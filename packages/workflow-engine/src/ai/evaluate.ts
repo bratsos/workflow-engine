@@ -18,6 +18,7 @@ import {
   logger,
   type OpenRouterRoutingOptions,
   resolveCost,
+  withoutOpenRouterProviderOverride,
 } from "./shared";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
@@ -32,15 +33,18 @@ import type {
 // Custom Evaluation Provider Registry
 // ============================================================================
 
-const evaluationProviderRegistry = new Map<
-  string,
-  (modelId: string) => EvaluationModelV4
->();
+type EvaluationProviderFactory = (
+  modelId: string,
+  policy?: OpenRouterRoutingOptions["provider"],
+) => EvaluationModelV4;
+
+const evaluationProviderRegistry = new Map<string, EvaluationProviderFactory>();
 
 /**
  * Register an evaluation model factory for a registry `provider` name, the
  * way `registerEmbeddingProvider` does for embeddings. The factory receives
- * the model id and returns an AI SDK evaluation model.
+ * the model id and returns an AI SDK evaluation model that honours the
+ * supplied provider policy.
  *
  * @example
  * ```typescript
@@ -53,7 +57,7 @@ const evaluationProviderRegistry = new Map<
  */
 export function registerEvaluationProvider(
   providerName: string,
-  factory: (modelId: string) => EvaluationModelV4,
+  factory: EvaluationProviderFactory,
 ): void {
   evaluationProviderRegistry.set(providerName, factory);
 }
@@ -65,7 +69,9 @@ export function getEvaluationModelProvider(
 ): EvaluationModelV4 {
   const customFactory = evaluationProviderRegistry.get(modelConfig.provider);
   if (customFactory) {
-    return customFactory(modelConfig.id);
+    return routing?.provider === undefined
+      ? customFactory(modelConfig.id)
+      : customFactory(modelConfig.id, routing.provider);
   }
 
   if (modelConfig.provider === "openrouter") {
@@ -149,6 +155,15 @@ export async function evaluate<const Q extends EvaluationQuestions>(
 
   try {
     const model = getEvaluationModelProvider(modelConfig, ctx.routing);
+    const callProviderOptions = options.providerOptions as Parameters<
+      typeof aiEvaluate
+    >[0]["providerOptions"];
+    const providerOptions =
+      ctx.routing?.provider !== undefined &&
+      modelConfig.provider === "openrouter" &&
+      !evaluationProviderRegistry.has("openrouter")
+        ? withoutOpenRouterProviderOverride(callProviderOptions)
+        : callProviderOptions;
     const result = await runWithCallTimeout(timeout, (signal) =>
       aiEvaluate({
         model,
@@ -163,13 +178,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
           ? { maxRetries: options.maxRetries }
           : {}),
         ...(options.headers !== undefined ? { headers: options.headers } : {}),
-        ...(options.providerOptions !== undefined
-          ? {
-              providerOptions: options.providerOptions as Parameters<
-                typeof aiEvaluate
-              >[0]["providerOptions"],
-            }
-          : {}),
+        ...(providerOptions !== undefined ? { providerOptions } : {}),
       }),
     );
 

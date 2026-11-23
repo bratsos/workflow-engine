@@ -13,7 +13,6 @@
 
 import {
   extractReportedCost,
-  extractServedBy,
   extractUsageDetails,
   logger,
   type ProviderResultLike,
@@ -166,38 +165,18 @@ function usageDetailsAcrossSteps(
 }
 
 /**
- * The endpoint that served the call. Kept only when every step that names
- * one names the same endpoint; a call whose steps were routed to different
- * endpoints has no single `servedBy` and the field is omitted.
- */
-function servedByAcrossSteps(steps: readonly unknown[]): string | undefined {
-  let servedBy: string | undefined;
-  for (const step of steps) {
-    if (!step || typeof step !== "object") continue;
-    const stepServedBy = extractServedBy(step as ProviderResultLike);
-    if (stepServedBy === undefined) continue;
-    if (servedBy === undefined) {
-      servedBy = stepServedBy;
-    } else if (servedBy !== stepServedBy) {
-      return undefined;
-    }
-  }
-  return servedBy;
-}
-
-/**
  * The value to hand `resolveCost` for an AI SDK result.
  *
  * A single-step result is returned as-is (its own `providerMetadata` is the
  * whole bill). A multi-step result becomes a `ProviderResultLike` that keeps
  * the call's aggregate usage (token totals plus the cached-input and
  * reasoning breakdowns, so the estimate prices cached input at the cached
- * rate) and the serving endpoint (when all steps agree), and replaces only
- * the reported-cost decision: the summed cost as `costUsd`, or no cost at
+ * rate) and replaces the reported-cost decision:
+ * the summed cost as `costUsd`, or no cost at
  * all when the sum is unusable. Neither the top-level `providerMetadata`
  * nor `finalStep` is carried, so `resolveCost` cannot rediscover the last
  * step's figure and estimates the whole call instead. The steps themselves
- * are carried so that estimate prices each step at its own long-context tier.
+ * are carried for provider attribution and per-step long-context pricing.
  */
 export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
   const multi = result as MultiStepResultLike | undefined;
@@ -206,7 +185,6 @@ export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
 
   const aggregate = multi?.usage ?? multi?.totalUsage;
   const costUsd = sumReportedCostAcrossSteps(steps);
-  const servedBy = servedByAcrossSteps(steps);
   const usage = {
     ...(finiteCount(aggregate?.inputTokens) !== undefined
       ? { inputTokens: aggregate!.inputTokens }
@@ -224,8 +202,5 @@ export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
     usage,
     steps,
     ...(costUsd !== undefined ? { costUsd } : {}),
-    ...(servedBy !== undefined
-      ? { providerMetadata: { openrouter: { provider: servedBy } } }
-      : {}),
   };
 }

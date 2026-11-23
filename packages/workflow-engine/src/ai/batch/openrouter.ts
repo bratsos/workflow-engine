@@ -4,6 +4,7 @@ import {
   extractReportedCost,
   extractServedBy,
   extractUsageDetails,
+  type OpenRouterRoutingOptions,
 } from "../shared";
 import {
   type EngineBatchItemResult,
@@ -22,11 +23,22 @@ export interface OpenRouterBatchConfig {
   baseURL?: string; // default "https://openrouter.ai/api/v1"
   fetch?: typeof globalThis.fetch; // default globalThis.fetch
   headers?: Record<string, string>;
+  routing?: OpenRouterRoutingOptions;
   endpoint?:
     | "/v1/chat/completions"
     | "/v1/responses"
     | "/v1/messages"
     | "/v1/embeddings"; // default "/v1/chat/completions"
+}
+
+export function assertOpenRouterBatchProviderPolicy(
+  policy: OpenRouterRoutingOptions["provider"],
+): void {
+  if (policy !== undefined) {
+    throw new Error(
+      "OpenRouter batch submissions cannot honour the helper's provider policy. OpenRouter does not enforce provider routing in individual batch items.",
+    );
+  }
 }
 
 const OpenRouterBatchResultItemSchema = z.object({
@@ -277,6 +289,7 @@ export function createOpenRouterBatchModel(
       requests: EngineBatchRequest[],
       opts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
+      assertOpenRouterBatchProviderPolicy(cfg.routing?.provider);
       const items = requests.map((req) => {
         const body: Record<string, unknown> = {
           messages: req.system

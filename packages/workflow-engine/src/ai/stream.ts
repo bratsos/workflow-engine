@@ -11,7 +11,12 @@ import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { logger, resolveCost, resolveLanguageModel } from "./shared";
+import {
+  assertAdapterProviderPolicy,
+  logger,
+  resolveCost,
+  resolveLanguageModel,
+} from "./shared";
 import { costResultLikeForSteps } from "./step-cost";
 import {
   createCallTimeout,
@@ -33,6 +38,8 @@ export function streamText(
   options: StreamOptions = {},
 ): AIStreamResult {
   const modelConfig = getModel(modelKey);
+  if (ctx.adapter?.streamText)
+    assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.streamText
     ? undefined
     : resolveLanguageModel(ctx, modelConfig);
@@ -117,6 +124,7 @@ export function streamText(
       reportedCostUsd,
       costSource,
       servedBy,
+      servedBySteps,
       cachedInputTokens,
       reasoningTokens,
     } = resolveCost(
@@ -165,6 +173,7 @@ export function streamText(
       cachedInputTokens,
       reasoningTokens,
       metadata: {
+        ...(servedBySteps !== undefined ? { servedBySteps } : {}),
         temperature: options.temperature,
         maxTokens: options.maxTokens,
         streamChunks: chunkCount,

@@ -6,6 +6,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAIHelper } from "../../ai/ai-helper.js";
 import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
@@ -152,5 +153,24 @@ describe("vendor batch SDK missing", () => {
         /^WARN: .*not batch-capable.*Falling back to the OpenRouter batch transport/,
       ),
     ]);
+  });
+
+  it("refuses the OpenRouter fallback when the native batch cannot serve a policy-bound call", async () => {
+    const fetchFn = vi.fn<typeof fetch>();
+    const ai = createAIHelper(
+      "batch-policy",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      {
+        routing: { provider: { only: ["anthropic"], allowFallbacks: true } },
+      },
+    );
+    const batch = ai.batch("fallback-haiku", "anthropic", { fetch: fetchFn });
+
+    await expect(
+      batch.submit([{ id: "r1", prompt: "Summarize the invoice." }]),
+    ).rejects.toThrow(/OpenRouter batch.*provider policy/i);
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });

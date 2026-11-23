@@ -29,9 +29,11 @@ export interface AIHelperOptions {
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
  * LanguageModel to use, or null/undefined to fall back to built-in resolution.
+ * A returned model must honour the supplied provider policy.
  */
 export type ProviderResolver = (
   modelConfig: ModelConfig,
+  policy?: OpenRouterRoutingOptions["provider"],
 ) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
 export type AICallType =

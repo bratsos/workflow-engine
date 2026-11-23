@@ -19,10 +19,17 @@ import {
   EngineBatchRefSchema,
   type EngineBatchRequest,
 } from "./batch/model";
-import { createOpenRouterBatchModel } from "./batch/openrouter";
+import {
+  assertOpenRouterBatchProviderPolicy,
+  createOpenRouterBatchModel,
+} from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
 import { restorePortableValue } from "./schema-portability";
-import { calculateCostWithDiscount, logger } from "./shared";
+import {
+  assertDirectProviderPolicy,
+  calculateCostWithDiscount,
+  logger,
+} from "./shared";
 import type {
   AIBatch,
   AIBatchCancelResult,
@@ -218,7 +225,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   /**
    * Lazy memoized backend resolution. Never runs in the constructor.
    */
-  private async provider$(): Promise<EngineBatchModel> {
+  private async provider$(forSubmit = false): Promise<EngineBatchModel> {
     return (this.providerPromise ??= (async () => {
       if (
         this.provider === "google" ||
@@ -262,6 +269,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             getProviderModelId(this.modelKey, "openrouter") ??
             (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
           if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
+          if (forSubmit)
+            assertOpenRouterBatchProviderPolicy(this.ctx.routing?.provider);
           const derived = modelConfig.batchModelId === undefined;
           warn(
             `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
@@ -305,6 +314,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       baseURL: this.options?.baseURL,
       fetch: this.options?.fetch,
       endpoint: this.options?.endpoint,
+      routing: this.ctx.routing,
     });
   }
 
@@ -434,7 +444,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       };
     }
 
-    const batchModel = await this.provider$();
+    const policy = this.ctx.routing?.provider;
+    if (this.provider === "openrouter")
+      assertOpenRouterBatchProviderPolicy(policy);
+    else assertDirectProviderPolicy(this.provider, policy);
+    const batchModel = await this.provider$(true);
     const modelConfig = getModel(this.modelKey);
 
     logger.debug(`batch submit request`, {

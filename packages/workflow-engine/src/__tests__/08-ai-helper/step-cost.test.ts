@@ -275,17 +275,19 @@ describe("costResultLikeForSteps accounting details", () => {
     expect(r.estimatedCostUsd).toBeCloseTo(0.5 + 0.05, 10);
   });
 
-  it("omits servedBy when the steps were routed to different endpoints", () => {
+  it("preserves step positions when a provider is unknown", () => {
     const result = {
       usage: { inputTokens: 20, outputTokens: 20 },
       steps: [
         step(0.1, 10, { provider: "Google" }),
+        step(undefined, 0),
         step(0.2, 10, { provider: "DeepInfra" }),
       ],
     };
     const r = resolveCost(MODEL, 20, 20, costResultLikeForSteps(result));
     expect(r.costSource).toBe("reported");
     expect(r.cost).toBeCloseTo(0.3, 10);
-    expect(r.servedBy).toBeUndefined();
+    expect(r.servedBy).toBe("Google,DeepInfra");
+    expect(r.servedBySteps).toEqual(["Google", null, "DeepInfra"]);
   });
 });

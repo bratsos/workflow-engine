@@ -13,6 +13,7 @@ import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { calculateCost, getModel, type ModelKey } from "./model-helper";
 import {
+  assertAdapterProviderPolicy,
   explainRoutingError,
   extractUsageDetails,
   logger,
@@ -208,6 +209,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   options: TextOptions<TTools> = {} as TextOptions<TTools>,
 ): Promise<AITextResult> {
   const modelConfig = getModel(modelKey);
+  if (ctx.adapter?.generateText)
+    assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateText
     ? undefined
     : resolveLanguageModel(ctx, modelConfig);
@@ -412,6 +415,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       reportedCostUsd,
       costSource,
       servedBy,
+      servedBySteps,
       cachedInputTokens,
       reasoningTokens,
     } = resolveCost(
@@ -448,6 +452,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       cachedInputTokens,
       reasoningTokens,
       metadata: {
+        ...(servedBySteps !== undefined ? { servedBySteps } : {}),
         temperature: options.temperature,
         maxTokens: options.maxTokens,
         finishReason: resultAny.finishReason,
@@ -524,6 +529,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   options: ObjectOptions = {},
 ): Promise<AIObjectResult<z.infer<TSchema>>> {
   const modelConfig = getModel(modelKey);
+  if (ctx.adapter?.generateObject)
+    assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateObject
     ? undefined
     : resolveLanguageModel(ctx, modelConfig);
@@ -636,6 +643,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       reportedCostUsd,
       costSource,
       servedBy,
+      servedBySteps,
       cachedInputTokens,
       reasoningTokens,
     } = resolveCost(
@@ -670,6 +678,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       cachedInputTokens,
       reasoningTokens,
       metadata: {
+        ...(servedBySteps !== undefined ? { servedBySteps } : {}),
         temperature: options.temperature,
         maxTokens: options.maxTokens,
         finishReason: resultAny.finishReason,

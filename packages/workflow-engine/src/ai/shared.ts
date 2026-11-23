@@ -6,8 +6,12 @@
  */
 
 import { google } from "@ai-sdk/google";
-import type { LanguageModelV4 } from "@ai-sdk/provider";
+import type {
+  LanguageModelV4,
+  SharedV4ProviderOptions,
+} from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
+import { wrapLanguageModel } from "ai";
 import { createLogger } from "../utils/logger";
 import {
   calculateCost,
@@ -27,43 +31,91 @@ export interface OpenRouterRoutingOptions {
   sort?: "throughput" | "price" | "latency";
   /** provider.require_parameters. Default true. */
   requireParameters?: boolean;
+  /** Upstream provider policy for calls made by this helper and its children. */
+  provider?: {
+    only?: string[];
+    order?: string[];
+    allowFallbacks?: boolean;
+    dataCollection?: "allow" | "deny";
+  };
+}
+
+export function assertDirectProviderPolicy(
+  provider: string,
+  policy: OpenRouterRoutingOptions["provider"],
+): void {
+  if (policy?.only !== undefined && !policy.only.includes(provider)) {
+    throw new Error(
+      `Provider "${provider}" is excluded by routing.provider.only.`,
+    );
+  }
+  if (
+    policy?.allowFallbacks === false &&
+    policy.order?.length &&
+    !policy.order.includes(provider)
+  ) {
+    throw new Error(
+      `Provider "${provider}" is outside routing.provider.order and provider fallbacks are disabled.`,
+    );
+  }
+  if (policy?.dataCollection === "deny") {
+    throw new Error(
+      `Direct provider "${provider}" cannot enforce routing.provider.dataCollection: "deny".`,
+    );
+  }
+}
+
+export function assertAdapterProviderPolicy(
+  policy: OpenRouterRoutingOptions["provider"],
+): void {
+  if (policy !== undefined) {
+    throw new Error(
+      "The configured AI adapter cannot enforce the helper's provider policy.",
+    );
+  }
 }
 
 export function buildOpenRouterRoutingProvider(
   modelConfig: ModelConfig,
   routing?: OpenRouterRoutingOptions,
-): {
-  sort: "throughput" | "price" | "latency";
-  require_parameters: boolean;
-  max_price?: {
-    prompt: number;
-    completion: number;
-  };
-} {
-  const priceHeadroom = routing?.priceHeadroom ?? 1.25;
-  const sort = routing?.sort ?? "throughput";
-  const requireParameters = routing?.requireParameters ?? true;
-
-  const provider: {
-    sort: "throughput" | "price" | "latency";
-    require_parameters: boolean;
-    max_price?: {
-      prompt: number;
-      completion: number;
-    };
-  } = {
-    sort,
-    require_parameters: requireParameters,
-  };
-
-  if (priceHeadroom > 0) {
-    provider.max_price = {
-      prompt: modelConfig.inputCostPerMillion * priceHeadroom,
-      completion: modelConfig.outputCostPerMillion * priceHeadroom,
-    };
+) {
+  const policy = routing?.provider;
+  if (policy?.only?.length === 0) {
+    throw new Error(
+      "routing.provider.only is empty, so no provider is permitted.",
+    );
   }
+  const priceHeadroom = routing?.priceHeadroom ?? 1.25;
+  return {
+    ...(policy?.order?.length
+      ? {}
+      : { sort: routing?.sort ?? ("throughput" as const) }),
+    require_parameters: routing?.requireParameters ?? true,
+    ...(priceHeadroom > 0 && {
+      max_price: {
+        prompt: modelConfig.inputCostPerMillion * priceHeadroom,
+        completion: modelConfig.outputCostPerMillion * priceHeadroom,
+      },
+    }),
+    ...(policy?.only !== undefined ? { only: policy.only } : {}),
+    ...(policy?.order !== undefined ? { order: policy.order } : {}),
+    ...(policy?.allowFallbacks !== undefined
+      ? { allow_fallbacks: policy.allowFallbacks }
+      : {}),
+    ...(policy?.dataCollection !== undefined
+      ? { data_collection: policy.dataCollection }
+      : {}),
+  };
+}
 
-  return provider;
+/** The SDK merges call options after model settings, so keep routing at the model boundary. */
+export function withoutOpenRouterProviderOverride(
+  options: SharedV4ProviderOptions | undefined,
+): SharedV4ProviderOptions | undefined {
+  const openrouterOptions = options?.openrouter;
+  if (!openrouterOptions || !("provider" in openrouterOptions)) return options;
+  const { provider: _provider, ...rest } = openrouterOptions;
+  return { ...options, openrouter: rest };
 }
 
 export function getModelProvider(
@@ -73,14 +125,30 @@ export function getModelProvider(
   if (modelConfig.provider === "openrouter") {
     const provider = buildOpenRouterRoutingProvider(modelConfig, routing);
 
-    return openrouter(modelConfig.id, {
+    const model = openrouter(modelConfig.id, {
       usage: { include: true },
       extraBody: {
         provider,
       },
     });
+    if (routing?.provider === undefined) return model;
+    return wrapLanguageModel({
+      model,
+      middleware: {
+        specificationVersion: "v4",
+        async transformParams({ params }) {
+          return {
+            ...params,
+            providerOptions: withoutOpenRouterProviderOverride(
+              params.providerOptions,
+            ),
+          };
+        },
+      },
+    });
   }
   if (modelConfig.provider === "google") {
+    assertDirectProviderPolicy("google", routing?.provider);
     // A registry entry may carry the catalog slug (`google/gemini-...`) so
     // the same key serves the Google batch path; the Google API itself
     // wants the bare model id (the slug 404s).
@@ -102,13 +170,18 @@ export function resolveLanguageModel(
   ctx: Pick<AIHelperContext, "providerResolver" | "routing">,
   modelConfig: ModelConfig,
 ): LanguageModelV4 {
-  const model =
-    ctx.providerResolver?.(modelConfig) ??
-    getModelProvider(modelConfig, ctx.routing);
+  const policy = ctx.routing?.provider;
+  const resolved =
+    policy === undefined
+      ? ctx.providerResolver?.(modelConfig)
+      : ctx.providerResolver?.(modelConfig, policy);
+  const model = resolved ?? getModelProvider(modelConfig, ctx.routing);
   return withPortableSchema(model, schemaTargetForModel(modelConfig, model));
 }
 
 export interface ProviderResultLike {
+  /** SDK transport name for a completed model step. */
+  model?: { provider?: string };
   /** A cost the transport itself reported, in USD (adapters). */
   costUsd?: number;
   providerMetadata?: Record<string, any>;
@@ -272,6 +345,8 @@ export interface CostResolution {
   costSource: "reported" | "estimated";
   /** The endpoint that served the request, when the provider names it. */
   servedBy?: string;
+  /** The serving provider for each step, in order. */
+  servedBySteps?: (string | null)[];
   /** Input tokens served from the prompt cache (part of `inputTokens`), when reported. */
   cachedInputTokens?: number;
   /** Reasoning tokens (part of `outputTokens`), when reported. */
@@ -363,9 +438,28 @@ export function resolveCost(
       usageDetails.cachedInputTokens,
     );
   const reportedCostUsd = extractReportedCost(providerResult);
-  const servedBy = extractServedBy(providerResult);
+  const steps = providerResult?.steps;
+  const servedBySteps =
+    steps && steps.length > 1
+      ? steps.map((value) => {
+          const step = value as ProviderResultLike | undefined;
+          const transport = step?.model?.provider?.split(".")[0];
+          const directProvider =
+            transport === "google" ||
+            transport === "openai" ||
+            transport === "anthropic"
+              ? transport
+              : null;
+          return extractServedBy(step) ?? directProvider;
+        })
+      : undefined;
+  const servedBy = servedBySteps
+    ? [...new Set(servedBySteps.filter((name) => name !== null))].join(",") ||
+      undefined
+    : extractServedBy(providerResult);
   const extras = {
     ...(servedBy !== undefined ? { servedBy } : {}),
+    ...(servedBySteps !== undefined ? { servedBySteps } : {}),
     ...usageDetails,
   };
 

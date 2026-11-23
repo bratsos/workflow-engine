@@ -13,6 +13,8 @@ import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
+  assertAdapterProviderPolicy,
+  assertDirectProviderPolicy,
   buildOpenRouterRoutingProvider,
   logger,
   type OpenRouterRoutingOptions,
@@ -28,17 +30,19 @@ const DEFAULT_EMBEDDING_DIMENSIONS = 768;
 // Custom Embedding Provider Registry
 // ============================================================================
 
-const embeddingProviderRegistry = new Map<
-  string,
-  (modelId: string) => EmbeddingModelV4
->();
+type EmbeddingProviderFactory = (
+  modelId: string,
+  policy?: OpenRouterRoutingOptions["provider"],
+) => EmbeddingModelV4;
+
+const embeddingProviderRegistry = new Map<string, EmbeddingProviderFactory>();
 
 /**
  * Register a custom embedding provider factory.
  *
  * Consumers can register any AI SDK community provider (Voyage, Cohere, Jina, etc.)
  * without modifying the workflow engine. The factory receives the model ID and must
- * return an EmbeddingModelV4 instance.
+ * return an EmbeddingModelV4 instance that honours the supplied provider policy.
  *
  * @example
  * ```typescript
@@ -50,7 +54,7 @@ const embeddingProviderRegistry = new Map<
  */
 export function registerEmbeddingProvider(
   providerName: string,
-  factory: (modelId: string) => EmbeddingModelV4,
+  factory: EmbeddingProviderFactory,
 ): void {
   embeddingProviderRegistry.set(providerName, factory);
 }
@@ -63,7 +67,9 @@ export function getEmbeddingModelProvider(
   // Custom providers registered by consumer
   const customFactory = embeddingProviderRegistry.get(modelConfig.provider);
   if (customFactory) {
-    return customFactory(modelConfig.id);
+    return routing?.provider === undefined
+      ? customFactory(modelConfig.id)
+      : customFactory(modelConfig.id, routing.provider);
   }
 
   // Built-in providers
@@ -77,6 +83,7 @@ export function getEmbeddingModelProvider(
     });
   }
   if (modelConfig.provider === "google") {
+    assertDirectProviderPolicy("google", routing?.provider);
     const googleModelId = modelConfig.id.replace(/^google\//, "");
     return google.embeddingModel(googleModelId);
   }
@@ -122,6 +129,7 @@ export async function embed(
 
   try {
     const isAdapter = ctx.adapter?.embed !== undefined;
+    if (isAdapter) assertAdapterProviderPolicy(ctx.routing?.provider);
     const embeddingModel = isAdapter
       ? undefined
       : getEmbeddingModelProvider(modelConfig, ctx.routing);
