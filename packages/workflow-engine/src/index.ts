@@ -418,6 +418,7 @@ export {
   DefinitionRegistrationRetryableError,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
+  RUN_ERASURE_COMMAND,
   RUN_WRITE_LEASE_MS,
   StaleVersionError,
 } from "./persistence/interface";

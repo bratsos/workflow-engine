@@ -625,11 +625,20 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     ).rejects.toMatchObject({ code: 77 });
     // The key named only the job, so it went before the job did.
     expect(await db.client.jobQueue.count()).toBe(0);
-    expect(await db.client.idempotencyKey.count()).toBe(0);
+    // Only the mark of the erasure that was under way is left.
+    expect(
+      (await db.client.idempotencyKey.findMany()).map(
+        (key: { commandType: string }) => key.commandType,
+      ),
+    ).toEqual(["run.erase"]);
     expect(
       await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
-    ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
+    ).toMatchObject({
+      removed: { runs: 1, idempotencyKeys: 0 },
+      incomplete: [],
+    });
     expect(await db.client.workflowRun.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
   }, 30_000);
 
   it("keeps a written run from the age sweep and erases what the sweep leaves", async () => {
@@ -1541,51 +1550,116 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       });
     });
 
+    const empty = { blobs: 0, steps: 0, keys: 0, events: 0 };
+    const answers = [
+      { signalled: true, ok: true, alreadyCompleted: false },
+      { signalled: true, ok: true, alreadyCompleted: true },
+    ];
+
     it.each([
       "completed",
+      "failed",
       "cancelled",
-    ] as const)("answers a late signal to a %s run as for a live one and writes nothing", async (ending) => {
+    ] as const)("answers the same signal sent twice to a %s run as to a live one, and erases with it", async (ending) => {
       // What a live run answers is what a run that has ended always answered.
       const control = await db.seed("RUNNING", "SUSPENDED");
       const worker = kernel();
       expect([
         await worker.dispatch(signal(control.id)),
         await worker.dispatch(signal(control.id)),
-      ]).toEqual([
-        { signalled: true, ok: true, alreadyCompleted: false },
-        { signalled: true, ok: true, alreadyCompleted: true },
-      ]);
-      const end = async (id: string) => {
-        if (ending === "cancelled") {
-          await worker.dispatch({ type: "run.cancel", workflowRunId: id });
-        } else {
-          await db.client.workflowRun.update({
-            where: { id },
-            data: { status: "COMPLETED" },
-          });
-        }
-      };
-      // Never signalled, then signalled before the run ended.
-      const fresh = await db.seed("RUNNING", "SUSPENDED");
-      const signalled = await db.seed("RUNNING", "SUSPENDED");
-      await worker.dispatch(signal(signalled.id));
-      await end(fresh.id);
-      await end(signalled.id);
-      const before = await leftovers();
-      expect(await worker.dispatch(signal(fresh.id))).toEqual({
-        signalled: true,
-        ok: true,
-        alreadyCompleted: false,
+      ]).toEqual(answers);
+      await worker.dispatch({ type: "run.cancel", workflowRunId: control.id });
+      expect(await worker.dispatch(erase(control.id))).toMatchObject({
+        incomplete: [],
       });
-      expect(await worker.dispatch(signal(signalled.id))).toEqual({
-        signalled: true,
-        ok: true,
-        alreadyCompleted: true,
+      expect(await leftovers()).toEqual(empty);
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      if (ending === "cancelled") {
+        await worker.dispatch({ type: "run.cancel", workflowRunId: id });
+      } else {
+        await db.client.workflowRun.update({
+          where: { id },
+          data: { status: ending === "failed" ? "FAILED" : "COMPLETED" },
+        });
+      }
+      expect(await worker.dispatch(signal(id))).toEqual(answers[0]);
+      // The signal's own writes: its step, the spilled payload and the wake.
+      const written = await leftovers();
+      expect(written).toMatchObject({ blobs: 1, steps: 1 });
+      expect(await worker.dispatch(signal(id))).toEqual(answers[1]);
+      expect(await leftovers()).toEqual(written);
+      // Registered while it wrote and released, it leaves erasure nothing.
+      expect(await worker.dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
       });
-      expect(await leftovers()).toEqual(before);
+      expect(await leftovers()).toEqual(empty);
     });
 
-    it("gives a late signal to an ended run the refusal of a wait past its deadline and leaves the wait as it was", async () => {
+    it("holds erasure off a late signal to an ended run until its spilled payload is stored", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      const gate = hold();
+      const sender = db.makeKernel({
+        blobStore: override(db.blobStore, {
+          async put(key, data) {
+            await gate.pause();
+            return db.blobStore.put(key, data);
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      try {
+        expect(await kernel().dispatch(erase(id))).toMatchObject({
+          removed: { runs: 0 },
+          incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+        });
+      } finally {
+        gate.release();
+      }
+      expect(await sending).toEqual(answers[0]);
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+    });
+
+    it("writes nothing for a late signal that arrives while its run is being erased", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      const listing = hold();
+      // Past its look for writers, in its external phase.
+      const erasing = db.makeKernel({
+        services: { aiLogger: db.aiLogger },
+        blobStore: override(db.blobStore, {
+          async list(prefix) {
+            const keys = await db.blobStore.list(prefix);
+            await listing.pause();
+            return keys;
+          },
+        }),
+      });
+      const erased = erasing.dispatch(erase(id));
+      await listing.reached;
+      let answer: unknown;
+      try {
+        answer = await kernel().dispatch(signal(id));
+        expect((await leftovers()).blobs).toBe(0);
+        expect((await leftovers()).steps).toBe(0);
+      } finally {
+        listing.release();
+      }
+      expect(answer).toEqual(answers[0]);
+      expect(await erased).toMatchObject({
+        removed: { runs: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+    });
+
+    it("answers a late signal to an ended run whose wait is past its deadline as a live one does", async () => {
       const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
       await db.stepLedger.claim({
         stageRecordId: stage.id,
@@ -1599,16 +1673,14 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
         waitState: { onTimeout: "return" },
       });
       await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
-      expect(await kernel().dispatch(signal(id))).toEqual({
+      const timedOut = {
         ok: true,
         signalled: false,
         alreadyCompleted: true,
         timedOut: true,
-      });
-      expect(await db.stepLedger.get(stage.id, "answer")).toMatchObject({
-        status: "pending",
-      });
-      expect(await db.client.workflowBlob.count()).toBe(0);
+      };
+      expect(await kernel().dispatch(signal(id))).toEqual(timedOut);
+      expect(await kernel().dispatch(signal(id))).toEqual(timedOut);
     });
 
     it("writes nothing once the run it read has been erased", async () => {

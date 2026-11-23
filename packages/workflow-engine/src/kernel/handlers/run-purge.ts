@@ -36,10 +36,11 @@
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
 
-import type {
-  PurgeableRun,
-  PurgeableRunStatus,
-  RunPurgeFence,
+import {
+  type PurgeableRun,
+  type PurgeableRunStatus,
+  RUN_ERASURE_COMMAND,
+  type RunPurgeFence,
 } from "../../persistence/interface.js";
 import type {
   RunPurgeByAgeCommand,
@@ -310,8 +311,24 @@ export async function handleTargetedRunPurge(
           skipped.push({ workflowRunId: id, status: run.status });
           continue;
         }
-        // A writer admitted before the run ended can still write. No new one
-        // is admitted now, so a later request finds it gone.
+        // A writer admitted before the run ended can still write. A writer
+        // that registers for the ended run after this mark finds it and
+        // writes nothing; one that registered before it is found here, so a
+        // later request finds it gone.
+        const marked = await persistence.acquireIdempotencyKey(
+          id,
+          RUN_ERASURE_COMMAND,
+          { workflowRunId: id },
+        );
+        // Completed, so that retention can remove one a purge left behind.
+        if (marked.status === "acquired") {
+          await persistence.completeIdempotencyKey(
+            id,
+            RUN_ERASURE_COMMAND,
+            { erasing: true },
+            id,
+          );
+        }
         if (await persistence.hasRunWriters(id)) {
           incomplete.push({ workflowRunId: id, failed: ["writers"] });
           continue;

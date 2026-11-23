@@ -247,15 +247,23 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       payload: big,
     });
     await held.reached;
+    // Prisma registers the sender as a writer of the run, so the sweep leaves
+    // the run until it is done; the in-memory store registers nothing.
+    const purged = { purged: 1, workflowRunIds: [runId] };
+    const none = { purged: 0, workflowRunIds: [] };
     await expect(
       send({ type: "run.purge", olderThan: later() }),
-    ).resolves.toEqual({
-      purged: 1,
-      workflowRunIds: [runId],
-    });
+    ).resolves.toEqual(realDatabase ? none : purged);
     held.open();
 
-    await expect(signal).rejects.toThrow();
+    if (realDatabase) {
+      await expect(signal).resolves.toMatchObject({ signalled: true });
+      await expect(
+        send({ type: "run.purge", olderThan: later() }),
+      ).resolves.toEqual(purged);
+    } else {
+      await expect(signal).rejects.toThrow();
+    }
     expect(await ledger.list(id)).toEqual([]);
     expect(await ports.blobStore.list(stepWriteSpillPrefix(id))).toEqual([]);
     expect((await wake(id, "late")).status).toBe("acquired");

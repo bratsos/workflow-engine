@@ -48,13 +48,22 @@ export async function handleStepSignal(
 
   // The ledger write can spill the payload to the blob store, outside any
   // transaction. Registered as a writer of the run (as `job.execute` is), the
-  // sender holds off erasure until it has written. A run that has ended
-  // admits no writer: its sender answers as it always did and writes nothing
-  // (a late signal, such as a webhook retry, is routine). A run that is gone
-  // is left to the fenced writes, which refuse.
-  const writer = await openRunWriter(deps.persistence, command.workflowRunId);
+  // sender holds off erasure until it has written. A late signal to a run
+  // that has ended (a webhook's retry, say) registers as well and behaves as
+  // on a live run. Only a run being erased refuses it, and then the sender
+  // writes nothing and answers as it would have; a run that is gone is left
+  // to the fenced writes, which refuse.
+  let writer = await openRunWriter(deps.persistence, command.workflowRunId);
+  if (!writer.held) {
+    writer = await openRunWriter(
+      deps.persistence,
+      command.workflowRunId,
+      undefined,
+      { endedOk: true },
+    );
+  }
   try {
-    const ended =
+    const erasing =
       !writer.held &&
       Boolean(await deps.persistence.getRun(command.workflowRunId));
     const fenced = fenceRunWrites(deps, command.workflowRunId, writer);
@@ -62,7 +71,7 @@ export async function handleStepSignal(
       command,
       { ...fenced, stepLedger: fenced.stepLedger ?? ledger },
       stage,
-      ended,
+      erasing,
     );
   } catch (error) {
     // The record went (purge, restart) after the read above: whatever this
@@ -90,7 +99,7 @@ async function deliverSignal(
   command: StepSignalCommand,
   deps: KernelDeps & { stepLedger: StepLedger },
   stage: WorkflowStageRecord,
-  ended: boolean,
+  erasing: boolean,
 ): Promise<HandlerResult<StepSignalResult>> {
   // The ledger is external to the stage transaction. A completed ledger row
   // must still retry its wake; this key commits with the wake and outbox event.
@@ -148,9 +157,9 @@ async function deliverSignal(
     };
   };
 
-  // The answer of a run that has ended, without the wake the same call makes
-  // on a live one. A stage that went while this read has nothing for the
-  // writes to land on, and they would have failed.
+  // The answer of a run being erased, without the writes the same call makes
+  // otherwise. A stage that went while this read has nothing for them to land
+  // on, and they would have failed.
   const answered = async (
     alreadyCompleted: boolean,
   ): Promise<HandlerResult<StepSignalResult>> => {
@@ -183,7 +192,9 @@ async function deliverSignal(
     alreadyCompleted: boolean,
   ): Promise<HandlerResult<StepSignalResult>> => {
     if (record.waitState?.timedOut) return timedOut();
-    return ended ? answered(alreadyCompleted) : wake(record, alreadyCompleted);
+    return erasing
+      ? answered(alreadyCompleted)
+      : wake(record, alreadyCompleted);
   };
   // Only a deadline fails a wait row. With an explicit `onTimeout` the
   // sender gets the same refusal as before the poller recorded it.
@@ -220,7 +231,7 @@ async function deliverSignal(
       record.deadlineAt !== null &&
       record.deadlineAt <= deps.clock.now();
     if (expired && record.waitState?.onTimeout !== "return") return timedOut();
-    if (ended) {
+    if (erasing) {
       // Without the write that settles it, the answer is the one it leads to.
       if (expired) return timedOut();
       payload();
@@ -255,7 +266,7 @@ async function deliverSignal(
   if (existing) return completeExisting(existing, readPayload);
 
   const payload = readPayload();
-  if (ended) return answered(false);
+  if (erasing) return answered(false);
   const claimed = await deps.stepLedger.claim({
     stageRecordId: stage.id,
     stepId: command.stepId,

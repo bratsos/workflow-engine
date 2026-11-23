@@ -127,6 +127,14 @@ export interface RunPurgePersistenceCounts {
  */
 export const RUN_WRITE_LEASE_MS = 60_000;
 
+/**
+ * The command type of the idempotency key, stamped with the run's ID, that
+ * `run.purge` writes before it looks for writers of a run it is about to erase.
+ * `beginRunWrite` with `endedOk` refuses a run that has one, which is what
+ * keeps a writer admitted after the run ended from writing into an erasure.
+ */
+export const RUN_ERASURE_COMMAND = "run.erase";
+
 export interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
@@ -872,12 +880,17 @@ export interface PersistenceCore {
   /**
    * Register a writer of the run's data, or refuse when the run is gone or
    * has ended. `unchecked` registers whatever the status, for a caller whose
-   * own transaction is ending the run.
+   * own transaction is ending the run. `endedOk` also admits a run that has
+   * ended, unless `run.purge` has marked it for erasure (an idempotency key
+   * of command type `RUN_ERASURE_COMMAND` stamped with the run): the
+   * registration commits first and the mark is looked for after it, so
+   * erasure either finds the writer or the writer finds the mark. An adapter
+   * that does not know `endedOk` refuses an ended run.
    */
   beginRunWrite?(
     workflowRunId: string,
     token: string,
-    options?: { unchecked?: boolean },
+    options?: { unchecked?: boolean; endedOk?: boolean },
   ): Promise<boolean>;
   /**
    * Renew the registration's lease; `false` when it no longer exists or its
