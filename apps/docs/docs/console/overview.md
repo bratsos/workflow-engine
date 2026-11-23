@@ -496,6 +496,18 @@ For SQLite, build `db` with `sqlite({ contract, path })` from
 `@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to
 `createPrismaConsoleReadPort`.
 
+## Filtering runs by tenant
+
+Enter a Tenant ID in the runs filter bar, or send
+`GET /api/runs?tenantId=tenant-a`. The filter matches the full tenant ID
+exactly. Clear the field or omit the parameter to list runs across tenants,
+including runs with no tenant ID. The list shows a Tenant column on pages
+that contain tenant IDs. Keep the same filter when following a page cursor.
+
+The tenant filter only changes the view. Anyone who can open the console
+can see every tenant available to its reader by clearing the filter. Enforce
+tenant access in your application's authorization and database policies.
+
 ## Finding a run stranded on an old definition version
 
 [Definition versioning](../core-concepts/definition-versioning.md) pins a

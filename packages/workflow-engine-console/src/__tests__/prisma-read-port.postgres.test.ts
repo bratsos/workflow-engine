@@ -343,6 +343,45 @@ if (!DATABASE_URL) {
       expect(seen).toEqual(["run-5", "run-4", "run-3", "run-2", "run-1"]);
     });
 
+    it("filters by exact tenant ID across a keyset page boundary at the same timestamp", async () => {
+      await prisma.workflowRun.createMany({
+        data: [
+          {
+            ...mkRun("run-tenant-1", at(50), "COMPLETED", "wf-a"),
+            tenantId: "tenant-a",
+          },
+          {
+            ...mkRun("run-tenant-2", at(50), "COMPLETED", "wf-a"),
+            tenantId: "tenant-a-extra",
+          },
+          {
+            ...mkRun("run-tenant-3", at(50), "COMPLETED", "wf-a"),
+            tenantId: "tenant-a",
+          },
+          {
+            ...mkRun("run-tenant-4", at(51), "PENDING", "wf-a"),
+            tenantId: "tenant-a",
+          },
+        ],
+      });
+      const port = reader();
+      const filters = { tenantId: "tenant-a", status: ["COMPLETED" as const] };
+      const first = await port.listRuns({ filters, limit: 1 });
+      expect(first.runs).toMatchObject([
+        { id: "run-tenant-3", tenantId: "tenant-a" },
+      ]);
+      expect(first.nextCursor).not.toBeNull();
+      const second = await port.listRuns({
+        filters,
+        limit: 1,
+        cursor: first.nextCursor!,
+      });
+      expect(second.runs).toMatchObject([
+        { id: "run-tenant-1", tenantId: "tenant-a" },
+      ]);
+      expect(second.nextCursor).toBeNull();
+    });
+
     it("round-trips the Status enum cast through a real enum column", async () => {
       const page = await reader().listRuns({
         filters: { status: ["FAILED", "RUNNING"] },

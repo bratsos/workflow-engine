@@ -404,6 +404,50 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(second.nextCursor).toBeNull();
   });
 
+  it("filters by exact tenant ID across a keyset page boundary at the same timestamp", async () => {
+    const runs = [
+      {
+        ...mkRun("run-tenant-1", at(500), "COMPLETED", "wf-a", 0, 0),
+        tenantId: "tenant-a",
+      },
+      {
+        ...mkRun("run-tenant-2", at(500), "COMPLETED", "wf-a", 0, 0),
+        tenantId: "tenant-a-extra",
+      },
+      {
+        ...mkRun("run-tenant-3", at(500), "COMPLETED", "wf-a", 0, 0),
+        tenantId: "tenant-a",
+      },
+      {
+        ...mkRun("run-tenant-4", at(501), "PENDING", "wf-a", 0, 0),
+        tenantId: "tenant-a",
+      },
+    ];
+    await prisma.workflowRun.createMany({ data: runs });
+    try {
+      const port = reader();
+      const filters = { tenantId: "tenant-a", status: ["COMPLETED" as const] };
+      const first = await port.listRuns({ filters, limit: 1 });
+      expect(first.runs).toMatchObject([
+        { id: "run-tenant-3", tenantId: "tenant-a" },
+      ]);
+      expect(first.nextCursor).not.toBeNull();
+      const second = await port.listRuns({
+        filters,
+        limit: 1,
+        cursor: first.nextCursor!,
+      });
+      expect(second.runs).toMatchObject([
+        { id: "run-tenant-1", tenantId: "tenant-a" },
+      ]);
+      expect(second.nextCursor).toBeNull();
+    } finally {
+      await prisma.workflowRun.deleteMany({
+        where: { id: { in: runs.map((run) => run.id) } },
+      });
+    }
+  });
+
   it("reads run details, JSON fields, stages, steps, annotations, logs, and events", async () => {
     const detail = await reader().getRunDetail("run-day-1");
 
