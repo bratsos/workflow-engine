@@ -54,6 +54,7 @@ export {
   StepSuspend,
   StepTimeoutError,
   type StepWaitOptions,
+  type StepWaitResult,
 } from "./core/steps";
 export type {
   AnnotationCreatedEvent,

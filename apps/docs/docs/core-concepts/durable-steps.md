@@ -58,11 +58,16 @@ The Prisma ledger uses the `WorkflowStep` model from [Prisma Setup](../persisten
 ```typescript
 interface StepApi {
   run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
+  waitFor<T>(id: string, opts: StepWaitOptions<T, "return"> & { onTimeout: "return" }): Promise<StepWaitResult<T>>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions<"return"> & { onTimeout: "return" }): Promise<StepWaitResult<T>>;
   waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   readonly ai: StepAiApi; // generateText / generateObject / streamText / map
 }
+
+type StepTimeoutMode = "throw" | "return";
+type StepWaitResult<T> = { timedOut: false; value: T } | { timedOut: true };
 
 interface StepRunOptions {
   lease?: number | string;        // held while fn runs; default 5 minutes
@@ -89,16 +94,18 @@ interface StepRunContext {
   readonly abortSignal: AbortSignal; // same object as ctx.abortSignal
 }
 
-interface StepWaitOptions<T> {
+interface StepWaitOptions<T, Mode extends StepTimeoutMode = "throw"> {
   poll: () => Promise<T>;
   ready: (value: T) => boolean;   // may be a type guard; the result narrows
   every: number | string;         // "30s", "5m", or milliseconds
   timeout: number | string;       // non-sliding deadline from the first wait
+  onTimeout?: Mode;
   pollBackoffMs?: number;         // backoff after poll() throws; default = every
 }
 
-interface StepSignalOptions {
+interface StepSignalOptions<Mode extends StepTimeoutMode = "throw"> {
   timeout: number | string;       // non-sliding deadline from the first wait
+  onTimeout?: Mode;
   keepalive?: number | string;    // re-suspend interval while no signal; default 5m
 }
 ```
@@ -147,7 +154,7 @@ const render = defineStage({
   // → { ok: true, signalled: true, alreadyCompleted: false }
   ```
 
-  Signalling twice is a no-op (`alreadyCompleted: true`); signalling a timed-out step is rejected.
+  A duplicate signal keeps the first payload and returns `alreadyCompleted: true`. A signal sent at or after the deadline of a wait with an explicit `onTimeout`, or after such a wait timed out, returns `{ ok: true, signalled: false, alreadyCompleted: true, timedOut: true }` and emits no `step:signalled` event. A signal sent after a wait failed with `StepTimeoutError` throws.
 - **`sleep`** suspends for the duration.
 
 Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when another worker holds a lease). The stage factory turns it into a suspended stage record, and `stage.pollSuspended` replays `execute()` on the next tick.
@@ -168,10 +175,42 @@ A signal wait re-suspends every `keepalive` (default five minutes, never later t
 - **`retries`** makes a thrown `fn` retryable: the failure is recorded, the stage suspends for `retryDelay`, and the next replay re-runs `fn`. When retries are exhausted the stored error is thrown and that stage attempt fails; while the stage's job has attempts left the stage is retried like any other throw, and each retry runs the step once more. **`retryBackoff`** grows the delay: after failed attempt *n* the wait is `retryDelay * factor^(n-1)`, capped at `maxDelay`, and `jitter: true` waits a uniform random fraction of it. `{ retries: 3, retryDelay: "10s", retryBackoff: { factor: 2, maxDelay: "30s" } }` waits 10 s, 20 s, 30 s. The delay is computed from the `attempt` stored on the row, so a retry replayed by another process computes the same delay.
 - **A step retries every error except `NonRetryableError`.** A Zod error from a response the body validates is retried like any other. Throw `NonRetryableError` (exported from `@bratsos/workflow-engine`, with the original as `cause`) when retrying cannot help, or pass **`retryIf`** to decide per error: it is called synchronously with the error and the step `attempt` (1 on the first) every time the body throws anything but a `NonRetryableError`. Returning `false` stops the step's own `retries`, and the stage sees a `NonRetryableError` with the original as `cause`, so its attempt fails terminally. Any other return value leaves `retries` in charge, and so does a predicate that throws (a throw or an object return is logged). A predicate that returns or throws a Promise breaks its synchronous contract: the engine attaches a no-op handler to a plain native Promise where it can, and if that Promise rejects and the engine cannot attach a handler, the rejection is the application's own unhandled rejection, as anywhere else in stage code. Neither changes when a step that failed is run again by anything else: a stage retry re-opens failed steps and `onReclaim` decides a takeover, exactly as before. During a rolling deploy: A terminal verdict (`NonRetryableError`, a `retryIf` that returns `false`) is honoured once every host runs this release. A host still on an earlier release that recovers a job (after a lost lease or a lost failure acknowledgement) runs it as that release does: it can run the body again, even past the queue's budget, which limits only the decision to schedule another retry, so completed steps and provider calls can run again. The dead-job end after a lost acknowledgement requires the recovering host to include the FAILED-stage handling of #83 (on main since e44baf8), not this release.
 - **A replayed step failure is classified as on main.** The ledger row of a failed step holds the message and nothing else. A replay that meets it rebuilds a plain `Error` with that message (or `StepTimeoutError` when the message is that step's timeout text), with no brand, so a `NonRetryableError` or a `retryIf` refusal is terminal only in the execution that threw it. A replay with `retries` left runs the body again, as it always has.
-- **Wait deadlines never slide.** `waitFor` and `waitForSignal` compute `timeout` once, when the wait is first recorded, and store it on the row; past it the step is marked failed and the stage fails with `StepTimeoutError`.
+- **Wait deadlines never slide.** `waitFor` and `waitForSignal` store the deadline and timeout policy when the wait is first recorded. A wait without `onTimeout`, or with `onTimeout: "throw"`, fails with `StepTimeoutError`. See [Branch on a deadline](#branch-on-a-deadline) for what an explicit `onTimeout` changes.
 - **A throwing `poll` does not fail the stage.** The stage suspends for `pollBackoffMs`; the first three consecutive failures are logged at DEBUG (batch providers are eventually consistent right after a submit) and the streak escalates to WARN from the fourth. A poll that returns resets the count.
 - A stage still waiting on the same step re-suspends silently on every poll: `stage:suspended` / `workflow:suspended` are emitted when the wait starts and again only when the stage moves on to a different step.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` rather than recording a failure, because the side effect already happened.
+
+### Branch on a deadline
+
+Set `onTimeout: "return"` on `waitForSignal` or `waitFor` when the stage can continue after the deadline.
+
+```typescript
+const approval = await ctx.step.waitForSignal<{ approved: boolean }>("approval", {
+  timeout: "15m",
+  onTimeout: "return",
+});
+if (approval.timedOut) {
+  return { output: { status: "expired" } };
+}
+return { output: { status: approval.value.approved ? "approved" : "declined" } };
+```
+
+The return type is `{ timedOut: false; value: T } | { timedOut: true }`. With `waitFor`, `value` is the ready poll's result and follows any type guard in `ready`. A signal sent before the wait also returns `{ timedOut: false, value }`.
+
+#### Exact deadlines are opt-in
+
+A wait with an explicit `onTimeout`, `"throw"` or `"return"`, keeps its deadline exactly:
+
+- The deadline decides the outcome. A signal or ready poll before the deadline completes the wait with its value. From the deadline on, the wait can only time out: a signal returns `{ ok: true, signalled: false, alreadyCompleted: true, timedOut: true }`, and a `ready` verdict that arrives at or after the deadline counts as a timeout, even when the next maintenance tick has yet to process the wait. Every replay reads the recorded outcome.
+- The stage wakes at the wait's next poll or deadline, or earlier for another wait. A wait keeps its deadline and its next poll across replays, including a replay that does not reach it because its branch is still doing other work. A replay that reaches a due poll runs it, even after another wait has suspended the stage.
+- A branch that reaches a new opted-in wait after another wait has suspended the stage opens it on the next replay, so its deadline counts from then.
+- If a worker dies while it replays the stage, the next replay starts within the 60-second claim lease. A wait the dead worker opened can therefore time out up to 60 seconds late. If the worker dies during the stage's job, the job is retried after the host's stale-lease threshold, which bounds the delay instead.
+
+A wait without `onTimeout` behaves as in earlier releases: the wait that suspended the stage sets its schedule, an expired wait is detected when the stage is next polled or replayed, and a signal is accepted until then. In a stage that mixes both, the stage wakes at the earlier of the two schedules.
+
+For a reusable options object, use `satisfies StepWaitOptions<T, "return">` or `satisfies StepSignalOptions<"return">` to preserve the literal timeout mode. The default options types keep returning `T`. If the options type allows either mode, the return type includes both the raw value and the wrapped outcome.
+
+Upgrade every worker and signal dispatcher before using `onTimeout: "return"`. Keep the policy stable for a recorded wait across replays.
 
 ---
 

@@ -125,7 +125,7 @@ expect(await harness.steps.error("charge-card")).toBe("card declined");
 | --- | --- |
 | `mockResult(stepId, value)` | the step records `completed` with `value`; its body never runs. `step.run`, `step.waitFor`, `step.waitForSignal` |
 | `mockError(stepId, error, { attempt? })` | the step records `failed` (at `MOCKED_FAILURE_ATTEMPT` unless `attempt` is given); the step throws the stored error instead of running its body |
-| `mockTimeout(stepId)` | the step's deadline is already past, so it fails with `StepTimeoutError` through the engine's own timeout path. `step.waitFor` and `step.waitForSignal` only |
+| `mockTimeout(stepId)` | the step starts past its deadline. `onTimeout: "return"` returns `{ timedOut: true }`. The default throws `StepTimeoutError`. `step.waitFor` and `step.waitForSignal` only |
 | `skipSleep(stepId)` / `skipSleeps()` | `step.sleep` returns immediately instead of suspending |
 | `clearMocks()` | drop every seed; recorded rows are untouched |
 

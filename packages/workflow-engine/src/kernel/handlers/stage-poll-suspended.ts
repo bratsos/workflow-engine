@@ -71,6 +71,7 @@ import {
   withClaimedRun,
 } from "../helpers/index.js";
 import { fenceRunWrites } from "../helpers/run-writes.js";
+import { pendingWaits, waitTimeoutPatch } from "../helpers/step-api.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type {
   ActivityRunInput,
@@ -254,6 +255,10 @@ async function recordStageRetry(
       metadata?: Record<string, unknown>;
     } | null
   )?.metadata;
+  const retryAt = deps.clock.now().getTime() + retryBackoffMs(budget.attempt);
+  const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+    () => undefined,
+  );
   return withClaimedRun(
     stageRecord.workflowRunId,
     run.version,
@@ -264,9 +269,7 @@ async function recordStageRetry(
         errorMessage: message,
         // A job that finished the stage meanwhile keeps its outcome.
         expectedVersion: stageRecord.version,
-        nextPollAt: new Date(
-          deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
-        ),
+        nextPollAt: new Date(Math.min(retryAt, waitDeadline ?? retryAt)),
         suspendedState: {
           ...(stageRecord.suspendedState as object),
           metadata: {
@@ -374,6 +377,19 @@ async function claimSuspendedStage(
   if (deadline !== undefined && deadline > now && deadline < leaseUntil) {
     leaseUntil = deadline;
   }
+  if (isDurableStage(stageRecord)) {
+    // If this poller dies mid-replay, a wait the replay opened is not in the
+    // stored schedule: the lease bounds how long it goes unseen.
+    leaseUntil = Math.min(leaseUntil, now + MIN_CLAIM_LEASE_MS);
+    // `maxWaitUntil` may name the deadline this pass settles; a later one
+    // must still bound the lease.
+    const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+      () => undefined,
+    );
+    if (waitDeadline !== undefined && waitDeadline < leaseUntil) {
+      leaseUntil = waitDeadline;
+    }
+  }
   const nextPollAt = new Date(leaseUntil);
   try {
     await deps.persistence.updateStage(stageRecord.id, {
@@ -444,33 +460,63 @@ async function releaseStageClaim(
   }
 }
 
-async function failExpiredDurableWait(
+function isDurableStage(stageRecord: WorkflowStageRecord): boolean {
+  const metadata = (
+    stageRecord.suspendedState as { metadata?: Record<string, unknown> } | null
+  )?.metadata;
+  return metadata?.[DURABLE_SUSPEND_MARKER] === true;
+}
+
+/**
+ * The earliest deadline still ahead among a durable stage's pending waits
+ * with an explicit `onTimeout`. No claim lease or retry backoff may pass it.
+ */
+async function nextWaitDeadline(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<number | undefined> {
+  if (!deps.stepLedger || !isDurableStage(stageRecord)) return;
+  const now = deps.clock.now().getTime();
+  let earliest: number | undefined;
+  for (const record of await pendingWaits(deps.stepLedger, stageRecord.id)) {
+    const deadline = record.deadlineAt!.getTime();
+    if (
+      record.waitState?.onTimeout !== undefined &&
+      deadline > now &&
+      (earliest === undefined || deadline < earliest)
+    ) {
+      earliest = deadline;
+    }
+  }
+  return earliest;
+}
+
+async function settleExpiredDurableWait(
   stageRecordId: string,
   deps: KernelDeps,
 ): Promise<void> {
   if (!deps.stepLedger) return;
   const now = deps.clock.now().getTime();
-  const expired = (await deps.stepLedger.list(stageRecordId)).find(
-    (record) =>
-      (record.kind === "wait" || record.kind === "signal") &&
-      record.status === "pending" &&
-      record.deadlineAt !== null &&
-      record.deadlineAt.getTime() <= now,
-  );
-  if (!expired) return;
-
-  const error = new StepTimeoutError(expired.stepId);
-  const failed = await deps.stepLedger.compareAndSet(
-    stageRecordId,
-    expired.stepId,
-    { status: expired.status, attempt: expired.attempt },
-    {
-      status: "failed",
-      error: error.message,
-      leaseExpiresAt: null,
-    },
-  );
-  if (failed.applied) throw error;
+  let failedDefault = false;
+  // Waits with an explicit `onTimeout` can expire together: settle each
+  // before another wait in the replay suspends the stage again. Of the
+  // others, only the first expired wait is failed, as before.
+  for (const record of await pendingWaits(deps.stepLedger, stageRecordId)) {
+    if (record.deadlineAt!.getTime() > now) continue;
+    if (record.waitState?.onTimeout === undefined) {
+      if (failedDefault) continue;
+      failedDefault = true;
+    }
+    const error = new StepTimeoutError(record.stepId);
+    const patch = waitTimeoutPatch(record, error);
+    const settled = await deps.stepLedger.compareAndSet(
+      stageRecordId,
+      record.stepId,
+      { status: "pending", attempt: record.attempt },
+      patch,
+    );
+    if (settled.applied && patch.status === "failed") throw error;
+  }
 }
 
 /** Replays a durable stage's full execute context outside a transaction. */
@@ -491,7 +537,8 @@ async function replayStage(
     if (!workflow) {
       throw new Error(`Workflow ${run.workflowId} not found in registry`);
     }
-    await failExpiredDurableWait(stageRecord.id, deps);
+    // The deadline's own write is a run write like the body's.
+    await settleExpiredDurableWait(stageRecord.id, writes);
     const workflowContext = await loadWorkflowContext(run.id, deps);
     const rawInput = resolveStageInput(
       workflow,
@@ -534,9 +581,9 @@ async function replayStage(
       const suspended = result as SuspendedResult;
       const nextPollAt = suspended.pollConfig.nextPollAt;
       const bufferedAnnotations = built.annotationBuffer.flush();
-      const maxWaitUntil = new Date(
-        deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
-      );
+      const maxWaitUntil =
+        suspended.pollConfig.maxWaitUntil ??
+        new Date(deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime);
       // A replay that is still waiting on the same durable step re-suspends
       // silently: the run already announced this suspension, and a poll
       // every few seconds must not re-emit `stage:suspended` /

@@ -10,7 +10,11 @@ import {
   trackedWrite,
 } from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
-import { neverAbortingSignal } from "../../core/steps.js";
+import {
+  DURABLE_WAIT_POLLS,
+  neverAbortingSignal,
+  type StepWaitPolls,
+} from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
@@ -333,6 +337,9 @@ export function buildStageExecutionContext(
         void writeBatchWarn(deps.persistence, workflowRunId, message),
       onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
       ai: () => context.ai,
+      waitPolls: (
+        resumeState as { metadata?: Record<string, unknown> } | null | undefined
+      )?.metadata?.[DURABLE_WAIT_POLLS] as StepWaitPolls | undefined,
     }),
     abortSignal,
     onProgress: (update: ProgressUpdate) => {

@@ -1,7 +1,11 @@
-import { StepResultNotSerializable } from "../../core/steps.js";
+import {
+  StepResultNotSerializable,
+  StepTimeoutError,
+} from "../../core/steps.js";
 import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
+import { waitTimeoutPatch } from "../helpers/step-api.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord, WorkflowStageRecord } from "../ports.js";
 
@@ -124,102 +128,99 @@ async function deliverSignal(
     };
   };
 
-  const existing = await deps.stepLedger.get(stage.id, command.stepId);
-  if (existing?.kind !== undefined && existing.kind !== "signal") {
-    throw new Error(
-      `Durable step "${command.stepId}" was previously used as ${existing.kind} and cannot receive a signal`,
-    );
-  }
-  if (existing?.status === "failed") {
+  const timedOut = (): HandlerResult<StepSignalResult> => ({
+    ok: true,
+    signalled: false,
+    alreadyCompleted: true,
+    timedOut: true,
+    _events: [],
+  });
+  const finish = async (
+    record: StepRecord,
+    alreadyCompleted: boolean,
+  ): Promise<HandlerResult<StepSignalResult>> => {
+    if (record.waitState?.timedOut) return timedOut();
+    return wake(record, alreadyCompleted);
+  };
+  // Only a deadline fails a wait row. With an explicit `onTimeout` the
+  // sender gets the same refusal as before the poller recorded it.
+  const failed = (record: StepRecord): HandlerResult<StepSignalResult> => {
+    if (
+      record.waitState?.onTimeout !== undefined &&
+      record.error === new StepTimeoutError(record.stepId).message
+    ) {
+      return timedOut();
+    }
     throw new Error(
       `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
     );
-  }
-  if (existing?.status === "completed") {
-    return wake(existing, true);
-  }
+  };
 
-  const payload = jsonRoundTrip(command.payload, command.stepId);
-  if (existing) {
+  const completeExisting = async (
+    record: StepRecord,
+    payload: () => unknown,
+  ) => {
+    if (record.kind !== "signal") {
+      throw new Error(
+        `Durable step "${command.stepId}" was previously used as ${record.kind} and cannot receive a signal`,
+      );
+    }
+    if (record.status === "failed") return failed(record);
+    if (record.status === "completed") return finish(record, true);
+
+    // From its deadline on, a wait with an explicit `onTimeout` can only
+    // settle as timed out, the verdict the poller and the stage replay reach.
+    // A "throw" wait is left for them to fail where they always have.
+    const expired =
+      record.status === "pending" &&
+      record.waitState?.onTimeout !== undefined &&
+      record.deadlineAt !== null &&
+      record.deadlineAt <= deps.clock.now();
+    if (expired && record.waitState?.onTimeout !== "return") return timedOut();
     const completed = await deps.stepLedger.compareAndSet(
       stage.id,
       command.stepId,
-      { status: existing.status, attempt: existing.attempt },
-      {
-        status: "completed",
-        result: payload,
-        error: null,
-        leaseExpiresAt: null,
-      },
+      { status: record.status, attempt: record.attempt },
+      expired
+        ? waitTimeoutPatch(record, new StepTimeoutError(record.stepId))
+        : {
+            status: "completed",
+            result: payload(),
+            error: null,
+            leaseExpiresAt: null,
+          },
     );
     if (!completed.applied) {
       const winner = await deps.stepLedger.get(stage.id, command.stepId);
       if (winner?.status === "completed") {
-        return wake(winner, true);
+        return finish(winner, true);
       }
-      if (winner?.status === "failed") {
-        throw new Error(
-          `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
-        );
-      }
+      if (winner?.status === "failed") return failed(winner);
       throw new Error(`Durable signal step "${command.stepId}" changed state`);
     }
-    return wake(completed.record!, false);
-  } else {
-    const claimed = await deps.stepLedger.claim({
-      stageRecordId: stage.id,
-      stepId: command.stepId,
-      // External signals arrive before the stage knows their replay position.
-      // seq=0 is treated as an unknown/wildcard position by StepApi.
-      seq: 0,
-      kind: "signal",
-      status: "completed",
-      attempt: 1,
-      leaseExpiresAt: null,
-      deadlineAt: null,
-      result: payload,
-    });
-    if (!claimed.created) {
-      if (claimed.record.kind !== "signal") {
-        throw new Error(
-          `Durable step "${command.stepId}" was previously used as ${claimed.record.kind} and cannot receive a signal`,
-        );
-      }
-      if (claimed.record.status === "failed") {
-        throw new Error(
-          `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
-        );
-      }
-      if (claimed.record.status === "completed") {
-        return wake(claimed.record, true);
-      }
-      const completed = await deps.stepLedger.compareAndSet(
-        stage.id,
-        command.stepId,
-        { status: claimed.record.status, attempt: claimed.record.attempt },
-        {
-          status: "completed",
-          result: payload,
-          error: null,
-          leaseExpiresAt: null,
-        },
-      );
-      if (!completed.applied) {
-        const winner = await deps.stepLedger.get(stage.id, command.stepId);
-        if (winner?.status === "completed") {
-          return wake(winner, true);
-        }
-        if (winner?.status === "failed") {
-          throw new Error(
-            `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
-          );
-        }
-        throw new Error(
-          `Durable signal step "${command.stepId}" changed state`,
-        );
-      }
-      return wake(completed.record!, false);
-    }
-    return wake(claimed.record, false);
+    return finish(completed.record!, false);
+  };
+
+  const readPayload = () => jsonRoundTrip(command.payload, command.stepId);
+  const existing = await deps.stepLedger.get(stage.id, command.stepId);
+  if (existing) return completeExisting(existing, readPayload);
+
+  const payload = readPayload();
+  const claimed = await deps.stepLedger.claim({
+    stageRecordId: stage.id,
+    stepId: command.stepId,
+    // External signals arrive before the stage knows their replay position.
+    // seq=0 is treated as an unknown/wildcard position by StepApi.
+    seq: 0,
+    kind: "signal",
+    status: "completed",
+    attempt: 1,
+    leaseExpiresAt: null,
+    deadlineAt: null,
+    result: payload,
+  });
+  if (!claimed.created) {
+    return completeExisting(claimed.record, () => payload);
   }
+  return wake(claimed.record, false);
 }

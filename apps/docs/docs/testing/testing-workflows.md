@@ -100,7 +100,7 @@ Caveats worth knowing before you rely on this:
 - Seeds match by step id across every stage, so a step id two stages deliberately share is answered for whichever claims it first.
 - A seed answers for the whole run: when the engine retries a failed stage it reopens that stage's step rows, and the seed is re-asserted rather than falling back to the real body. `clearMocks()` hands the step back.
 - `mockError` records the failure above any `retries` budget the step declares, so it is terminal. Pass `{ attempt: 1 }` to test the retry path, and do not assert on a mocked failure's `attempt`.
-- `mockTimeout` throws for a step that has no deadline (`step.run`, `step.sleep`) rather than silently doing nothing.
+- `mockTimeout` exercises the wait's deadline policy. An opted-in wait returns `{ timedOut: true }`. The default policy throws `StepTimeoutError`. Calling it for `step.run` or `step.sleep` throws because those steps have no wait deadline.
 
 `createMockStepLedger(inner, clock)` is exported for use without the harness; it mirrors the `StepLedger` port exactly.
 

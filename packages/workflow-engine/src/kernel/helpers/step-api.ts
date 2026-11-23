@@ -4,10 +4,15 @@ import type {
   StepApi,
   StepControlFlowError,
   StepKeyUse,
+  StepPollSchedule,
   StepRunContext,
   StepRunOptions,
   StepSignalOptions,
+  StepSuspendSchedule,
+  StepTimeoutMode,
   StepWaitOptions,
+  StepWaitPolls,
+  StepWaitResult,
 } from "../../core/steps.js";
 import {
   brandNonRetryable,
@@ -31,7 +36,12 @@ import {
   stageAbortReason,
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
-import type { Clock, StepLedger, StepRecord } from "../ports.js";
+import type {
+  Clock,
+  StepLedger,
+  StepRecord,
+  StepRecordPatch,
+} from "../ports.js";
 import {
   isSubmitStepRow,
   owedRefsOf,
@@ -84,6 +94,8 @@ export interface CreateStepApiOptions {
   abortSignal?: AbortSignal;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
   ai?: () => AIHelper;
+  /** The wait polls the stage's last suspension stored (see `StepWaitPolls`). */
+  waitPolls?: StepWaitPolls;
   /**
    * Uniform source in [0, 1) for `retryBackoff.jitter`. Defaults to
    * `Math.random`; injectable so a test can pin the drawn delay.
@@ -130,6 +142,53 @@ function storedError(record: StepRecord): Error {
   return new Error(
     record.error ?? `Durable step "${record.stepId}" previously failed`,
   );
+}
+
+export function waitTimeoutPatch(
+  record: StepRecord,
+  error: StepTimeoutError,
+): StepRecordPatch {
+  if (record.waitState?.onTimeout === "return") {
+    return {
+      status: "completed",
+      result: null,
+      error: null,
+      leaseExpiresAt: null,
+      waitState: { ...record.waitState, timedOut: true },
+    };
+  }
+  return { status: "failed", error: error.message, leaseExpiresAt: null };
+}
+
+/**
+ * A stage's pending wait and signal rows that carry a deadline, read without
+ * the results of its completed steps.
+ */
+export async function pendingWaits(
+  ledger: StepLedger,
+  stageRecordId: string,
+): Promise<StepRecord[]> {
+  const rows = await (ledger.listPendingWaits?.(stageRecordId) ??
+    ledger.list(stageRecordId));
+  return rows.filter(
+    (row) =>
+      (row.kind === "wait" || row.kind === "signal") &&
+      row.status === "pending" &&
+      row.deadlineAt !== null,
+  );
+}
+
+function waitResult<T>(
+  record: StepRecord,
+  onTimeout: StepTimeoutMode | undefined,
+): T | StepWaitResult<T> {
+  if (record.status === "failed") throw storedError(record);
+  if (record.waitState?.timedOut) {
+    if (onTimeout === "return") return { timedOut: true };
+    throw terminal(new StepTimeoutError(record.stepId));
+  }
+  const value = record.result as T;
+  return onTimeout === "return" ? { timedOut: false, value } : value;
 }
 
 /**
@@ -293,6 +352,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    */
   const requestedIds = new Map<string, StepKeyUse>();
   let pendingControlFlow: StepControlFlowError | undefined;
+  let suspendedBy: StepControlFlowError | undefined;
+  const waitCheckpoints = new Set<Promise<void>>();
+  const waitSchedules = new Map<string, StepPollSchedule>();
   const defaultLeaseMs = assertTimerMs(
     "defaultLeaseMs",
     options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
@@ -308,6 +370,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
   function suspend(error: StepControlFlowError): never {
     pendingControlFlow ??= error;
+    if (error instanceof StepSuspend) waitSchedules.set(error.stepId, error);
     throw error;
   }
 
@@ -525,20 +588,33 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
   }
 
   /**
-   * Fail a wait or signal step at its deadline — unless the thing it was
-   * waiting for landed first. A signal delivered, or another poller's ready
-   * verdict, is an outcome recorded out of band; the deadline write must
-   * lose to it rather than convert an answered step into a timed-out one.
-   * Returns the recorded outcome when it lost; otherwise it throws.
+   * Settle a wait or signal step at its deadline. A signal or a ready poll
+   * can win the same pending row, so always use the recorded outcome.
    */
-  async function timeout(stepId: string): Promise<StepRecord> {
-    const error = new StepTimeoutError(stepId);
-    const outcome = await commitOutcome(stepId, "pending", {
-      status: "failed",
-      error: error.message,
-      leaseExpiresAt: null,
-    });
-    if (!outcome.parked) throw terminal(error);
+  async function timeout(record: StepRecord): Promise<StepRecord> {
+    const error = new StepTimeoutError(record.stepId);
+    const patch = waitTimeoutPatch(record, error);
+    const outcome = await commitOutcome(
+      record.stepId,
+      "pending",
+      patch,
+      record.attempt,
+    );
+    if (!outcome.parked && patch.status === "failed") throw terminal(error);
+    return outcome.record;
+  }
+
+  async function updateWaitState(
+    record: StepRecord,
+    waitState: StepRecord["waitState"],
+  ): Promise<StepRecord | null> {
+    const { stageRecordId, ledger } = requireLedger();
+    const outcome = await ledger.compareAndSet(
+      stageRecordId,
+      record.stepId,
+      { status: "pending", attempt: record.attempt },
+      { waitState },
+    );
     return outcome.record;
   }
 
@@ -548,6 +624,34 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
   const inFlight = new Set<InFlightRun>();
 
+  /** A wait's ledger setup can outlive the first rejection from Promise.all. */
+  function trackWait<T>(
+    id: string,
+    execute: (beforePoll: (schedule: StepPollSchedule) => void) => Promise<T>,
+  ): Promise<T> {
+    const { promise: checkpoint, resolve } = Promise.withResolvers<void>();
+    waitCheckpoints.add(checkpoint);
+    function checkpointReached() {
+      waitCheckpoints.delete(checkpoint);
+      resolve();
+    }
+    let polling: StepPollSchedule | undefined;
+    const result = execute((schedule) => {
+      polling = schedule;
+      waitSchedules.set(id, schedule);
+      checkpointReached();
+    });
+    const settled = () => {
+      if (polling && waitSchedules.get(id) === polling)
+        waitSchedules.delete(id);
+      checkpointReached();
+    };
+    // Release the checkpoint from the same promise the stage awaits, so a
+    // branch that resumes from this result can start its next wait.
+    void result.then(settled, settled);
+    return result;
+  }
+
   /**
    * Let every in-flight `run` finish so its ledger row is written before the
    * stage suspends. Bounded by the longest remaining lease: a step that
@@ -555,7 +659,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    * that would otherwise block forever. Failures need no handling here —
    * `run` already recorded them as failed rows.
    */
-  async function settleInFlight(): Promise<void> {
+  async function settleInFlight(
+    suspension?: StepControlFlowError,
+  ): Promise<StepSuspendSchedule | undefined> {
     while (inFlight.size > 0) {
       const pending = [...inFlight];
       const boundMs = Math.max(
@@ -586,8 +692,76 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           "WARN",
           `${pending.length} durable run step(s) outlived their lease while the stage was suspending`,
         );
-        return;
+        break;
       }
+    }
+    if (!suspension) return;
+    // Track only checkpointing. An opted-in poll can still be in progress
+    // when another wait suspends the stage, so use its provisional schedule.
+    while (waitCheckpoints.size > 0) await Promise.all(waitCheckpoints);
+    // From here a continuation cannot open an opted-in wait: its deadline
+    // would miss this schedule. Steps that already exist still run.
+    suspendedBy = suspension;
+    if (!options.stepLedger || !options.stageRecordId) return;
+    // A wait with an explicit `onTimeout` wakes the stage at its poll or
+    // deadline, also when this invocation did not reach it. Other waits keep
+    // the schedule of the wait that suspended the stage.
+    const now = suspension.at.getTime();
+    const polls: StepWaitPolls = [];
+    const carriedPolls = new Map(
+      (Array.isArray(options.waitPolls) ? options.waitPolls : []).map(
+        (poll) => [poll.stepId, poll],
+      ),
+    );
+    let earliest: StepPollSchedule | undefined;
+    let maxWaitUntil: Date | undefined;
+    for (const row of await pendingWaits(
+      options.stepLedger,
+      options.stageRecordId,
+    )) {
+      if (row.waitState?.onTimeout === undefined) continue;
+      const deadline = row.deadlineAt!.getTime();
+      const fresh = waitSchedules.get(row.stepId);
+      const carried = carriedPolls.get(row.stepId);
+      const carriedAt = Date.parse(carried?.nextPollAt ?? "");
+      let nextPoll = deadline;
+      let pollInterval: number | undefined;
+      if (fresh) {
+        nextPoll = fresh.nextPollAt.getTime();
+        pollInterval = fresh.pollInterval;
+      } else if (
+        Number.isFinite(carriedAt) &&
+        Number.isFinite(carried?.pollInterval)
+      ) {
+        pollInterval = carried!.pollInterval;
+        // Overdue and not reached yet: the next poll follows its interval.
+        nextPoll = carriedAt > now ? carriedAt : now + pollInterval;
+      }
+      nextPoll = Math.min(nextPoll, deadline);
+      pollInterval ??= Math.max(0, nextPoll - now);
+      polls.push({
+        stepId: row.stepId,
+        nextPollAt: new Date(nextPoll).toISOString(),
+        pollInterval,
+      });
+      if (!earliest || nextPoll < earliest.nextPollAt.getTime()) {
+        earliest = {
+          nextPollAt: new Date(nextPoll),
+          maxWaitUntil: row.deadlineAt!,
+          pollInterval,
+        };
+      }
+      if (!maxWaitUntil || deadline < maxWaitUntil.getTime()) {
+        maxWaitUntil = row.deadlineAt!;
+      }
+    }
+    if (earliest && maxWaitUntil) {
+      return {
+        nextPollAt: earliest.nextPollAt,
+        pollInterval: earliest.pollInterval,
+        maxWaitUntil,
+        polls,
+      };
     }
   }
 
@@ -830,11 +1004,19 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       return completed.record.result as T;
     },
 
-    async waitFor<T>(id: string, opts: StepWaitOptions<T>) {
+    async waitFor<T>(
+      id: string,
+      opts: StepWaitOptions<T, StepTimeoutMode>,
+      beforePoll: (schedule: StepPollSchedule) => void,
+    ) {
       const invocation = begin(id, "wait");
       const existing = await get(invocation, "wait");
-      if (existing?.status === "completed") return existing.result as T;
-      if (existing?.status === "failed") throw storedError(existing);
+      if (existing?.status === "completed" || existing?.status === "failed") {
+        return waitResult<T>(existing, opts.onTimeout);
+      }
+      if (!existing && suspendedBy && opts.onTimeout !== undefined) {
+        throw suspendedBy;
+      }
 
       const everyMs = parseStepDuration(opts.every);
       const timeoutMs = parseStepDuration(opts.timeout);
@@ -852,19 +1034,25 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             attempt: 1,
             leaseExpiresAt: null,
             deadlineAt: new Date(now.getTime() + timeoutMs),
-            waitState: { everyMs },
+            waitState: {
+              everyMs,
+              ...(opts.onTimeout !== undefined
+                ? { onTimeout: opts.onTimeout }
+                : {}),
+            },
           })
         ).record;
 
-      if (record.status === "completed") return record.result as T;
-      if (record.status === "failed") throw storedError(record);
+      if (record.status === "completed" || record.status === "failed") {
+        return waitResult<T>(record, opts.onTimeout);
+      }
       if (!record.deadlineAt) {
         throw new Error(`Durable wait step "${id}" is missing deadlineAt`);
       }
 
       const current = options.clock.now();
       if (current.getTime() >= record.deadlineAt.getTime()) {
-        return parkedResult<T>(await timeout(id));
+        return waitResult<T>(await timeout(record), opts.onTimeout);
       }
       // Nothing this poll could learn will be kept: the run is cancelled or
       // another worker owns the job. The row stays pending for whoever
@@ -872,6 +1060,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const aborted = abortError();
       if (aborted) throw aborted;
 
+      const savedEveryMs = record.waitState?.everyMs ?? everyMs;
+      beforePoll({
+        nextPollAt: boundedNextPoll(current, savedEveryMs, record.deadlineAt),
+        maxWaitUntil: record.deadlineAt,
+        pollInterval: savedEveryMs,
+      });
       let value: T;
       try {
         value = await opts.poll();
@@ -886,12 +1080,21 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        await update(id, {
-          waitState: { ...record.waitState, pollFailures },
+        const updated = await updateWaitState(record, {
+          ...record.waitState,
+          pollFailures,
         });
+        if (updated?.status === "completed" || updated?.status === "failed") {
+          return waitResult<T>(updated, opts.onTimeout);
+        }
         const afterPoll = options.clock.now();
         if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
-          return parkedResult<T>(await timeout(id));
+          return waitResult<T>(
+            await timeout(
+              updated?.attempt === record.attempt ? updated : record,
+            ),
+            opts.onTimeout,
+          );
         }
         suspend(
           new StepSuspend({
@@ -908,25 +1111,31 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         );
       }
 
-      if (opts.ready(value)) {
+      const ready = opts.ready(value);
+      // Read after the verdict, which can itself take time.
+      const afterPoll = options.clock.now();
+      const expired = afterPoll.getTime() >= record.deadlineAt.getTime();
+      // With an explicit `onTimeout` the deadline decides: a ready answer
+      // seen at or after it is too late, like a signal at that instant.
+      if (ready && !(expired && record.waitState?.onTimeout !== undefined)) {
         const result = jsonRoundTrip(value, id);
         // A wait row is open while `pending`: an out-of-band completion
         // (a signal delivered, another poller ahead of this one) wins.
         const completed = await complete(id, "pending", result);
-        if (completed.parked) return parkedResult<T>(completed.record);
-        return completed.record.result as T;
+        return waitResult<T>(completed.record, opts.onTimeout);
       }
 
-      const afterPoll = options.clock.now();
-      if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
-        return parkedResult<T>(await timeout(id));
+      if (expired) {
+        return waitResult<T>(await timeout(record), opts.onTimeout);
       }
       if (record.waitState?.pollFailures) {
         // The poll answered: a later failure starts a new streak.
         const { pollFailures: _reset, ...rest } = record.waitState;
-        await update(id, { waitState: rest });
+        const settled = await updateWaitState(record, rest);
+        if (settled?.status === "completed" || settled?.status === "failed") {
+          return waitResult<T>(settled, opts.onTimeout);
+        }
       }
-      const savedEveryMs = record.waitState?.everyMs ?? everyMs;
       suspend(
         new StepSuspend({
           stepId: id,
@@ -942,11 +1151,18 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       );
     },
 
-    async waitForSignal<T = unknown>(id: string, opts: StepSignalOptions) {
+    async waitForSignal<T = unknown>(
+      id: string,
+      opts: StepSignalOptions<StepTimeoutMode>,
+    ) {
       const invocation = begin(id, "signal");
       const existing = await get(invocation, "signal");
-      if (existing?.status === "completed") return existing.result as T;
-      if (existing?.status === "failed") throw storedError(existing);
+      if (existing?.status === "completed" || existing?.status === "failed") {
+        return waitResult<T>(existing, opts.onTimeout);
+      }
+      if (!existing && suspendedBy && opts.onTimeout !== undefined) {
+        throw suspendedBy;
+      }
 
       const timeoutMs = parseStepDuration(opts.timeout);
       const keepaliveMs = positiveDuration(
@@ -966,17 +1182,21 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             attempt: 1,
             leaseExpiresAt: null,
             deadlineAt: new Date(now.getTime() + timeoutMs),
+            ...(opts.onTimeout !== undefined
+              ? { waitState: { onTimeout: opts.onTimeout } }
+              : {}),
           })
         ).record;
 
-      if (record.status === "completed") return record.result as T;
-      if (record.status === "failed") throw storedError(record);
+      if (record.status === "completed" || record.status === "failed") {
+        return waitResult<T>(record, opts.onTimeout);
+      }
       if (!record.deadlineAt) {
         throw new Error(`Durable signal step "${id}" is missing deadlineAt`);
       }
       const current = options.clock.now();
       if (current.getTime() >= record.deadlineAt.getTime()) {
-        return parkedResult<T>(await timeout(id));
+        return waitResult<T>(await timeout(record), opts.onTimeout);
       }
       suspend(
         new StepSuspend({
@@ -1042,7 +1262,18 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
   };
 
   const api = {
-    ...impl,
+    waitFor<T>(id: string, opts: StepWaitOptions<T, StepTimeoutMode>) {
+      return trackWait(id, (beforePoll) => impl.waitFor(id, opts, beforePoll));
+    },
+    waitForSignal<T = unknown>(
+      id: string,
+      opts: StepSignalOptions<StepTimeoutMode>,
+    ) {
+      return trackWait(id, () => impl.waitForSignal<T>(id, opts));
+    },
+    sleep(id: string, duration: number | string) {
+      return trackWait(id, () => impl.sleep(id, duration));
+    },
     /**
      * Steps may run concurrently under `Promise.all`. Each `run` is tracked
      * while it executes so a suspension elsewhere can wait for it (see
@@ -1077,8 +1308,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     writable: false,
     value: createStepAi({
       run: (id, fn, opts) => api.run(id, fn, opts),
-      waitFor: <T>(id: string, opts: StepWaitOptions<T>) =>
-        api.waitFor(id, opts),
+      waitFor: api.waitFor,
       async isCompleted(stepId) {
         const { stageRecordId, ledger } = requireLedger();
         const record = await ledger.get(stageRecordId, stepId);

@@ -207,6 +207,19 @@ export class PrismaStepLedger implements StepLedger {
     return records.map(mapStep);
   }
 
+  async listPendingWaits(stageRecordId: string): Promise<StepRecord[]> {
+    const records = await this.prisma.workflowStep.findMany({
+      where: {
+        stageRecordId,
+        status: "pending",
+        kind: { in: ["wait", "signal"] },
+        deadlineAt: { not: null },
+      },
+      orderBy: { seq: "asc" },
+    });
+    return records.map(mapStep);
+  }
+
   transactionReads(persistence: Persistence): Partial<StepLedger> | undefined {
     if (this.databaseType !== "sqlite") return undefined;
     return sqliteTransactionReads(persistence, this.prisma, (tx) => {

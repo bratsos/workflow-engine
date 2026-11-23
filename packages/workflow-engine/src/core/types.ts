@@ -108,6 +108,8 @@ export interface SuspendedResult {
     pollInterval: number;
     maxWaitTime: number;
     nextPollAt: Date;
+    /** Absolute deadline for a durable suspension. */
+    maxWaitUntil?: Date;
   };
   metrics: StageMetrics;
 }
