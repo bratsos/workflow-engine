@@ -254,11 +254,10 @@ jobs:
       matrix:
         database: ["postgres", "sqlite"]
 
-    # Known red: under Bun's node:sqlite, the journal-mode and root-connection
-    # cases in sqlite8-kernel-concurrency.test.ts and from-prisma8-sqlite.test.ts
-    # fail with "database is locked" where Node passes them; they are listed in
-    # the ci lane report. The Postgres row stays a hard gate.
-    continue-on-error: ${{ matrix.database == 'sqlite' }}
+    # The Postgres row is a hard gate. The SQLite steps are non-blocking for now:
+    # under Bun's node:sqlite the journal-mode and root-connection cases in
+    # sqlite8-kernel-concurrency.test.ts and from-prisma8-sqlite.test.ts fail
+    # with "database is locked" where Node passes them.
 
     services:
       postgres:
@@ -345,18 +344,21 @@ jobs:
 
       - name: Run engine SQLite conformance tests
         if: matrix.database == 'sqlite'
+        continue-on-error: true
         run: bun --bun run --cwd packages/workflow-engine test:sqlite
         env:
           SQLITE8_KERNEL_SQLITE: "1"
 
       - name: Run host outbox recovery tests on SQLite
         if: matrix.database == 'sqlite'
+        continue-on-error: true
         run: |
           bun --bun run --cwd packages/workflow-engine-host-node vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
           bun --bun run --cwd packages/workflow-engine-host-serverless vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
 
       - name: Run console SQLite conformance tests
         if: matrix.database == 'sqlite'
+        continue-on-error: true
         run: |
           bun --bun packages/workflow-engine-console/scripts/build-ui.mjs
           bun --bun run --cwd packages/workflow-engine-console vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
