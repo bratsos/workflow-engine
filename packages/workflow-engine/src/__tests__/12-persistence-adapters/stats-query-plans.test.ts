@@ -753,7 +753,13 @@ describe.skipIf(!sqlite && !databaseUrl)(
             );
             expect(queries).toHaveLength(1);
             const explanation = await plan(queries[0]!, size === 0);
-            expect(explanation).toMatch(/ai_calls_tenantId_createdAt_idx/);
+            // An empty table gives the planner no reason to prefer the tenant
+            // index over the age index, and either bounds the read.
+            expect(explanation).toMatch(
+              size === 0
+                ? /ai_calls_(?:tenantId_)?createdAt_idx/
+                : /ai_calls_tenantId_createdAt_idx/,
+            );
             expect(explanation).not.toMatch(
               /Seq Scan on ai_calls|SCAN (?:main\.)?(?:ai_calls|t0)\b/i,
             );
