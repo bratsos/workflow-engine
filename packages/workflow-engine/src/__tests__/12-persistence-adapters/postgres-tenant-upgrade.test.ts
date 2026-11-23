@@ -21,11 +21,24 @@ const seven =
 const nine =
   "workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)";
 
+it("keeps the seven-argument body identical to the nine-argument body apart from its NULL attribution", async () => {
+  const [nineBody, sevenBody, ...rest] = (await readFile(enqueue, "utf8"))
+    .split("$$")
+    .filter((_, index) => index % 2 === 1);
+  expect(rest).toEqual([]);
+  const attribution =
+    /^ {2}p_tenant_id +CONSTANT text +:= NULL;\n {2}p_labels +CONSTANT jsonb +:= NULL;\n/m;
+  expect(sevenBody).toMatch(attribution);
+  expect(sevenBody.replace(attribution, "")).toBe(nineBody);
+});
+
 describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
   let admin: Client;
   let id: string;
   let schemas: string[];
   let schema: string;
+  // SQL-standard function bodies (RETURN) need PostgreSQL 14.
+  let sqlStandardBodies: boolean;
 
   async function newSchema() {
     const name = `tenant_upgrade_${id}_${schemas.length}`;
@@ -39,6 +52,11 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
     schemas = [];
     admin = new Client({ connectionString: databaseUrl });
     await admin.connect();
+    sqlStandardBodies =
+      Number(
+        (await admin.query("SHOW server_version_num")).rows[0]
+          .server_version_num,
+      ) >= 140000;
     schema = await newSchema();
     await admin.query(`SET search_path TO "${schema}", public`);
   });
@@ -55,7 +73,7 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
   });
 
   async function psqlWith(
-    { stop = true, searchPath = schema },
+    { stop = true, searchPath = schema, options = "" },
     ...args: string[]
   ) {
     const url = new URL(databaseUrl!);
@@ -78,7 +96,7 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
           env: {
             ...process.env,
             PGPASSWORD: password,
-            PGOPTIONS: `-c search_path=${searchPath}`,
+            PGOPTIONS: `-c search_path=${searchPath} ${options}`,
           },
         },
       );
@@ -314,9 +332,14 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
         REVOKE EXECUTE ON FUNCTION ${fn} FROM PUBLIC;
         GRANT EXECUTE ON FUNCTION ${fn} TO pg_monitor WITH GRANT OPTION;
         ALTER FUNCTION ${fn} OWNER TO pg_read_all_settings;
-        CREATE FUNCTION "${upgraded}".enqueue_order(k text) RETURNS text LANGUAGE SQL
-          RETURN "${upgraded}".workflow_engine_enqueue(k, 'orders', 'Orders', '{}', '{}', 5, NULL);
       `);
+    const wrapped = `"${upgraded}".workflow_engine_enqueue(k, 'orders', 'Orders', '{}', '{}', 5, NULL)`;
+    // On PostgreSQL 14+ the wrapper's body records a dependency on the function.
+    await admin.query(
+      `CREATE FUNCTION "${upgraded}".enqueue_order(k text) RETURNS text LANGUAGE sql ${
+        sqlStandardBodies ? `RETURN ${wrapped}` : `AS $$ SELECT ${wrapped} $$`
+      }`,
+    );
     const [before] = await functions(upgraded);
     expect(before).toMatchObject({
       args: 7,
@@ -346,7 +369,7 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
     await admin.query(`
         CREATE FUNCTION "${conflicting}".workflow_engine_enqueue(
           report_key text, b text, c text, d jsonb, e jsonb, f integer, g text
-        ) RETURNS text LANGUAGE sql RETURN 'report';
+        ) RETURNS text LANGUAGE sql AS $$ SELECT 'report'::text $$;
       `);
     const [own] = await functions(conflicting);
     expect(await run(conflicting)).toMatchObject({
@@ -367,6 +390,22 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
         await call(conflicting, `"${conflicting}"`, 9, [conflicting]),
       ).toEqual([conflicting]);
     }
+
+    // A failing first statement: the schema already holds a nine-argument
+    // function under other parameter names. Whether the seven-argument
+    // function is still the released one or was replaced, it creates runs.
+    const nineTaken = await engine(released);
+    await admin.query(`
+        CREATE FUNCTION "${nineTaken}".workflow_engine_enqueue(
+          app_key text, b text, c text, d jsonb, e jsonb, f integer, g text, h text, i jsonb
+        ) RETURNS text LANGUAGE sql AS $$ SELECT 'existing-nine'::text $$;
+      `);
+    expect(await run(nineTaken)).toMatchObject({
+      stderr: expect.stringContaining("42P13"),
+    });
+    expect(await call(nineTaken, `"${nineTaken}"`, 7, [nineTaken])).toEqual([
+      nineTaken,
+    ]);
   });
 
   // Each scenario runs once on alpha.21 engines and once on engines upgraded
@@ -473,7 +512,7 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
     });
   });
 
-  it("keeps a role restricted to the seven-argument function enqueueing with the documented grant", async () => {
+  it("keeps a role restricted to the seven-argument function enqueueing after the upgrade", async () => {
     const e = await engine(released);
     const role = `enqueue_role_${id}`;
     await admin.query(`
@@ -485,10 +524,10 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
       REVOKE EXECUTE ON FUNCTION "${e}".${seven} FROM PUBLIC;
       GRANT EXECUTE ON FUNCTION "${e}".${seven} TO "${role}";
     `);
-    const enqueueAsRole = async () => {
+    const enqueueAsRole = async (args: 7 | 9) => {
       await admin.query(`SET ROLE "${role}"`);
       try {
-        return await enqueueId(e, `"${e}"`, 7);
+        return await enqueueId(e, `"${e}"`, args);
       } finally {
         await admin.query("RESET ROLE");
       }
@@ -502,14 +541,15 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
         ...acl.flatMap((statement) => ["-c", statement]),
       );
     try {
-      expect(await enqueueAsRole()).toEqual(expect.any(String));
+      expect(await enqueueAsRole(7)).toEqual(expect.any(String));
       const [releasedFunction] = await functions(e);
 
-      // The seven-argument function calls the new overload as its caller.
+      // Restricting the new overload leaves the released callers alone.
       expect(
         await install(`REVOKE EXECUTE ON FUNCTION ${nine} FROM PUBLIC`),
       ).toMatchObject({ code: 0 });
-      expect(await enqueueAsRole()).toEqual({ code: "42501" });
+      expect(await enqueueAsRole(7)).toEqual(expect.any(String));
+      expect(await enqueueAsRole(9)).toEqual({ code: "42501" });
 
       expect(
         await install(
@@ -517,7 +557,8 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
           `GRANT EXECUTE ON FUNCTION ${nine} TO "${role}"`,
         ),
       ).toMatchObject({ code: 0 });
-      expect(await enqueueAsRole()).toEqual(expect.any(String));
+      expect(await enqueueAsRole(9)).toEqual(expect.any(String));
+      expect(await enqueueAsRole(7)).toEqual(expect.any(String));
       const [after, overload] = await functions(e);
       expect(after).toEqual(releasedFunction);
       expect(overload.acl).toEqual([
@@ -554,26 +595,34 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
     await expectEnqueues(schema, false);
   });
 
-  it("fails the column upgrade while an attribution index name holds another definition", async () => {
+  it("fails the column upgrade while an attribution index name is on another table, however identifiers print", async () => {
     await releasedAttributionTables();
     await admin.query(
-      'CREATE INDEX "ai_calls_workflowRunId_idx" ON ai_calls (topic)',
+      'CREATE INDEX "ai_calls_workflowRunId_idx" ON workflow_runs (id)',
     );
     expect(await psql("-f", schemaUpgrade)).toMatchObject({
       code: 3,
       stderr: expect.stringContaining(
-        "Attribution index ai_calls_workflowRunId_idx is missing, invalid or not defined as planned",
+        "Attribution index ai_calls_workflowRunId_idx is missing, invalid or on another table",
       ),
     });
     await admin.query('DROP INDEX "ai_calls_workflowRunId_idx"');
+    expect(
+      await psqlWith(
+        { options: "-c quote_all_identifiers=on" },
+        "-f",
+        schemaUpgrade,
+      ),
+    ).toMatchObject({ code: 0 });
     expect(await psql("-f", schemaUpgrade)).toMatchObject({ code: 0 });
     expect(
       (
         await admin.query(
-          `SELECT pg_get_indexdef('"ai_calls_workflowRunId_idx"'::regclass) AS definition`,
+          `SELECT indrelid::regclass::text AS "table", indisvalid AS valid
+             FROM pg_index WHERE indexrelid = '"ai_calls_workflowRunId_idx"'::regclass`,
         )
-      ).rows[0].definition,
-    ).toContain('USING btree ("workflowRunId")');
+      ).rows,
+    ).toEqual([{ table: "ai_calls", valid: true }]);
   });
 
   it.skipIf(process.env.PRISMA_MAJOR !== "6")(
@@ -636,7 +685,7 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
         expect(await psql("-f", schemaUpgrade)).toMatchObject({
           code: 3,
           stderr: expect.stringContaining(
-            "is missing, invalid or not defined as planned",
+            "is missing, invalid or on another table",
           ),
         });
         await admin.query(

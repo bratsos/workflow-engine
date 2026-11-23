@@ -1488,17 +1488,17 @@ consumer's migration owns it.
 
 The same file installs and upgrades. It is idempotent and drops nothing:
 it creates the nine-argument overload, then replaces the released
-seven-argument function in place, which keeps that function's owner, ACL,
-comment and the views or wrappers that depend on it. Table names resolve
-through the caller's search path. psql takes a libpq connection string:
+seven-argument function in place, which keeps that function's owner, ACL
+and the views or wrappers that depend on it. Table names resolve through
+the caller's search path. psql takes a libpq connection string:
 remove Prisma-only parameters such as `schema` and `statement_cache_size`,
 and select a non-public engine schema with
 `PGOPTIONS='-c search_path=<schema>'`.
 
 A new function gets the database's default function ACL, which lets
-`PUBLIC` execute it. The seven-argument function calls the nine-argument one
-as the calling role, so every role that enqueues needs `EXECUTE` on the new
-overload. To restrict it to an application role, commit the `REVOKE` and
+`PUBLIC` execute it. Existing callers of the seven-argument function keep
+their access; only roles that pass a tenant or labels need `EXECUTE` on the
+new overload. To restrict it to an application role, commit the `REVOKE` and
 `GRANT` with the install:
 
 ```bash
@@ -1533,8 +1533,7 @@ workflow_engine_enqueue(
   p_labels             jsonb
 ) RETURNS text
 
--- The released signature. It calls the nine-argument form with NULL tenant
--- and labels.
+-- The released signature. It stores NULL tenant and labels.
 workflow_engine_enqueue(
   p_idempotency_key    text,
   p_workflow_id        text,
@@ -1579,7 +1578,7 @@ Three things it cannot do:
   schema at execution, applying the same defaults; only the stored column
   differs.
 
-Requires PostgreSQL 14+ (built-in `gen_random_uuid()` and SQL-standard function bodies).
+Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
 
 ## Performance Considerations
 

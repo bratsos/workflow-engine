@@ -371,7 +371,7 @@ if (!DATABASE_URL) {
       });
     });
 
-    it("keeps the seven-argument signature, which creates an unattributed run through the new overload", async () => {
+    it("keeps the seven-argument signature, which creates an unattributed run with its own body", async () => {
       const writer = new Client({ connectionString: DATABASE_URL });
       await writer.connect();
       try {

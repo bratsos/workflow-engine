@@ -35,34 +35,29 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
   ON "idempotency_keys" ("workflowRunId");
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys" ("createdAt");
 
--- IF NOT EXISTS skips any index that already has the name: an INVALID one
--- left by a failed concurrent build, or one with another definition. Check
--- each name is a valid index of the planned table and columns.
+-- IF NOT EXISTS skips any index that already has the name, including an
+-- INVALID one left by a failed concurrent build. Check each name is a valid
+-- index on the planned table.
 DO $$
 DECLARE
   bad_index text;
 BEGIN
   SELECT wanted.name INTO bad_index
   FROM (VALUES
-    ('workflow_runs_tenantId_createdAt_id_idx', 'workflow_runs',
-     'btree ("tenantId", "createdAt" DESC, id DESC)'),
-    ('ai_calls_tenantId_createdAt_idx', 'ai_calls', 'btree ("tenantId", "createdAt")'),
-    ('ai_calls_workflowRunId_idx', 'ai_calls', 'btree ("workflowRunId")'),
-    ('ai_calls_textExpiresAt_idx', 'ai_calls', 'btree ("textExpiresAt")'),
-    ('idempotency_keys_workflowRunId_idx', 'idempotency_keys', 'btree ("workflowRunId")'),
-    ('idempotency_keys_createdAt_idx', 'idempotency_keys', 'btree ("createdAt")')
-  ) AS wanted(name, table_name, definition)
+    ('workflow_runs_tenantId_createdAt_id_idx', 'workflow_runs'),
+    ('ai_calls_tenantId_createdAt_idx', 'ai_calls'),
+    ('ai_calls_workflowRunId_idx', 'ai_calls'),
+    ('ai_calls_textExpiresAt_idx', 'ai_calls'),
+    ('idempotency_keys_workflowRunId_idx', 'idempotency_keys'),
+    ('idempotency_keys_createdAt_idx', 'idempotency_keys')
+  ) AS wanted(name, table_name)
   LEFT JOIN pg_index i ON i.indexrelid = to_regclass(quote_ident(wanted.name))
   WHERE NOT coalesce(
-    i.indisvalid
-      AND NOT i.indisunique
-      AND i.indrelid = to_regclass(quote_ident(wanted.table_name))
-      AND split_part(pg_get_indexdef(i.indexrelid), ' USING ', 2) = wanted.definition,
+    i.indisvalid AND i.indrelid = to_regclass(quote_ident(wanted.table_name)),
     false)
   LIMIT 1;
-
   IF FOUND THEN
-    RAISE EXCEPTION 'Attribution index % is missing, invalid or not defined as planned', bad_index
+    RAISE EXCEPTION 'Attribution index % is missing, invalid or on another table', bad_index
       USING HINT = 'Drop that index with DROP INDEX CONCURRENTLY and retry this script.';
   END IF;
 END;

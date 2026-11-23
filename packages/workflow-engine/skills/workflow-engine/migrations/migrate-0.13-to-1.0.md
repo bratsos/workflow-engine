@@ -401,9 +401,9 @@ allow concurrent index builds to run outside transaction blocks.
 If the command exits on `55P03`, let the blocking transaction finish and
 rerun the script. Completed table steps and indexes are reusable. Before
 returning success, the script checks that each of the six names is a valid
-index of the planned table and columns. A failed or canceled concurrent build
-leaves an invalid index, and an older index can hold the name with another
-definition. If the script reports an index, inspect it with `\d` in psql,
+index on the planned table. A failed or canceled concurrent build leaves an
+invalid index under the name. If the script reports an index, inspect it with
+`\d` in psql,
 drop it with `DROP INDEX CONCURRENTLY` outside a transaction, then rerun. Deploy the
 updated schema or contract and clients after the script succeeds and the
 optional enqueue upgrade below is complete.
@@ -449,21 +449,21 @@ The same file installs and upgrades, and it drops nothing:
 - It creates `workflow_engine_enqueue(..., p_tenant_id text, p_labels jsonb)`,
   which takes all nine arguments and has no defaults.
 - It then replaces the released seven-argument function in place with
-  `CREATE OR REPLACE`. Its signature, defaults, owner, ACL, comment and the
-  views or wrappers that depend on it stay as they are. Its body calls the
-  new overload with NULL tenant and labels.
+  `CREATE OR REPLACE`. Its signature, defaults, owner, ACL and the views or
+  wrappers that depend on it stay as they are. Its body stores NULL tenant
+  and labels and does not call the new overload.
 
 No call can match both overloads, so existing calls keep resolving. Table
 names resolve through the caller's search path as before, also for triggers
-on the engine tables and after a schema rename. The nine-argument overload is
-created first: if a later statement fails, the released function still
-works, and with `--single-transaction` nothing changes.
+on the engine tables and after a schema rename. If a statement fails, the
+seven-argument function still works, released or replaced, and with
+`--single-transaction` nothing changes.
 
 The new overload gets the database's default function ACL, which lets
-`PUBLIC` execute it. The seven-argument function calls it as the calling
-role, so every role that enqueues needs `EXECUTE` on the new overload. If you
-restricted the released function, restrict the new one in the same
-transaction:
+`PUBLIC` execute it. Existing callers of the seven-argument function keep
+their access; only roles that pass a tenant or labels need `EXECUTE` on the
+new overload. If you restricted the released function, restrict the new one
+in the same transaction:
 
 ```bash
 # Omit both -c lines to keep the default ACL.
@@ -474,7 +474,7 @@ psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
 ```
 
 Without `ON_ERROR_STOP`, psql prints an error but exits 0, so automation
-cannot see the failure. `sql/enqueue.sql` requires PostgreSQL 14 or newer.
+cannot see the failure. `sql/enqueue.sql` requires PostgreSQL 13 or newer.
 
 Custom persistence adapters receive the run ID as the fourth argument to
 `completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument
