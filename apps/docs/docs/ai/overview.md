@@ -151,8 +151,9 @@ and pass their USD `cost`. A supplied cost bypasses the model registry and
 uses the supplied `modelKey` as the recorded model ID. It defaults to
 `costSource: "reported"`; set `"estimated"` for a supplied estimate.
 
-Failed calls report safe diagnostics to callers and workflow history.
-Detailed provider warnings and error text require both trace flags.
+Failed calls report safe diagnostics to callers and workflow history,
+including errors read from the SDK stream result (`rawResult`). Detailed
+provider warnings and error text require both trace flags.
 Use those flags only for data you intend to send to process diagnostics.
 
 The accounting policy covers the prompt, response and top-level instructions.
@@ -166,17 +167,20 @@ use the policy and you have addressed historical rows.
 At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
 `{ failed, pending }`. Failed writes are cumulative for that helper and its
 children. Pending includes open streams and writes still in progress when
-the timeout expires. Automatic batch accounting follows result retrieval.
-Call `recordResults` explicitly when you need to await that write or retry it.
+the timeout expires. A write the database refuses reaches `onLogError`. A
+caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
+message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
+rejects if that write fails; `recordResults` retries it. A batch's rows are
+written together on both SQLite and PostgreSQL.
 
-The kernel schedules stage drains after committing outcomes, outside stage,
-step and poll deadlines and leases. `createKernel({ aiFlushTimeoutMs })`
-sets the drain budget, with a five-second default. Incomplete accounting
-produces a best-effort run warning with counts. Run totals reflect the
-accounting available at outcome time. Use the ledger or `costByTenant` after
-a drain for later arrivals. `kernel.flush()` waits for the scheduled drains
-and the configured logger within its own bound. The Node host calls it during
-shutdown and the serverless host calls it after the invocation's work settles.
+Stage helpers do not wait for their accounting writes, so stage outcomes,
+retries and deadlines do not depend on them. Run totals sum the ledger rows
+under the run's topic, `workflow.<runId>`, when the run ends: a write still in
+flight at that moment, or one written with another topic, is not counted. A
+worker that exits before a write lands loses that row.
+`kernel.flush({ timeoutMs })` waits for the configured logger's pending
+writes within its own bound. The Node host calls it during shutdown and the
+serverless host calls it after the invocation's work settles.
 
 ## Core Operations
 
