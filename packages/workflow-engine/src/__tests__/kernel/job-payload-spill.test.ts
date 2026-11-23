@@ -87,6 +87,45 @@ describe("payload spill: job transport", () => {
     expect(await blobStore.list("workflow-v2/spill/jobs/")).toEqual([]);
   });
 
+  it("answers a failed spill only after every other spill of the batch settled", async () => {
+    const queue = new InMemoryJobQueue("test-worker");
+    const blobStore = new InMemoryBlobStore();
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const put = blobStore.put.bind(blobStore);
+    blobStore.put = async (key, value) => {
+      if (key.includes("stage-1")) throw new Error("storage failure");
+      await slow;
+      return put(key, value);
+    };
+    const transport = createSpillingJobTransport(queue, {
+      blobStore,
+      thresholdBytes: 1000,
+    });
+    let settled = false;
+    const enqueuing = transport
+      .enqueueParallel(
+        ["stage-1", "stage-2"].map((stageId) => ({
+          workflowRunId: "run-1",
+          workflowId: "wf-1",
+          stageId,
+          payload: { config: { blob: "q".repeat(5000) } },
+        })),
+      )
+      .finally(() => {
+        settled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The caller's run writer registration still covers the pending put.
+    expect(settled).toBe(false);
+    release();
+    await expect(enqueuing).rejects.toThrow("storage failure");
+    expect(await blobStore.list("")).toHaveLength(1);
+    expect(await queue.getJobsByWorkflowRun("run-1")).toEqual([]);
+  });
+
   it("delegates adoptWorkerId to the wrapped transport", () => {
     const { transport } = setup();
     expect(transport.adoptWorkerId?.("host-1")).toBe("test-worker");

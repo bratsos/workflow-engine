@@ -638,7 +638,10 @@ export function createSpillingJobTransport(
     },
 
     async enqueueParallel(jobs: EnqueueJobInput[]) {
-      const packed = await Promise.all(
+      // Every put settles before this answers, even after one failed: a put
+      // still running once the caller moved on would land outside its run
+      // writer registration.
+      const settled = await Promise.allSettled(
         jobs.map(async (job) => {
           if (job.payload === undefined) return job;
           const originalGroupValue =
@@ -670,7 +673,13 @@ export function createSpillingJobTransport(
           };
         }),
       );
-      return transport.enqueueParallel(packed);
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+      return transport.enqueueParallel(
+        settled.map(
+          (result) => (result as PromiseFulfilledResult<EnqueueJobInput>).value,
+        ),
+      );
     },
 
     async getJobsForPurge(workflowRunId) {
