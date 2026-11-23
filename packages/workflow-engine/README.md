@@ -926,6 +926,9 @@ async execute(ctx) {
       retryBackoff: { factor: 2, maxDelay: "5m", jitter: true },
       heartbeat: "1m",     // extend the lease automatically while the body runs
       onReclaim: "fail",   // refuse a lease-expiry takeover: StepNotReplaySafeError
+      // retryIf: decide per error, synchronously. `false` stops the step's own
+      // retries and fails the stage terminally (no job retry either).
+      retryIf: (error) => (error as { status?: number }).status !== 400,
     },
   );
 
@@ -1050,6 +1053,8 @@ async execute(ctx) {
   return { output: { results } };
 }
 ```
+
+`run.cancel` cancels every provider batch the run created that has not ended (OpenAI, Anthropic and Gemini; OpenRouter has no cancel call and reports `unsupported`) and reports one outcome per batch in `RunCancelResult.batches`; a batch that may still be running is also a WARN log on the run. A repeated `run.cancel` retries the cancels that did not take effect. `run.redrive` never adopts or waits on a cancelled batch: it submits a new one. Every worker must run 1.0.0-alpha.21 or later before you rely on cancel followed by redrive, because an older worker can adopt the cancelled batch.
 
 A worker that dies between the provider accepting a batch and the ledger recording it is the expensive failure. On a replay the submit step adopts the batch carrying its `externalKey` (OpenAI metadata, Google `displayName`); on transports with nothing to search (Anthropic, OpenRouter) it throws `BatchNotAdoptableError` rather than pay twice — `batch: { onReclaim: "resubmit" }` opts back into resubmitting. Batch capability comes from the model registry: `getModel(key).supportsAsyncBatch`, with `batchProvider` naming the transport.
 
@@ -1244,6 +1249,16 @@ async execute(ctx) {
 }
 ```
 
+A failure that no retry can fix (invalid input, a rejected credential) should not spend the job's attempts. Throw `NonRetryableError`, with the original error as `cause`, from a stage or a `ctx.step.run` body: the stage fails at once, with no step retry, job retry or poll retry. In a durable step, `retryIf` makes the same decision per error.
+
+```typescript
+import { NonRetryableError } from "@bratsos/workflow-engine";
+
+if (response.status === 401) {
+  throw new NonRetryableError("Provider rejected the API key");
+}
+```
+
 ---
 
 ## API Reference
@@ -1281,7 +1296,7 @@ Transaction behavior:
 - `stage.pollSuspended` claims each stage (a version-guarded `nextPollAt` lease) before replaying it, so two orchestrators never replay the same stage; the replay runs outside any transaction and the outcome commits in a short per-stage transaction.
 
 Cancellation semantics:
-- `run.cancel` is **authoritative**: it marks the run as `CANCELLED` and cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`) in its transaction, then, after that commits, cancels all queued/suspended jobs via `jobTransport.cancelByRun()`. A worker that dequeues one of the run's jobs in between discards it as an orphan, so that job ends `FAILED`, not `CANCELLED`.
+- `run.cancel` is **authoritative**: it marks the run as `CANCELLED` and cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`) in its transaction, then, after that commits, cancels all queued/suspended jobs via `jobTransport.cancelByRun()` and the run's provider batches (see [Batch AI Calls](#batch-ai-calls-ctxstepaimap)). A worker that dequeues one of the run's jobs in between discards it as an orphan, so that job ends `FAILED`, not `CANCELLED`.
 - The running body sees it: the host's job heartbeat (`job.heartbeat`) aborts `ctx.abortSignal` with a `StageAbortedError` (`reason: "cancelled"`, or `"lease-lost"` when another worker took the job). `waitFor` checks the signal before it polls; a `run` body that finishes after a cancel is recorded as failed with the cancellation as its error.
 - `stage.pollSuspended` skips stages whose run has been cancelled.
 - `job.execute` re-checks run status after stage execution. If the run was cancelled during execution, the result is discarded and `ghost: true` is returned with `ghostReason: "orphan"`; `"race"` (the run was still `PENDING`) and `"version"` (this build does not serve the run) are re-delivered by the hosts rather than dropped.
@@ -1326,7 +1341,11 @@ import type { StepApi, StepRunOptions, StepRunContext, StepWaitOptions, StepSign
 import {
   StepTimeoutError, StepLeaseLostError, StepNotReplaySafeError, DuplicateStepKeyError,
   StageAbortedError, stageAbortReason, isStepControlFlowError, deriveStepExternalKey,
+  NonRetryableError, isNonRetryableError,
 } from "@bratsos/workflow-engine";
+// Dead jobs, for custom hosts and dispatchers
+import { JobTargetMissingError, isJobTargetMissingError } from "@bratsos/workflow-engine";
+import { isRetryableStageError } from "@bratsos/workflow-engine/kernel";
 import { AiMapBatchFailedError, AiMapBudgetExceededError, BatchNotAdoptableError } from "@bratsos/workflow-engine";
 
 // Kernel
