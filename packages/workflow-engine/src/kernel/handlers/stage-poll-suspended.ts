@@ -265,12 +265,18 @@ async function recordStageRetry(
       metadata?: Record<string, unknown>;
     } | null
   )?.metadata;
-  const retryAt =
-    deps.clock.now().getTime() +
-    retryBackoffMs(budget.attempt, budget.retryPolicy);
-  const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+  const now = deps.clock.now().getTime();
+  const deadlines = await optedInWaitDeadlines(stageRecord, deps).catch(
     () => undefined,
   );
+  // Give an already-due wait the default retry delay so the next poll can
+  // settle its timeout. A later pending wait can still shorten that delay.
+  const retryAt =
+    now +
+    retryBackoffMs(
+      budget.attempt,
+      deadlines?.hasExpired ? undefined : budget.retryPolicy,
+    );
   return withClaimedRun(
     stageRecord.workflowRunId,
     run.version,
@@ -281,7 +287,7 @@ async function recordStageRetry(
         errorMessage: message,
         // A job that finished the stage meanwhile keeps its outcome.
         expectedVersion: stageRecord.version,
-        nextPollAt: new Date(Math.min(retryAt, waitDeadline ?? retryAt)),
+        nextPollAt: new Date(Math.min(retryAt, deadlines?.next ?? retryAt)),
         suspendedState: {
           ...(stageRecord.suspendedState as object),
           metadata: {
@@ -395,9 +401,10 @@ async function claimSuspendedStage(
     leaseUntil = Math.min(leaseUntil, now + MIN_CLAIM_LEASE_MS);
     // `maxWaitUntil` may name the deadline this pass settles; a later one
     // must still bound the lease.
-    const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+    const deadlines = await optedInWaitDeadlines(stageRecord, deps).catch(
       () => undefined,
     );
+    const waitDeadline = deadlines?.next;
     if (waitDeadline !== undefined && waitDeadline < leaseUntil) {
       leaseUntil = waitDeadline;
     }
@@ -479,28 +486,25 @@ function isDurableStage(stageRecord: WorkflowStageRecord): boolean {
   return metadata?.[DURABLE_SUSPEND_MARKER] === true;
 }
 
-/**
- * The earliest deadline still ahead among a durable stage's pending waits
- * with an explicit `onTimeout`. No claim lease or retry backoff may pass it.
- */
-async function nextWaitDeadline(
+/** Deadlines among a durable stage's pending waits with an explicit `onTimeout`. */
+async function optedInWaitDeadlines(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
-): Promise<number | undefined> {
+): Promise<{ next: number | undefined; hasExpired: boolean } | undefined> {
   if (!deps.stepLedger || !isDurableStage(stageRecord)) return;
   const now = deps.clock.now().getTime();
-  let earliest: number | undefined;
+  let next: number | undefined;
+  let hasExpired = false;
   for (const record of await pendingWaits(deps.stepLedger, stageRecord.id)) {
+    if (record.waitState?.onTimeout === undefined) continue;
     const deadline = record.deadlineAt!.getTime();
-    if (
-      record.waitState?.onTimeout !== undefined &&
-      deadline > now &&
-      (earliest === undefined || deadline < earliest)
-    ) {
-      earliest = deadline;
+    if (deadline <= now) {
+      hasExpired = true;
+    } else if (next === undefined || deadline < next) {
+      next = deadline;
     }
   }
-  return earliest;
+  return { next, hasExpired };
 }
 
 async function settleExpiredDurableWait(

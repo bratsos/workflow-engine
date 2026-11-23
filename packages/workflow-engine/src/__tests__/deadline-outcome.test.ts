@@ -1335,38 +1335,49 @@ describe.skipIf(!realDatabase)(
       expect(await storedOutput(t)).toBe(stored);
     });
 
-    it("bounds a configured poll retry backoff by the next opted-in deadline", async () => {
+    it.each([
+      { deadline: "upcoming", elapsedDuringReplay: 0, retryDelay: 10_000 },
+      { deadline: "expired", elapsedDuringReplay: 10_100, retryDelay: 2_000 },
+    ])("schedules a failed replay with a 60 s backoff and an $deadline opted-in deadline", async ({
+      elapsedDuringReplay,
+      retryDelay,
+    }) => {
       let failReplay = false;
       const t = await start(
         async (step) => {
-          if (failReplay) throw new Error("temporary replay failure");
-          const answer = await step.waitFor("answer", {
-            every: 100,
-            timeout: 10_000,
+          if (failReplay) {
+            // Simulate an I/O request that fails once its response arrives.
+            clock.advance(elapsedDuringReplay);
+            throw new Error("temporary replay failure");
+          }
+          const answer = await step.waitForSignal("answer", {
+            keepalive: 200,
+            timeout: 10_200,
             onTimeout: "return",
-            poll: async () => false,
-            ready: (value) => value,
           });
           return outcome(answer);
         },
         {},
-        { maxAttempts: 2, backoff: { initialDelayMs: 30_000 } },
+        { maxAttempts: 3, backoff: { initialDelayMs: 60_000 } },
       );
-      const started = clock.now().getTime();
       await expect(t.execute()).resolves.toMatchObject({
         outcome: "suspended",
       });
       failReplay = true;
-      clock.set(new Date(started + 100));
+      clock.advance(200);
       await t.tick();
+      const nextPollAt = new Date(clock.now().getTime() + retryDelay);
       expect(await t.getStage()).toMatchObject({
         status: "SUSPENDED",
         errorMessage: "temporary replay failure",
-        nextPollAt: new Date(started + 10_000),
+        nextPollAt,
       });
 
       failReplay = false;
-      clock.set(new Date(started + 10_000));
+      clock.set(new Date(nextPollAt.getTime() - 1));
+      await t.tick();
+      expect((await t.record())?.status).toBe("pending");
+      clock.set(nextPollAt);
       await t.tick();
       expect(await t.status()).toBe("COMPLETED");
       expect(await storedOutput(t)).toBe("timeout");
