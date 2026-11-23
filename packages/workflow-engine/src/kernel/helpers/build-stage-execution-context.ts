@@ -1,9 +1,19 @@
-import type { AIHelper, LogContext } from "../../ai/types.js";
+import { createAIHelper } from "../../ai/ai-helper.js";
+import type {
+  AIHelper,
+  LogContext,
+  StageAIHelperOptions,
+} from "../../ai/types.js";
+import {
+  boundedAIFlush,
+  DEFAULT_AI_FLUSH_TIMEOUT_MS,
+} from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
 import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
+  AICallFlushResult,
   AICallLogger,
   CreateAnnotationInput,
 } from "../../persistence/interface.js";
@@ -22,7 +32,7 @@ import { createStepApi } from "./step-api.js";
 export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
   progressEvents: KernelEvent[];
-  flushAI: () => Promise<void>;
+  scheduleAIFlush: () => void;
   annotationBuffer: ReturnType<typeof createAnnotationBuffer>;
 }
 
@@ -39,9 +49,11 @@ export function defineLazyAIContext<T extends object>(
   deps: ExecutorDeps,
 ): {
   context: T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger };
-  flushAI: () => Promise<void>;
+  scheduleAIFlush: () => void;
 } {
   let helper: AIHelper | undefined;
+  let boundLogger: AICallLogger | undefined;
+  let fallback: AIHelper | undefined;
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
@@ -82,34 +94,57 @@ export function defineLazyAIContext<T extends object>(
     createLog: (data) => deps.persistence.createLog(data),
   };
 
+  const options: StageAIHelperOptions = {
+    attribution: {
+      tenantId: params.tenantId,
+      labels: params.labels,
+      workflowRunId: params.workflowRunId,
+    },
+    bindCallLogger: (logger) => {
+      boundLogger ??= logger;
+    },
+  };
+  const getHelper = (): AIHelper => {
+    if (!helper) {
+      const services = configured();
+      helper = services.ai(
+        topic,
+        services.aiLogger,
+        logContext,
+        undefined,
+        options,
+      );
+    }
+    return helper;
+  };
+
   Object.defineProperties(target, {
     ai: {
       enumerable: true,
       configurable: true,
-      get: () => {
-        if (!helper) {
-          const services = configured();
-          helper = services.ai(
-            topic,
-            services.aiLogger,
-            logContext,
-            undefined,
-            {
-              attribution: {
-                tenantId: params.tenantId,
-                labels: params.labels,
-                workflowRunId: params.workflowRunId,
-              },
-            },
-          );
-        }
-        return helper;
-      },
+      get: getHelper,
     },
     aiLogger: {
       enumerable: true,
       configurable: true,
-      get: () => configured().aiLogger,
+      get: () => {
+        getHelper();
+        if (!boundLogger) {
+          // A custom implementation can omit the binding supplied by createAIHelper.
+          // Its capture policy is unknown, so use a text-free logger for direct writes.
+          fallback = createAIHelper(
+            topic,
+            configured().aiLogger,
+            logContext,
+            undefined,
+            {
+              ...options,
+              text: { store: "none" },
+            },
+          );
+        }
+        return boundLogger;
+      },
     },
   });
 
@@ -118,20 +153,40 @@ export function defineLazyAIContext<T extends object>(
       readonly ai: AIHelper;
       readonly aiLogger: AICallLogger;
     },
-    async flushAI() {
-      if (!helper?.flush) return;
-      const counts = await helper
-        .flush({ timeoutMs: deps.aiFlushTimeoutMs })
-        .catch(() => ({ failed: 1, pending: 0 }));
-      if (counts.failed === 0 && counts.pending === 0) return;
-      await deps.persistence
-        .createLog({
-          workflowRunId: params.workflowRunId,
-          level: "WARN",
-          message: "AI call logging did not finish successfully",
-          metadata: counts,
-        })
-        .catch(() => {});
+    scheduleAIFlush() {
+      if (!helper) return;
+      const flush = async () => {
+        const timeoutMs = deps.aiFlushTimeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS;
+        const deadline = Date.now() + timeoutMs;
+        const counts = await boundedAIFlush(async (opts) => {
+          const results = await Promise.all([
+            helper?.flush?.(opts),
+            fallback?.flush(opts),
+          ]);
+          return results.reduce<AICallFlushResult>(
+            (total, result) => ({
+              failed: total.failed + (result?.failed ?? 0),
+              pending: total.pending + (result?.pending ?? 0),
+            }),
+            { failed: 0, pending: 0 },
+          );
+        }, timeoutMs);
+        const { failed, pending } = counts;
+        if (failed === 0 && pending === 0) return;
+        await boundedAIFlush(
+          async () => {
+            await deps.persistence.createLog({
+              workflowRunId: params.workflowRunId,
+              level: "WARN",
+              message: "AI call logging did not finish successfully",
+              metadata: { failed, pending },
+            });
+          },
+          Math.max(0, deadline - Date.now()),
+        );
+      };
+      if (deps.deferAIFlush) deps.deferAIFlush(flush);
+      else void flush();
     },
   };
 }
@@ -256,9 +311,9 @@ export function buildStageExecutionContext(
     workflowContext,
   } as StageContext<any, any, any>;
 
-  const { flushAI } = defineLazyAIContext(context, input, deps);
+  const { scheduleAIFlush } = defineLazyAIContext(context, input, deps);
 
-  return { context, progressEvents, annotationBuffer, flushAI };
+  return { context, progressEvents, annotationBuffer, scheduleAIFlush };
 }
 
 /** Resolve the same stage input used by job.execute for a replay. */

@@ -16,6 +16,10 @@ import { isMissingPackageError } from "./batch/ai-sdk";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
+  protectProviderWarnings,
+  providerError,
+} from "./provider-diagnostics.js";
+import {
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
   extractReportedCost,
@@ -189,9 +193,8 @@ export async function transcribe(
   });
 
   try {
-    const model = await getTranscriptionModelProvider(
-      modelConfig,
-      ctx.routing?.provider,
+    const model = protectProviderWarnings(
+      await getTranscriptionModelProvider(modelConfig, ctx.routing?.provider),
     );
     const result = await runWithCallTimeout(timeout, (signal) =>
       aiTranscribe({
@@ -291,7 +294,7 @@ export async function transcribe(
       error: errorMessage,
       durationMs,
     });
-    throw error;
+    throw providerError(error, "Provider transcribe call failed");
   } finally {
     timeout.cleanup();
   }

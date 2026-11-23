@@ -12,6 +12,10 @@ import { streamText as aiStreamText } from "ai";
 import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
+  protectProviderWarnings,
+  providerError,
+} from "./provider-diagnostics.js";
+import {
   assertAdapterProviderPolicy,
   logger,
   type ProviderResultLike,
@@ -43,7 +47,7 @@ export function streamText(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.streamText
     ? undefined
-    : resolveLanguageModel(ctx, modelConfig);
+    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig));
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -54,11 +58,11 @@ export function streamText(
 
   // For logging, extract prompt string
   const promptForLog =
-    "prompt" in input && input.prompt
+    typeof input.prompt === "string"
       ? input.prompt
-      : JSON.stringify(input.messages);
+      : (JSON.stringify(input.messages) ?? "");
 
-  const closeStream = ctx.beginStream?.();
+  let closeStream: (() => void) | undefined;
   // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
   let streamError: { error: unknown } | undefined;
@@ -312,6 +316,7 @@ export function streamText(
   let adapterResponse: AdapterStreamResponse | undefined;
   let result: ReturnType<typeof aiStreamText> | undefined;
   try {
+    closeStream = ctx.beginOperation?.();
     if (ctx.adapter?.streamText) {
       adapterResponse = ctx.adapter.streamText({
         model: modelConfig,
@@ -337,7 +342,10 @@ export function streamText(
     }
   } catch (error) {
     logError(error);
-    throw timeoutErrorIfExpired(timeout, error);
+    throw providerError(
+      timeoutErrorIfExpired(timeout, error),
+      "Provider stream failed",
+    );
   }
 
   // Create async iterable that collects text and calls onChunk. This is a
@@ -345,9 +353,15 @@ export function streamText(
   // (below) reconcile against the buffered result independently.
   const streamIterable: AsyncIterable<string> = {
     [Symbol.asyncIterator]: () => {
-      const reader = adapterResponse
-        ? adapterResponse.stream[Symbol.asyncIterator]()
-        : result!.textStream[Symbol.asyncIterator]();
+      let reader: AsyncIterator<string>;
+      try {
+        reader = adapterResponse
+          ? adapterResponse.stream[Symbol.asyncIterator]()
+          : result!.textStream[Symbol.asyncIterator]();
+      } catch (error) {
+        logError(error);
+        throw providerError(error, "Provider stream failed");
+      }
       return {
         async next() {
           try {
@@ -364,7 +378,10 @@ export function streamText(
             return { done: false, value };
           } catch (error) {
             recordStreamError(error);
-            throw timeoutErrorIfExpired(timeout, error);
+            throw providerError(
+              timeoutErrorIfExpired(timeout, error),
+              "Provider stream failed",
+            );
           }
         },
       };
@@ -397,7 +414,10 @@ export function streamText(
       );
     } catch (error) {
       logError(streamError ? streamError.error : error);
-      throw timeoutErrorIfExpired(timeout, error);
+      throw providerError(
+        timeoutErrorIfExpired(timeout, error),
+        "Provider stream failed",
+      );
     }
   };
 
@@ -411,7 +431,10 @@ export function streamText(
         : (await runWithCallTimeout(timeout, () => result!.text)) || fullText;
     } catch (error) {
       recordStreamError(error);
-      throw timeoutErrorIfExpired(timeout, error);
+      throw providerError(
+        timeoutErrorIfExpired(timeout, error),
+        "Provider stream failed",
+      );
     }
   };
 
@@ -433,7 +456,10 @@ export function streamText(
       );
     } catch (error) {
       recordStreamError(error);
-      throw timeoutErrorIfExpired(timeout, error);
+      throw providerError(
+        timeoutErrorIfExpired(timeout, error),
+        "Provider stream failed",
+      );
     }
   };
 

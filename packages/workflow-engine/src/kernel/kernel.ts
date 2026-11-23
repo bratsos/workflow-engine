@@ -22,7 +22,11 @@
  */
 
 import { createAIHelper } from "../ai/ai-helper.js";
-import { DEFAULT_AI_FLUSH_TIMEOUT_MS } from "../ai/write-tracker.js";
+import {
+  AICallWriteTracker,
+  boundedAIFlush,
+  DEFAULT_AI_FLUSH_TIMEOUT_MS,
+} from "../ai/write-tracker.js";
 import type { Workflow } from "../core/workflow";
 import type {
   AICallFlushOptions,
@@ -163,7 +167,7 @@ export interface KernelConfig {
   stepLedger?: StepLedger;
   /** Optional services exposed lazily through stage contexts. */
   services?: KernelServices;
-  /** Maximum wait for AI writes at the end of a stage attempt. Defaults to 5 s. */
+  /** Maximum wait for a detached stage accounting drain. Defaults to 5 s. */
   aiFlushTimeoutMs?: number;
   /**
    * How long an idempotency key may sit `in_progress` before a subsequent
@@ -265,6 +269,7 @@ export interface KernelDeps {
   stepLedger?: StepLedger;
   services?: KernelServices;
   aiFlushTimeoutMs?: number;
+  deferAIFlush?: (flush: () => Promise<void>) => void;
 }
 
 // ============================================================================
@@ -391,6 +396,26 @@ export function createKernel(config: KernelConfig): Kernel {
     ),
   };
 
+  const stageDrains = new AICallWriteTracker();
+  async function withStageDrains<T>(
+    work: (scope: KernelDeps) => Promise<T>,
+  ): Promise<T> {
+    const scheduled: Array<() => Promise<void>> = [];
+    try {
+      return await work({
+        ...deps,
+        deferAIFlush: (flush) => scheduled.push(flush),
+      });
+    } finally {
+      // Outcomes, outbox rows and idempotency are settled before accounting
+      // drains can run. The dispatch never holds a job or poll lease for one.
+      for (const flush of scheduled) {
+        const done = stageDrains.begin();
+        void Promise.resolve().then(flush).then(done, done);
+      }
+    }
+  }
+
   /**
    * Idempotency-key choreography shared by job.execute's own transaction
    * phasing and the generic transactional path below: acquire → replay a
@@ -493,9 +518,11 @@ export function createKernel(config: KernelConfig): Kernel {
     // not hold a database transaction open.
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
-      const result = await handleStagePollSuspended(command, deps);
-      await result._postCommit?.(deps);
-      return stripEvents(result);
+      return withStageDrains(async (scope) => {
+        const result = await handleStagePollSuspended(command, scope);
+        await result._postCommit?.(scope);
+        return stripEvents(result);
+      });
     }
 
     // These ports use their own connections. Lease reaping needs no
@@ -548,30 +575,32 @@ export function createKernel(config: KernelConfig): Kernel {
     // execution does not hold a database transaction open.
     // -----------------------------------------------------------------
     if (command.type === "job.execute") {
-      return withIdempotency(
-        command.idempotencyKey,
-        command.type,
-        () => command.workflowRunId,
-        async () => {
-          // Refused (the run has ended), the execution writes nothing; the
-          // preflight answers as before.
-          const writer = await openRunWriter(
-            persistence,
-            command.workflowRunId,
-          );
-          try {
-            return stripEvents(
-              await handleJobExecute(
-                command,
-                fenceRunWrites(deps, command.workflowRunId, writer),
-              ),
+      return withStageDrains((scope) =>
+        withIdempotency(
+          command.idempotencyKey,
+          command.type,
+          () => command.workflowRunId,
+          async () => {
+            // Refused (the run has ended), the execution writes nothing; the
+            // preflight answers as before.
+            const writer = await openRunWriter(
+              persistence,
+              command.workflowRunId,
             );
-          } finally {
-            await writer.close();
-          }
-        },
-        undefined,
-        command.workflowRunId,
+            try {
+              return stripEvents(
+                await handleJobExecute(
+                  command,
+                  fenceRunWrites(scope, command.workflowRunId, writer),
+                ),
+              );
+            } finally {
+              await writer.close();
+            }
+          },
+          undefined,
+          command.workflowRunId,
+        ),
       );
     }
 
@@ -876,12 +905,22 @@ export function createKernel(config: KernelConfig): Kernel {
     dispatch,
     annotations,
     async flush(options) {
-      return (
-        (await services?.aiLogger?.flush?.(options)) ?? {
-          failed: 0,
-          pending: 0,
-        }
+      const timeoutMs = assertTimerMs(
+        "timeoutMs",
+        options?.timeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
+        { allowZero: true },
       );
+      const logger = services?.aiLogger;
+      const [stages, writes] = await Promise.all([
+        stageDrains.flush({ timeoutMs }),
+        logger
+          ? boundedAIFlush(async (opts) => logger.flush?.(opts), timeoutMs)
+          : { failed: 0, pending: 0 },
+      ]);
+      return {
+        failed: writes.failed,
+        pending: stages.pending + writes.pending,
+      };
     },
     servedDefinitions: () => servedDefinitions(config.registry),
   };

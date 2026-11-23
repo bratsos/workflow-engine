@@ -294,7 +294,11 @@ class ServerlessHostImpl implements ServerlessHost {
     try {
       return await work();
     } finally {
-      await this.kernel.flush?.();
+      try {
+        await this.kernel.flush?.();
+      } catch {
+        console.warn("[ServerlessHost] Call accounting drain failed");
+      }
     }
   }
 

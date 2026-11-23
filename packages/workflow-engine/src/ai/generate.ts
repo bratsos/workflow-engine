@@ -10,9 +10,13 @@ import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
-import { isTraceTextEnabled } from "../utils/logger";
 import { AICallTimeoutError } from "./errors";
 import { getModel, type ModelKey } from "./model-helper";
+import {
+  originalProviderError,
+  protectProviderWarnings,
+  providerError,
+} from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   type CostResolution,
@@ -233,20 +237,15 @@ export function logFailure(
   const safeError =
     params.error instanceof AICallTimeoutError
       ? `Timed out after ${params.error.timeoutMs}ms`
-      : params.error instanceof Error
-        ? params.error.name
-        : "Error";
-  const errorMessage = isTraceTextEnabled()
-    ? params.error instanceof Error
-      ? params.error.message
-      : String(params.error)
-    : safeError;
+      : "Provider call failed";
+  const errorMessage = safeError;
   const steps = params.steps ?? [];
+  // A call that reached the model and failed afterwards still consumed tokens.
   const accounting =
     params.accounting ??
     resolveFailureAccounting(
       params.modelKey,
-      params.error,
+      originalProviderError(params.error),
       steps,
       params.result,
     );
@@ -302,7 +301,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateText
     ? undefined
-    : resolveLanguageModel(ctx, modelConfig);
+    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig));
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -583,7 +582,10 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       error: errorMessage,
       durationMs,
     });
-    throw explainRoutingError(error, ctx.routing, modelKey);
+    throw providerError(
+      explainRoutingError(error, ctx.routing, modelKey),
+      "Provider generation failed",
+    );
   } finally {
     timeout.cleanup();
   }
@@ -601,7 +603,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateObject
     ? undefined
-    : resolveLanguageModel(ctx, modelConfig);
+    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig));
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -816,7 +818,10 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       error: errorMessage,
       durationMs,
     });
-    throw explainRoutingError(error, ctx.routing, modelKey);
+    throw providerError(
+      explainRoutingError(error, ctx.routing, modelKey),
+      "Provider structured generation failed",
+    );
   } finally {
     timeout.cleanup();
   }

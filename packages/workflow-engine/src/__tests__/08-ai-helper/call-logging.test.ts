@@ -109,9 +109,9 @@ it("only emits request, response and provider error text with the text trace fla
       });
       await ai.generateText(modelKey, "request marker");
       await ai.embed(modelKey, "embedding marker");
-      await expect(ai.generateText(modelKey, "fail")).rejects.toThrow(
-        "error body marker",
-      );
+      const failure = ai.generateText(modelKey, "fail");
+      await expect(failure).rejects.toThrow("Provider generation failed");
+      await expect(failure).rejects.not.toHaveProperty("cause");
     };
     await call();
     expect(trace.mock.calls.flat()).toContain(
@@ -137,4 +137,99 @@ it("only emits request, response and provider error text with the text trace fla
     errors.mockRestore();
     vi.unstubAllEnvs();
   }
+});
+
+it("does not send provider warnings to process diagnostics", async () => {
+  vi.stubEnv("WORKFLOW_ENGINE_TRACE", "");
+  vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
+  const warnings = vi
+    .spyOn(process, "emitWarning")
+    .mockImplementation(() => {});
+  try {
+    const { MockLanguageModelV4 } = await import("ai/test");
+    const model = new MockLanguageModelV4({
+      async doGenerate() {
+        return {
+          content: [{ type: "text", text: "reply" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: {
+              total: 1,
+              noCache: undefined,
+              cacheRead: undefined,
+              cacheWrite: undefined,
+            },
+            outputTokens: { total: 1, text: undefined, reasoning: undefined },
+          },
+          warnings: [{ type: "other", message: "private warning marker" }],
+        };
+      },
+    });
+    const ai = createAIHelper(
+      "accounting",
+      new InMemoryAICallLogger(),
+      undefined,
+      () => model,
+      {
+        text: { store: "none" },
+      },
+    );
+    expect((await ai.generateText(modelKey, "request marker")).text).toBe(
+      "reply",
+    );
+    expect(JSON.stringify(warnings.mock.calls)).not.toContain(
+      "private warning marker",
+    );
+  } finally {
+    warnings.mockRestore();
+    vi.unstubAllEnvs();
+  }
+});
+
+it("does not leave an open write after normalizing an empty stream prompt", async () => {
+  const ai = createAIHelper(
+    "accounting",
+    new InMemoryAICallLogger(),
+    undefined,
+    undefined,
+    {
+      adapter: {
+        streamText: () => ({
+          stream: (async function* () {
+            yield "reply";
+          })(),
+        }),
+      },
+    },
+  );
+  const { stream } = ai.streamText(modelKey, { prompt: "" });
+  for await (const _ of stream) {
+    /* drain */
+  }
+  expect(await ai.flush({ timeoutMs: 0 })).toEqual({ failed: 0, pending: 0 });
+});
+
+it("tracks batch recording from the duplicate check through the write", async () => {
+  const logger = new InMemoryAICallLogger();
+  const check = Promise.withResolvers<boolean>();
+  vi.spyOn(logger, "isRecorded").mockReturnValue(check.promise);
+  const ai = createAIHelper("accounting", logger);
+  const batch = ai.createChild("batch").batch(modelKey, "openrouter");
+  const recorded = batch.recordResults("batch-1", [
+    {
+      id: "item-1",
+      prompt: "request marker",
+      status: "succeeded",
+      result: "response marker",
+      inputTokens: 1,
+      outputTokens: 1,
+    },
+  ]);
+  try {
+    expect(await ai.flush({ timeoutMs: 0 })).toEqual({ failed: 0, pending: 1 });
+  } finally {
+    check.resolve(false);
+    await recorded;
+  }
+  expect(await ai.flush()).toEqual({ failed: 0, pending: 0 });
 });

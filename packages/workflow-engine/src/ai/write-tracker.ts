@@ -53,3 +53,26 @@ export class AICallWriteTracker {
     return { failed: this.failed, pending: this.pending };
   }
 }
+
+/** Apply the caller's own bound even if a custom flush ignores it or throws. */
+export async function boundedAIFlush(
+  flush: (options: AICallFlushOptions) => Promise<AICallFlushResult | void>,
+  timeoutMs: number,
+): Promise<AICallFlushResult> {
+  const work = (async () => {
+    try {
+      return (await flush({ timeoutMs })) ?? { failed: 0, pending: 0 };
+    } catch {
+      return { failed: 1, pending: 0 };
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<AICallFlushResult>((resolve) => {
+    timer = setTimeout(() => resolve({ failed: 0, pending: 1 }), timeoutMs);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

@@ -317,14 +317,19 @@ describe("run.cancel: provider batches", () => {
     const h = await setup("cancel-throws");
     await h.execute();
     h.model.cancel = vi.fn(async () => {
-      throw new Error("HTTP 503");
+      throw Object.assign(new Error("private diagnostic marker"), {
+        statusCode: 503,
+      });
     });
 
     const result = await h.cancel();
 
     expect(result.cancelled).toBe(true);
     expect(result.batches).toEqual([
-      expect.objectContaining({ status: "failed", error: "HTTP 503" }),
+      expect.objectContaining({
+        status: "failed",
+        error: "Provider batch cancellation failed (HTTP 503)",
+      }),
     ]);
     expect((await h.run())?.status).toBe("CANCELLED");
     expect((await h.stage())?.status).toBe("CANCELLED");
@@ -358,13 +363,13 @@ describe("run.cancel: provider batches", () => {
     expect(noCredentials.batches).toEqual([
       expect.objectContaining({
         status: "unavailable",
-        error: "OpenRouter batch access needs an API key",
+        error: "The batch transport could not be resolved",
       }),
     ]);
     expect(noKey.batches).toEqual([
       expect.objectContaining({
         status: "unavailable",
-        error: "API key is missing",
+        error: "Provider API key is missing.",
       }),
     ]);
     expect((await h.run())?.status).toBe("CANCELLED");
@@ -926,7 +931,10 @@ describe("a provider cancel whose outcome is unknown", () => {
       const cancel = h.model.cancel!;
       let failing = true;
       h.model.cancel = vi.fn(async (ref: EngineBatchRef) => {
-        if (ref.id === "batch-2" && failing) throw new Error("HTTP 503");
+        if (ref.id === "batch-2" && failing)
+          throw Object.assign(new Error("private diagnostic marker"), {
+            statusCode: 503,
+          });
         return cancel(ref);
       });
       const result = await h.cancel();
@@ -1791,7 +1799,7 @@ describe("a cancel sweep that was interrupted", () => {
     await h.execute();
 
     expect((await h.stage())?.errorMessage).toMatch(
-      /completing the cancel failed \(provider unreachable\)/,
+      /completing the cancel failed \(Provider batch cancellation failed\)/,
     );
     expect(h.model.start).toHaveBeenCalledTimes(1);
     expect(h.model.adopt).not.toHaveBeenCalled();

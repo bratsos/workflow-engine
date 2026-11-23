@@ -134,7 +134,8 @@ const worker = ai.createChild("worker", "1", {
 Child helpers inherit the tenant and merge labels by key. A child text policy
 inherits the parent's TTL when omitted. The default stores full text without
 expiry. `store: "none"` leaves the prompt and response empty and drops stream
-instructions from the accounting row, including when the logger is custom.
+instructions from the accounting row. Direct `ctx.aiLogger` writes share the
+stage helper's attribution and text policy, including with custom loggers.
 A full-text TTL sets `textExpiresAt` on the row so
 `engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
 requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
@@ -150,15 +151,32 @@ and pass their USD `cost`. A supplied cost bypasses the model registry and
 uses the supplied `modelKey` as the recorded model ID. It defaults to
 `costSource: "reported"`; set `"estimated"` for a supplied estimate.
 
+Failed calls report safe diagnostics to callers and workflow history.
+Detailed provider warnings and error text require both trace flags.
+Use those flags only for data you intend to send to process diagnostics.
+
+The accounting policy covers the prompt, response and top-level instructions.
+Keep opaque caller metadata free of content that needs that same lifecycle.
+Workflow inputs and outputs, durable step results and repair data, blobs,
+events, application logs and annotations each have their own lifecycle. The
+console can display those workflow copies. This also applies to manually
+persisted SDK or batch results. Apply a privacy guarantee after all writers
+use the policy and you have addressed historical rows.
+
 At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
 `{ failed, pending }`. Failed writes are cumulative for that helper and its
 children. Pending includes open streams and writes still in progress when
-the timeout expires. Stage attempts flush before recording their outcome
-using `createKernel({ aiFlushTimeoutMs })`, which defaults to five seconds.
-The kernel logs a run warning with the counts if either is nonzero.
-`kernel.flush()` drains the configured logger when it implements `flush`.
-The Node host calls it during shutdown and the serverless host calls it
-before returning from an invocation.
+the timeout expires. Automatic batch accounting follows result retrieval.
+Call `recordResults` explicitly when you need to await that write or retry it.
+
+The kernel schedules stage drains after committing outcomes, outside stage,
+step and poll deadlines and leases. `createKernel({ aiFlushTimeoutMs })`
+sets the drain budget, with a five-second default. Incomplete accounting
+produces a best-effort run warning with counts. Run totals reflect the
+accounting available at outcome time. Use the ledger or `costByTenant` after
+a drain for later arrivals. `kernel.flush()` waits for the scheduled drains
+and the configured logger within its own bound. The Node host calls it during
+shutdown and the serverless host calls it after the invocation's work settles.
 
 ## Core Operations
 

@@ -27,6 +27,10 @@ import {
   openRouterBatchProvider,
 } from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
+import {
+  providerError,
+  traceProviderDiagnostic,
+} from "./provider-diagnostics.js";
 import { restorePortableValue } from "./schema-portability";
 import {
   assertAdapterProviderPolicy,
@@ -628,12 +632,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           createdRefs.length > 0
             ? `. Successfully created ${createdRefs.length} batch(es) before failure: [${createdIds}]`
             : ""
-        }: ${err instanceof Error ? err.message : String(err)}`;
-        const batchError = new BatchSubmitError(errMsg, createdRefs);
-        if (err instanceof Error && err.stack) {
-          batchError.stack = `${batchError.stack}\nCaused by: ${err.stack}`;
-        }
-        throw batchError;
+        }: ${providerError(err, "Provider batch submission failed").message}`;
+        throw new BatchSubmitError(errMsg, createdRefs);
       }
     }
 
@@ -724,9 +724,15 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
     const statuses = await Promise.all(
       refs.map((ref) =>
-        batchModel.status(ref, {
-          abortSignal: this.options?.abortSignal,
-        }),
+        Promise.resolve()
+          .then(() =>
+            batchModel.status(ref, {
+              abortSignal: this.options?.abortSignal,
+            }),
+          )
+          .catch((error: unknown) => {
+            throw providerError(error, "Provider batch status check failed");
+          }),
       ),
     );
 
@@ -764,7 +770,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const errors = statuses
       .map((s) => s.error)
       .filter((e): e is string => typeof e === "string" && e.length > 0);
-    const aggregatedError = errors.length > 0 ? errors.join("; ") : undefined;
+    if (errors.length > 0)
+      traceProviderDiagnostic("Provider batch status", errors.join("; "));
+    const aggregatedError =
+      hasFailed || errors.length > 0
+        ? "The provider reported a batch failure"
+        : undefined;
 
     // Per-item provider failures are visible in the counts as soon as the
     // batch settles; say so at the poll, not only after collect.
@@ -824,23 +835,34 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
     const settled = await Promise.allSettled(
       refs.map((ref) =>
-        cancel(ref, {
-          ...(this.options?.abortSignal
-            ? { abortSignal: this.options.abortSignal }
-            : {}),
-        }),
+        Promise.resolve().then(() =>
+          cancel(ref, {
+            ...(this.options?.abortSignal
+              ? { abortSignal: this.options.abortSignal }
+              : {}),
+          }),
+        ),
       ),
     );
     const failed = settled.find(
       (s): s is PromiseRejectedResult => s.status === "rejected",
     );
-    if (failed) throw failed.reason;
+    if (failed)
+      throw providerError(failed.reason, "Provider batch cancellation failed");
     return refs.map((ref, i) => ({
       ref,
       outcome: (
         settled[i] as PromiseFulfilledResult<Awaited<ReturnType<typeof cancel>>>
       ).value.outcome,
     }));
+  }
+
+  private async *providerResults(model: EngineBatchModel, ref: EngineBatchRef) {
+    try {
+      yield* model.results(ref, { abortSignal: this.options?.abortSignal });
+    } catch (error) {
+      throw providerError(error, "Provider batch results fetch failed");
+    }
   }
 
   async getResults(
@@ -860,7 +882,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       batchId.startsWith("batch-empty-")
     ) {
       const emptyResults: AIBatchResult<T>[] = [];
-      await this.recordResults(batchId, emptyResults);
+      void this.recordResults(batchId, emptyResults).catch(() => {});
       return emptyResults;
     }
 
@@ -921,9 +943,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const results: AIBatchResult<T>[] = [];
 
     for (const ref of targetRefs) {
-      for await (const item of batchModel.results(ref, {
-        abortSignal: this.options?.abortSignal,
-      })) {
+      for await (const item of this.providerResults(batchModel, ref)) {
         totalReceivedItems++;
         const customId = resolveCustomId(item);
         if (!customId) {
@@ -954,7 +974,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             inputTokens,
             outputTokens,
             status: "failed",
-            error,
+            error: "The provider reported a batch item failure",
             validated: false,
             ...accountingFields(item),
           });
@@ -1002,7 +1022,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens,
               outputTokens,
               status: "failed",
-              error: `Failed to parse JSON response for schema validation: ${parseError}`,
+              error: "Failed to parse JSON response for schema validation",
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1022,17 +1042,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 : parsedJson;
             validation = schema.safeParse(candidate);
           } catch (schemaErr) {
-            const errText =
-              schemaErr instanceof Error
-                ? schemaErr.message
-                : String(schemaErr);
+            traceProviderDiagnostic(
+              "Batch response validation threw",
+              schemaErr,
+            );
             results.push({
               id: customId,
               prompt: promptFor(customId),
               inputTokens,
               outputTokens,
               status: "failed",
-              error: `Schema validation threw an error: ${errText}`,
+              error: "Schema validation threw an error",
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1049,7 +1069,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens,
               outputTokens,
               status: "failed",
-              error: `Response did not match the request's schema: ${validation.error.message}`,
+              error: "Response did not match the request's schema",
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1140,11 +1160,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
-    // Auto-record results
-    await this.recordResults(batchId, results, {
+    // Accounting follows the result independently of the caller's step deadline.
+    void this.recordResults(batchId, results, {
       batchDurationMs: durationMs,
       provider,
-    });
+    }).catch(() => {});
 
     return results;
   }
@@ -1171,9 +1191,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return inFlight;
     }
 
+    const endCheck = this.ctx.beginOperation?.();
     const recordPromise = (async () => {
       try {
-        if (await this.isRecorded(batchId)) {
+        if (
+          await this.isRecorded(batchId).catch((error: unknown) => {
+            this.ctx.onAccountingError?.(error);
+            traceProviderDiagnostic("Batch accounting lookup failed", error);
+            throw new Error("Batch accounting lookup failed");
+          })
+        ) {
           logger.debug(`Batch ${batchId} already recorded, skipping.`);
           this.recordedBatchIds.add(batchId);
           return;
@@ -1182,7 +1209,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         const modelConfig = getModel(this.modelKey);
         const provider = extra.provider ?? this.provider;
 
-        await this.ctx.aiCallLogger.logBatchResults(
+        const write = this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
             const estimatedCost = calculateCostWithDiscount(
@@ -1242,11 +1269,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             };
           }),
         );
+        endCheck?.();
+        await write;
         // Only after the ledger write succeeded. Marking before the await
         // meant one transient DB error left the id in the set, and every
         // later getResults() in this process skipped recording for good.
         this.recordedBatchIds.add(batchId);
       } finally {
+        endCheck?.();
         this.recordingPromises.delete(batchId);
       }
     })();

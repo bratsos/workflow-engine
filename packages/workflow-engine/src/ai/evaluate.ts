@@ -14,6 +14,10 @@ import { experimental_evaluate as aiEvaluate } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
+  protectProviderWarnings,
+  providerError,
+} from "./provider-diagnostics.js";
+import {
   buildOpenRouterRoutingProvider,
   logger,
   mergeOpenRouterProviderOptions,
@@ -154,7 +158,9 @@ export async function evaluate<const Q extends EvaluationQuestions>(
   });
 
   try {
-    const model = getEvaluationModelProvider(modelConfig, ctx.routing);
+    const model = protectProviderWarnings(
+      getEvaluationModelProvider(modelConfig, ctx.routing),
+    );
     const callProviderOptions = options.providerOptions as Parameters<
       typeof aiEvaluate
     >[0]["providerOptions"];
@@ -256,7 +262,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       error: errorMessage,
       durationMs,
     });
-    throw error;
+    throw providerError(error, "Provider evaluate call failed");
   } finally {
     timeout.cleanup();
   }

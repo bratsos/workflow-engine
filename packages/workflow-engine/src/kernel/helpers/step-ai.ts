@@ -11,6 +11,10 @@
 import type { z } from "zod";
 import type { EngineBatchRef } from "../../ai/batch/model";
 import { getModel, type ModelKey } from "../../ai/model-helper";
+import {
+  originalProviderError,
+  providerError,
+} from "../../ai/provider-diagnostics.js";
 import { calculateCostWithDiscount } from "../../ai/shared";
 import type {
   AIBatchCancelResult,
@@ -311,6 +315,14 @@ function formatIssues(error: z.ZodError): string {
     .join("\n");
 }
 
+function validateMapResult<T>(schema: z.ZodType<T>, value: unknown) {
+  try {
+    return schema.safeParse(value);
+  } catch (error) {
+    throw providerError(error, "AI map response validation failed");
+  }
+}
+
 function stringify(value: unknown): string {
   if (typeof value === "string") return value;
   try {
@@ -341,6 +353,7 @@ function withRepair(prompt: TextInput, feedback: Feedback): TextInput {
  * `realtime.retries`.
  */
 function asGenerationFailure(error: unknown): Feedback | undefined {
+  error = originalProviderError(error);
   if (typeof error !== "object" || error === null) return undefined;
   const e = error as {
     name?: unknown;
@@ -732,10 +745,13 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
 
       for (;;) {
         if (feedback) {
-          if (repairsLeft <= 0) return failed(feedback.issues);
+          if (repairsLeft <= 0)
+            return failed(
+              "The response did not satisfy the required output format",
+            );
           if (!budget.reserve()) {
             return failed(
-              `${feedback.issues}\n(realtime budget exhausted before repair)`,
+              "The response did not satisfy the required output format (realtime budget exhausted before repair)",
             );
           }
           repairsLeft--;
@@ -784,7 +800,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             };
             continue;
           }
-          const validated = spec.schema.safeParse(streamed);
+          const validated = validateMapResult(spec.schema, streamed);
           if (validated.success) {
             return {
               ...base,
@@ -846,7 +862,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           return routed;
         }
 
-        const parsed = spec.schema.safeParse(object);
+        const parsed = validateMapResult(spec.schema, object);
         if (parsed.success) {
           return {
             ...base,

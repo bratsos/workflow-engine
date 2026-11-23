@@ -94,7 +94,7 @@ describe("generateObject failure accounting", () => {
 
     await expect(
       ai.generateObject(MODEL, "extract", z.object({ a: z.string() })),
-    ).rejects.toThrow("not JSON");
+    ).rejects.toThrow("No object generated");
 
     const [row] = await aiLogger.listCalls("t");
     expect(row).toMatchObject({
@@ -131,7 +131,7 @@ describe("generateObject failure accounting", () => {
 
     await expect(
       ai.generateObject(CACHED_MODEL, "extract", z.object({ a: z.string() })),
-    ).rejects.toThrow("schema mismatch");
+    ).rejects.toThrow("No object generated");
 
     const calls = await aiLogger.listCalls("t");
     expect(calls).toHaveLength(1);

@@ -846,6 +846,7 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     expect(results.map((r) => r.status)).toEqual(["failed", "failed"]);
     expect(results.map((r) => r.reportedCostUsd)).toEqual([0.12, 0.05]);
 
+    await batch.recordResults("b-validation", results);
     const rows = loggedBatchResults[0]?.records ?? [];
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -925,6 +926,7 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
       reasoningTokens: 50,
     });
 
+    await batch.recordResults("b-accounting", results);
     const row = loggedBatchResults[0]?.records[0];
     expect(row).toMatchObject({
       requestId: "r-accounting",

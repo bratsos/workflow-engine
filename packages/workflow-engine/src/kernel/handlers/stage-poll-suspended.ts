@@ -523,7 +523,7 @@ async function replayStage(
     try {
       result = await stageDef.execute(built.context);
     } finally {
-      await built.flushAI();
+      built.scheduleAIFlush();
     }
     const moved = await superseded(stageRecord, deps);
     if (moved) {
@@ -1006,7 +1006,7 @@ export async function handleStagePollSuspended(
     }) as CheckCompletionContext<unknown>["annotate"];
 
     // 3e. Build check context
-    const { context: checkContextBase, flushAI } = defineLazyAIContext(
+    const { context: checkContextBase, scheduleAIFlush } = defineLazyAIContext(
       {
         workflowRunId: run.id,
         stageId: stageRecord.stageId,
@@ -1076,23 +1076,25 @@ export async function handleStagePollSuspended(
     // this poll. Only this call is covered: what persists its answer is the
     // engine's, and is handled below.
     let checkResult: CompletionCheckResult<unknown>;
+    let checkedAt: number;
     try {
       checkResult = await stageDef.checkCompletion!(
         stageRecord.suspendedState as any,
         checkContext,
       );
+      checkedAt = deps.clock.now().getTime();
       // Its fault, not a store's: a missing answer must not read as one.
       if (checkResult == null) {
         throw new TypeError(`checkCompletion returned ${checkResult}`);
       }
     } catch (error) {
-      await flushAI();
+      scheduleAIFlush();
       // Annotations recorded before the throw persist alongside the FAILED
       // outcome.
       await failPolledStage(toErrorMessage(error));
       continue;
     }
-    await flushAI();
+    scheduleAIFlush();
 
     try {
       const moved = await superseded(stageRecord, deps);
@@ -1237,7 +1239,7 @@ export async function handleStagePollSuspended(
         );
       } else if (
         stageRecord.maxWaitUntil &&
-        stageRecord.maxWaitUntil.getTime() <= deps.clock.now().getTime()
+        stageRecord.maxWaitUntil.getTime() <= checkedAt
       ) {
         // Not ready, and the stage's maxWaitUntil deadline has now
         // passed. checkCompletion() didn't report its own deadline

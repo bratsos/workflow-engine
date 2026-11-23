@@ -38,6 +38,7 @@ import {
   generateText as generateTextImpl,
 } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
+import { traceProviderDiagnostic } from "./provider-diagnostics.js";
 import { calculateCostWithDiscount, logger } from "./shared";
 import { streamText as streamTextImpl } from "./stream";
 import { transcribe as transcribeImpl } from "./transcribe";
@@ -117,12 +118,19 @@ class AIHelperImpl implements AIHelper {
       },
       logBatchResults: (batchId, inputs) => {
         const calls = inputs.map((input) => this.prepareCall(input));
-        return this.trackWrite(calls, () =>
+        const write = this.trackWrite(calls, () =>
           aiCallLogger.logBatchResults(batchId, calls),
-        );
+        ).catch((error) => {
+          traceProviderDiagnostic("Batch accounting write failed", error);
+          throw new Error("Batch accounting write failed");
+        });
+        void write.catch(() => {});
+        return write;
       },
       isRecorded: (batchId) => aiCallLogger.isRecorded(batchId),
       getStats: (prefix) => aiCallLogger.getStats(prefix),
+      listCalls: aiCallLogger.listCalls?.bind(aiCallLogger),
+      flush: (config) => this.flush(config),
     };
 
     // Create batch log function if logContext is provided
@@ -213,12 +221,17 @@ class AIHelperImpl implements AIHelper {
     return result;
   }
 
+  bindCallLogger(): void {
+    this.options?.bindCallLogger?.(this.trackedLogger);
+  }
+
   /** Bundle the state generateText/generateObject/embed/streamText/batch need. */
   private context(): AIHelperContext {
     return {
       topic: this.topic,
       aiCallLogger: this.trackedLogger,
-      beginStream: () => this.writes.begin(),
+      beginOperation: () => this.writes.begin(),
+      onAccountingError: () => this.writes.fail(),
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
       adapter: this.options?.adapter,
@@ -426,7 +439,15 @@ export function createAIHelper(
   providerResolver?: ProviderResolver,
   options?: StageAIHelperOptions,
 ): AIHelper {
-  return new AIHelperImpl(topic, logger, logContext, providerResolver, options);
+  const helper = new AIHelperImpl(
+    topic,
+    logger,
+    logContext,
+    providerResolver,
+    options,
+  );
+  helper.bindCallLogger();
+  return helper;
 }
 
 // ============================================================================

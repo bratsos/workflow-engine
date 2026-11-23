@@ -50,7 +50,7 @@ export function createLocalExecutor(): ActivityExecutor {
           logs: [],
         };
       } finally {
-        await built?.flushAI();
+        built?.scheduleAIFlush();
       }
     },
   };

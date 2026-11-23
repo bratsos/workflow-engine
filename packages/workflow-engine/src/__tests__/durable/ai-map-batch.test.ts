@@ -416,7 +416,10 @@ describe("step.ai.map batch policy", () => {
     const results = h.results();
     expect(results).toHaveLength(25);
     expect(results.every((r) => r.status === "failed")).toBe(true);
-    expect(results[0]).toMatchObject({ error: "expired", attempts: 1 });
+    expect(results[0]).toMatchObject({
+      error: "The provider reported a batch failure",
+      attempts: 1,
+    });
     expect(h.mock.getCalls()).toHaveLength(0);
   });
 
@@ -426,7 +429,7 @@ describe("step.ai.map batch policy", () => {
     const result = await h.execute();
     expect(result.outcome).toBe("failed");
     expect(String((result as { error?: string }).error)).toMatch(
-      /batch "batch-1" failed: expired/,
+      /batch "batch-1" failed: The provider reported a batch failure/,
     );
   });
 });

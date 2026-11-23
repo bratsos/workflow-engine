@@ -1047,6 +1047,9 @@ to suppress stored text or to set an expiry on captured text. Set both
 `WORKFLOW_ENGINE_TRACE=1` and `WORKFLOW_ENGINE_TRACE_TEXT=1` for text in traces.
 `ai.recordCall` accepts an explicit USD cost for external calls, and
 `ai.flush()` waits for pending accounting writes at the end of a request.
+Stage outcomes commit before the accounting drain. Provider diagnostics are
+redacted by default. Apply separate retention to caller metadata, workflow
+data, durable results and application logs.
 
 
 ### Batch AI Calls (`ctx.step.ai.map`)

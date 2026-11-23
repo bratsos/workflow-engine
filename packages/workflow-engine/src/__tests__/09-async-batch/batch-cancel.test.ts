@@ -519,7 +519,11 @@ describe("AIBatch.cancel and a replayed submit", () => {
   it("tries every batch, then throws when one cancel failed", async () => {
     const cancel = vi
       .fn()
-      .mockRejectedValueOnce(new Error("HTTP 503"))
+      .mockRejectedValueOnce(
+        Object.assign(new Error("private diagnostic marker"), {
+          statusCode: 503,
+        }),
+      )
       .mockResolvedValueOnce({ outcome: "cancelled" });
     const batch = new AIBatchImpl(
       ctx,

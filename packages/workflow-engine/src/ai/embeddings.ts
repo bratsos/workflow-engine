@@ -13,6 +13,10 @@ import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
+  protectProviderWarnings,
+  providerError,
+} from "./provider-diagnostics.js";
+import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
   buildOpenRouterRoutingProvider,
@@ -138,10 +142,12 @@ export async function embed(
     if (isAdapter) assertAdapterProviderPolicy(ctx.routing?.provider);
     const embeddingModel = isAdapter
       ? undefined
-      : getEmbeddingModelProvider(
-          modelConfig,
-          ctx.routing,
-          options.providerOptions?.openrouter?.provider,
+      : protectProviderWarnings(
+          getEmbeddingModelProvider(
+            modelConfig,
+            ctx.routing,
+            options.providerOptions?.openrouter?.provider,
+          ),
         );
     const providerOptions = {
       ...(modelConfig.provider === "google" && {
@@ -266,7 +272,7 @@ export async function embed(
       error: errorMessage,
       durationMs,
     });
-    throw error;
+    throw providerError(error, "Provider embedding call failed");
   } finally {
     timeout.cleanup();
   }

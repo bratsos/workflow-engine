@@ -17,18 +17,47 @@ import {
 } from "../ai/ai-helper.js";
 import { registerModels } from "../ai/model-helper.js";
 import type { AIAdapter } from "../ai/types.js";
+import type { Stage } from "../core/stage.js";
 import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { defineWorkflow } from "../core/workflow.js";
 import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
+import type { Kernel, KernelConfig } from "../kernel/kernel.js";
 import type { CreateAICallInput } from "../persistence/interface.js";
 import {
   type KernelDatabase,
   kernelDatabase,
   override,
   realDatabase,
+  sqlite,
 } from "./sqlite8-kernel-utils.js";
 
+// Vitest loads the published integration surfaces from their workspace sources.
+const integration = {
+  console: "../../../workflow-engine-console/src/prisma-read-port.js",
+  node: "../../../workflow-engine-host-node/src/host.js",
+  serverless: "../../../workflow-engine-host-serverless/src/host.js",
+};
 const schema = z.object({});
+
+async function within<T>(work: Promise<T>, timeoutMs = 1_500): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error("The operation did not finish within the test budget"),
+            ),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const workflow = defineWorkflow({
   id: "tenant-attribution",
   name: "Tenant attribution",
@@ -321,7 +350,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     });
     await expect(
       ai.generateText(modelKey, "request marker", { maxRetries: 0 }),
-    ).rejects.toThrow("error body marker");
+    ).rejects.toThrow("Provider generation failed");
     await ai.generateObject(modelKey, "request marker", schema);
     await ai.embed(modelKey, "request marker");
     await ai.evaluate(modelKey, {
@@ -511,7 +540,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     "execute",
     "replay",
     "checkCompletion",
-  ] as const)("forwards run attribution and flushes writes before the %s outcome", async (path) => {
+  ] as const)("commits the %s outcome while attributed accounting is still pending", async (path) => {
     const started = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const write = async (call: CreateAICallInput) => {
@@ -604,28 +633,23 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         ? execute
         : kernel.dispatch({ type: "stage.pollSuspended" });
     try {
-      await Promise.race([
-        started.promise,
-        finish.then(() => {
-          throw new Error("Stage finished before the write began");
-        }),
-      ]);
+      await started.promise;
+      const finished = await within<unknown>(finish);
+      expect(finished).toBeDefined();
       expect(factory.mock.calls[0]?.[4]?.attribution).toEqual({
         ...attribution,
         workflowRunId,
       });
-      const stageBefore = await db.client.workflowStage.findFirst({
-        where: { workflowRunId },
-      });
-      expect(stageBefore.status).toBe(
-        path === "execute" ? "RUNNING" : "SUSPENDED",
-      );
       expect(await db.client.aICall.count({ where: { workflowRunId } })).toBe(
         0,
       );
+      expect(
+        await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+      ).toMatchObject({ status: "COMPLETED" });
     } finally {
       release.resolve();
       await finish;
+      await kernel.flush();
     }
     const row = await db.client.aICall.findFirst({ where: { workflowRunId } });
     expect(row).toMatchObject({
@@ -698,16 +722,473 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       job,
     });
     expect(result.outcome).toBe("completed");
+    await kernel.flush();
+    await vi.waitFor(async () => {
+      expect(
+        await db.client.workflowLog.findMany({
+          where: { workflowRunId, level: "WARN" },
+        }),
+      ).toEqual([
+        expect.objectContaining({
+          workflowStageId: null,
+          message: "AI call logging did not finish successfully",
+          metadata: { failed: 1, pending: 1 },
+        }),
+      ]);
+    });
+  });
+
+  async function queueJob(
+    stage: Stage<typeof schema, typeof schema, typeof schema>,
+    config: Partial<KernelConfig>,
+  ) {
+    const def = defineWorkflow({
+      id: "diagnostics",
+      name: "Diagnostics",
+      description: "Exercises the accounting boundary",
+      input: schema,
+    })
+      .pipe(stage)
+      .build();
+    const kernel = db.makeKernel({
+      registry: { getWorkflow: () => def },
+      ...config,
+    });
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "diagnostics-run",
+      workflowId: def.id,
+      input: {},
+      ...attribution,
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "kernel-worker",
+    });
+    const job = await db.jobTransport.dequeue();
+    if (!job) throw new Error("Expected a job");
+    return { workflowRunId, kernel, job };
+  }
+
+  const diagnosticsStage = {
+    id: "verify",
+    name: "Verify",
+    schemas: { input: schema, output: schema, config: schema },
+  } as const;
+  const sensitive = "private provider diagnostic marker";
+
+  it.each([
+    ["batch", "none"],
+    ["batch", "full"],
+    ["durable", "none"],
+    ["realtime", "full"],
+    ["validation", "none"],
+    ["batch accounting", "full"],
+  ] as const)("keeps %s provider diagnostics out of host and console data with %s capture", async (path, store) => {
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        if (path === "batch") {
+          await ctx.ai
+            .batch(modelKey, "openrouter", {
+              apiKey: "fixture-key",
+              fetch: async () => new Response(sensitive, { status: 400 }),
+            })
+            .submit([{ id: "item-1", prompt: "request marker" }]);
+        } else if (path === "durable") {
+          await ctx.step.ai.generateText("fetch", modelKey, "request marker");
+        } else if (path === "validation") {
+          await ctx.step.ai.map("fetch", ["item-1"], {
+            model: modelKey,
+            policy: "realtime",
+            prompt: () => "request marker",
+            stream: true,
+            schema: z.object({}).transform(() => {
+              throw new Error(sensitive);
+            }),
+          });
+        } else if (path === "batch accounting") {
+          await ctx.aiLogger.logBatchResults("batch-1", [
+            {
+              ...manual,
+              topic: "scope",
+              modelId: modelKey,
+              requestId: "item-1",
+            },
+          ]);
+        } else {
+          await ctx.ai.generateText(modelKey, "request marker");
+        }
+        return { output: {} };
+      },
+    });
+    const { workflowRunId, kernel, job } = await queueJob(stage, {
+      services: {
+        aiLogger: override(db.aiLogger, {
+          async logBatchResults() {
+            throw new Error(sensitive);
+          },
+        }),
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, {
+            ...options,
+            text: { store, ttlMs: 1 },
+            adapter: {
+              streamText() {
+                return {
+                  stream: (async function* () {
+                    yield "{}";
+                  })(),
+                  inputTokens: 1,
+                  outputTokens: 1,
+                };
+              },
+              async generateText() {
+                throw new Error(sensitive);
+              },
+            },
+          }),
+      },
+    });
+    const { createServerlessHost } = await import(integration.serverless);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport: db.jobTransport,
+      workerId: "kernel-worker",
+    });
+    const result = await host.handleJob({ ...job, maxAttempts: 1 });
+    expect(result.outcome).toBe(path === "validation" ? "completed" : "failed");
+    const { createPrismaConsoleReadPort } = await import(integration.console);
+    const reader = createPrismaConsoleReadPort(db.client, {
+      databaseType: sqlite ? "sqlite" : "postgresql",
+    });
+    const reads = await Promise.all([
+      reader.getRunDetail(workflowRunId),
+      reader.listRunEvents(workflowRunId, 0),
+      db.client.workflowStage.findMany({ where: { workflowRunId } }),
+      db.client.workflowLog.findMany({ where: { workflowRunId } }),
+      db.client.workflowStep.findMany({ where: { stage: { workflowRunId } } }),
+      db.client.jobQueue.findMany({ where: { workflowRunId } }),
+      db.client.outboxEvent.findMany({ where: { workflowRunId } }),
+    ]);
+    expect(reads[0]).toBeTruthy();
+    expect(reads[1]?.length).toBeGreaterThan(0);
+    if (path === "validation") {
+      expect(JSON.stringify(reads[4])).toContain(
+        "AI map response validation failed",
+      );
+    }
+    expect(JSON.stringify([result, ...reads])).not.toContain(sensitive);
+  });
+
+  it.each([
+    "none",
+    "full",
+  ] as const)("binds raw stage writes to %s capture and run attribution", async (store) => {
+    const input = {
+      ...manual,
+      modelId: manual.modelKey,
+      topic: "scope",
+      metadata: { instructions: sensitive, details: { caller: sensitive } },
+    };
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        // The logger is the first AI accessor touched by this stage.
+        ctx.aiLogger.logCall(input);
+        await ctx.aiLogger.logBatchResults("batch-2", [
+          { ...input, requestId: "item-1", callType: "batch" },
+        ]);
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, {
+            ...options,
+            text: { store, ttlMs: 10 },
+          }),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    await kernel.flush();
+    const rows = await db.client.aICall.findMany({ where: { workflowRunId } });
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row).toMatchObject({ ...attribution, workflowRunId });
+      // Opaque caller metadata is explicitly outside the text-retention policy.
+      expect(row.metadata.details).toEqual({ caller: sensitive });
+      if (store === "none") {
+        expect(row).toMatchObject({
+          prompt: "",
+          response: "",
+          textExpiresAt: null,
+        });
+        expect(row.metadata).not.toHaveProperty("instructions");
+      } else {
+        expect(row).toMatchObject({
+          prompt: manual.prompt,
+          response: manual.response,
+          textExpiresAt: expect.any(Date),
+        });
+      }
+    }
+  });
+
+  it("keeps a timely not-ready poll suspended as a successful accounting write crosses its deadline", async () => {
+    let now = Date.now();
+    const deadline = now + 1_000;
+    const write = Promise.withResolvers<void>();
+    const stage = defineAsyncBatchStage({
+      ...diagnosticsStage,
+      mode: "async-batch",
+      async execute() {
+        return {
+          suspended: true,
+          state: {
+            batchId: "batch-1",
+            submittedAt: new Date(now).toISOString(),
+            pollInterval: 1,
+            maxWaitTime: 1_000,
+          },
+          pollConfig: {
+            nextPollAt: new Date(now),
+            pollInterval: 1,
+            maxWaitTime: 1_000,
+          },
+        };
+      },
+      async checkCompletion(_state, ctx) {
+        expect(now).toBeLessThan(deadline);
+        ctx.ai.recordCall(manual);
+        return { ready: false };
+      },
+    });
+    const logger = override(db.aiLogger, {
+      async logCall(call) {
+        await write.promise;
+        now = deadline + 1;
+        await db.aiLogger.logCall(call);
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      clock: { now: () => new Date(now) },
+      services: { aiLogger: logger },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("suspended");
+    await db.client.workflowStage.updateMany({
+      where: { workflowRunId },
+      data: { maxWaitUntil: new Date(deadline) },
+    });
+    now += 100;
+    const poll = kernel.dispatch({ type: "stage.pollSuspended" });
+    try {
+      await within(poll);
+      expect(
+        await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+      ).toMatchObject({ status: "SUSPENDED" });
+    } finally {
+      write.resolve();
+      await poll;
+      await kernel.flush();
+    }
+    expect(now).toBeGreaterThan(deadline);
+    expect(await db.client.aICall.count({ where: { workflowRunId } })).toBe(1);
+  });
+
+  it.each([
+    "throw",
+    "hold",
+  ] as const)("preserves a committed host result with a %s helper drain, rejecting logger drain and held warning", async (mode) => {
+    const held = Promise.withResolvers<{ failed: number; pending: number }>();
+    const warningWritten = Promise.withResolvers<void>();
+    const warning = Promise.withResolvers<void>();
+    const warningStarted = Promise.withResolvers<void>();
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        ctx.ai.recordCall(manual);
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      persistence: override(db.persistence, {
+        async createLog(input) {
+          if (input.message === "AI call logging did not finish successfully") {
+            warningStarted.resolve();
+            await warning.promise;
+          }
+          const saved = await db.persistence.createLog(input);
+          if (input.message === "AI call logging did not finish successfully")
+            warningWritten.resolve();
+          return saved;
+        },
+      }),
+      aiFlushTimeoutMs: 20,
+      services: {
+        aiLogger: override(db.aiLogger, {
+          flush: async () => {
+            throw new Error(sensitive);
+          },
+        }),
+        ai: (topic, logger, context, resolver, options) => {
+          const helper = createAIHelper(
+            topic,
+            logger,
+            context,
+            resolver,
+            options,
+          );
+          return override(helper, {
+            flush() {
+              if (mode === "throw") throw new Error(sensitive);
+              return held.promise;
+            },
+          });
+        },
+      },
+    });
+    const { createServerlessHost } = await import(integration.serverless);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport: db.jobTransport,
+      workerId: "kernel-worker",
+    });
+    const result = host.handleJob(job);
+    try {
+      await within(warningStarted.promise);
+      expect((await within<{ outcome: string }>(result)).outcome).toBe(
+        "completed",
+      );
+      expect(
+        await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+      ).toMatchObject({ status: "COMPLETED" });
+    } finally {
+      held.resolve({ failed: 0, pending: 0 });
+      warning.resolve();
+      await result;
+      await within(warningWritten.promise);
+    }
+  });
+
+  it("bounds both kernel flush and Node shutdown when the logger ignores the supplied timeout", async () => {
+    const release = Promise.withResolvers<{
+      failed: number;
+      pending: number;
+    }>();
+    const kernel: Kernel = db.makeKernel({
+      services: {
+        aiLogger: override(db.aiLogger, { flush: () => release.promise }),
+      },
+    });
+    const { createNodeHost } = await import(integration.node);
+    const host = createNodeHost({
+      kernel,
+      jobTransport: db.jobTransport,
+      workerId: "kernel-worker",
+      shutdownTimeoutMs: 20,
+      jobPollIntervalMs: 10,
+      flushOutboxOnStop: false,
+    });
+    await host.start();
+    try {
+      expect(await within(kernel.flush({ timeoutMs: 20 }))).toEqual({
+        failed: 0,
+        pending: 1,
+      });
+      await within(host.stop());
+    } finally {
+      release.resolve({ failed: 0, pending: 0 });
+      await host.stop();
+    }
+  });
+
+  it("completes a leased durable batch read while its automatic write is still pending", async () => {
+    const writeStarted = Promise.withResolvers<void>();
+    const receipt = Promise.withResolvers<void>();
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const count = await ctx.step.run(
+          "retrieve",
+          async () => {
+            const batch = ctx.ai.batch(modelKey, "openrouter", {
+              apiKey: "fixture-key",
+              fetch: async () =>
+                Response.json({
+                  id: "batch-1",
+                  status: "completed",
+                  results: [
+                    {
+                      custom_id: "item-1",
+                      response: {
+                        status_code: 200,
+                        body: { choices: [{ message: { content: "reply" } }] },
+                      },
+                    },
+                  ],
+                }),
+            });
+            return (await batch.getResults("batch-1")).length;
+          },
+          { lease: 1_000 },
+        );
+        expect(count).toBe(1);
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: override(db.aiLogger, {
+          async logBatchResults() {
+            writeStarted.resolve();
+            await receipt.promise;
+          },
+        }),
+      },
+    });
+    const outcome = executeJobWithHeartbeat(kernel, {
+      job,
+      jobTransport: db.jobTransport,
+    });
+    try {
+      await within(writeStarted.promise);
+      expect((await within(outcome)).outcome).toBe("completed");
+      const saved = await db.client.workflowStep.findFirst({
+        where: { stepId: "retrieve", stage: { workflowRunId } },
+      });
+      expect(saved.status.toLowerCase()).toBe("completed");
+    } finally {
+      receipt.reject(new Error(sensitive));
+      await outcome;
+      await kernel.flush();
+    }
     expect(
       await db.client.workflowLog.findMany({
-        where: { workflowRunId, level: "WARN" },
+        where: {
+          workflowRunId,
+          level: "WARN",
+          message: "AI call logging did not finish successfully",
+        },
       }),
     ).toEqual([
-      expect.objectContaining({
-        workflowStageId: null,
-        message: "AI call logging did not finish successfully",
-        metadata: { failed: 1, pending: 1 },
-      }),
+      expect.objectContaining({ metadata: { failed: 1, pending: 0 } }),
     ]);
   });
 });

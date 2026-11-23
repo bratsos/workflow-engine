@@ -38,6 +38,7 @@ export interface AIHelperOptions {
 /** Options forwarded by the kernel when binding a helper to a stage. */
 export type StageAIHelperOptions = AIHelperOptions & {
   attribution?: { workflowRunId?: string };
+  bindCallLogger?: (logger: AICallLogger) => void;
 };
 
 export type AIHelperChildOptions = Pick<
@@ -859,7 +860,8 @@ export interface AIHelper {
 export interface AIHelperContext {
   readonly topic: string;
   readonly aiCallLogger: AICallLogger;
-  readonly beginStream?: () => () => void;
+  readonly beginOperation?: () => () => void;
+  readonly onAccountingError?: (error: unknown) => void;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;
   readonly adapter?: AIAdapter;
