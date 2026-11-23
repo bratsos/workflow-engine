@@ -26,7 +26,11 @@ import { defineWorkflow } from "../core/workflow.js";
 import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import type { Kernel, KernelConfig } from "../kernel/kernel.js";
 import { CollectingEventSink } from "../kernel/testing/index.js";
-import type { CreateAICallInput } from "../persistence/interface.js";
+import type {
+  AICallLogger,
+  CreateAICallInput,
+} from "../persistence/interface.js";
+import { createPrismaAICallLogger } from "../persistence/prisma/index.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -928,6 +932,11 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     schemas: { input: schema, output: schema, config: schema },
   } as const;
   const sensitive = "private provider diagnostic marker";
+  // A logger of its own, so its flush counts only this test's writes.
+  const freshLogger = () =>
+    createPrismaAICallLogger(db.client, {
+      databaseType: sqlite ? "sqlite" : "postgresql",
+    });
 
   // A provider model whose stream fails in one of the ways the SDK reports.
   const failingStream = (path: string) =>
@@ -1447,7 +1456,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ]);
   });
 
-  it("rejects an awaited stage write that the database refuses and counts both failures in ctx.aiLogger.flush", async () => {
+  it("rejects an awaited stage write that the database refuses and counts both failures in ctx.aiLogger.flush, with the configured logger's own", async () => {
     const call = {
       ...manual,
       modelId: manual.modelKey,
@@ -1473,7 +1482,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       },
     });
     const { kernel, job, workflowRunId } = await queueJob(stage, {
-      services: { aiLogger: db.aiLogger, ai: createAIHelper },
+      services: { aiLogger: freshLogger(), ai: createAIHelper },
     });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -1488,9 +1497,10 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     } finally {
       warn.mockRestore();
     }
+    // ctx.aiLogger and the configured Prisma logger each count both.
     expect(outcomes).toEqual([
       "AI call accounting write failed",
-      { failed: 2, pending: 0 },
+      { failed: 4, pending: 0 },
     ]);
     expect(
       await db.client.aICall.findMany({ where: { workflowRunId } }),
@@ -1899,14 +1909,15 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         return { output: {} };
       },
     });
+    const configured = freshLogger();
     const { kernel, job } = await queueJob(stage, {
       services: {
-        aiLogger: override(db.aiLogger, {
+        aiLogger: override(configured, {
           async logCall(call: CreateAICallInput) {
             entered.resolve();
             await release.promise;
             if (result === "refused") throw new Error(`refused ${sensitive}`);
-            await db.aiLogger.logCall(call);
+            await configured.logCall(call);
           },
         }),
         ai: createAIHelper,
@@ -1930,6 +1941,135 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(await db.client.aICall.count({ where: { topic: "direct" } })).toBe(
       result === "stored" ? 1 : 0,
     );
+  });
+
+  it("sends a buffered logger's direct write when the stage flushes ctx.aiLogger, so the run total and completion event count it", async () => {
+    // Rows wait in the logger until its flush inserts them; a write settles
+    // once its row is inserted.
+    const configured = freshLogger();
+    const queue: [CreateAICallInput, PromiseWithResolvers<void>][] = [];
+    const buffered = override(configured, {
+      logCall(call: CreateAICallInput) {
+        const written = Promise.withResolvers<void>();
+        queue.push([call, written]);
+        return written.promise;
+      },
+      async flush() {
+        for (const [call, written] of queue.splice(0)) {
+          await configured.logCall(call).then(written.resolve, written.reject);
+        }
+        return { failed: 0, pending: 0 };
+      },
+    });
+    const observed: Record<string, unknown> = {};
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        void ctx.aiLogger.logCall({
+          ...manual,
+          modelId: manual.modelKey,
+          topic: `workflow.${ctx.workflowRunId}.stage.direct`,
+          cost: 1.25,
+        });
+        observed.flushed = await ctx.aiLogger.flush?.();
+        observed.rows = await db.client.aICall.count({
+          where: { workflowRunId: ctx.workflowRunId },
+        });
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: { aiLogger: buffered, ai: createAIHelper },
+    });
+    try {
+      expect(
+        (
+          await executeJobWithHeartbeat(kernel, {
+            job,
+            jobTransport: db.jobTransport,
+          })
+        ).outcome,
+      ).toBe("completed");
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+    } finally {
+      await buffered.flush?.();
+    }
+    expect(observed).toEqual({
+      flushed: { failed: 0, pending: 0 },
+      rows: 1,
+    });
+    expect(
+      await db.client.workflowRun.findUnique({ where: { id: workflowRunId } }),
+    ).toMatchObject({ status: "COMPLETED", totalCost: 1.25, totalTokens: 5 });
+    const [completed] = await db.client.outboxEvent.findMany({
+      where: { workflowRunId, eventType: "workflow:completed" },
+    });
+    expect(completed.payload).toMatchObject({
+      totalCost: 1.25,
+      totalTokens: 5,
+    });
+  });
+
+  it.each([
+    "a plain object",
+    "a class instance",
+  ] as const)("keeps every member of a configured logger that is %s when a stage spreads ctx.aiLogger into a decorator", async (shape) => {
+    const configured = freshLogger();
+    const aiLogger: AICallLogger =
+      shape === "a class instance"
+        ? configured
+        : {
+            logCall: (call) => configured.logCall(call),
+            logBatchResults: (batchId, calls) =>
+              configured.logBatchResults(batchId, calls),
+            getStats: (topic) => configured.getStats(topic),
+            listCalls: (options) => configured.listCalls(options),
+            isRecorded: (batchId) => configured.isRecorded(batchId),
+          };
+    let metered = 0;
+    const observed: Record<string, unknown> = {};
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const source = ctx.aiLogger;
+        const decorated = {
+          ...source,
+          logCall(call: CreateAICallInput) {
+            metered++;
+            return source.logCall(call);
+          },
+        };
+        await decorated.logCall({
+          ...manual,
+          modelId: manual.modelKey,
+          topic: `workflow.${ctx.workflowRunId}.stage.direct`,
+        });
+        observed.cost = (
+          await decorated.getStats(`workflow.${ctx.workflowRunId}`)
+        ).totalCost;
+        observed.recorded = await decorated.isRecorded("no-such-batch");
+        observed.flushed = await decorated.flush?.();
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: { aiLogger, ai: createAIHelper },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect({ metered, ...observed }).toEqual({
+      metered: 1,
+      cost: manual.cost,
+      recorded: false,
+      flushed: { failed: 0, pending: 0 },
+    });
+    expect(await db.client.aICall.count({ where: { workflowRunId } })).toBe(1);
   });
 
   it.each([

@@ -4,7 +4,12 @@ import type {
   LogContext,
   StageAIHelperOptions,
 } from "../../ai/types.js";
-import { AICallWriteTracker, trackedWrite } from "../../ai/write-tracker.js";
+import {
+  AICallWriteTracker,
+  boundedAIFlush,
+  DEFAULT_AI_FLUSH_TIMEOUT_MS,
+  trackedWrite,
+} from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
 import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
@@ -24,7 +29,11 @@ import {
 import { writeBatchWarn } from "./batch-warn.js";
 import { createStorageShim } from "./create-storage-shim.js";
 import { toErrorMessage } from "./error-message.js";
+import { assertTimerMs } from "./host-support.js";
 import { createStepApi } from "./step-api.js";
+
+/** How often ctx.aiLogger.flush flushes the configured logger again while direct writes are pending. */
+const DIRECT_WRITE_RECHECK_MS = 10;
 
 export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
@@ -50,8 +59,7 @@ export function defineLazyAIContext<T extends object>(
 
   // Rows keep the text policy and attribution of whatever built them. Every
   // row names this run, so erasing the run finds it; the stage fills only the
-  // tenant and labels a row lacks, under the row's own. Every other member is
-  // the configured logger's own, bound to it.
+  // tenant and labels a row lacks, under the row's own.
   const stamp = (call: CreateAICallInput): CreateAICallInput => ({
     ...call,
     workflowRunId: params.workflowRunId,
@@ -61,10 +69,55 @@ export function defineLazyAIContext<T extends object>(
         ? { ...params.labels, ...call.labels }
         : undefined,
   });
-  const overriding = (logger: AICallLogger, own: Partial<AICallLogger>) =>
-    forwardingProxy(logger, (key, value) =>
-      Object.hasOwn(own, key) ? own[key as keyof AICallLogger] : value,
-    );
+  // A plain object, so a spread keeps every member: each member of the
+  // logger, own or inherited, reaches the logger, except those `own` replaces.
+  // A read of a member the logger does not list still reaches it.
+  const overriding = (
+    logger: AICallLogger,
+    own: Partial<AICallLogger>,
+  ): AICallLogger => {
+    const view = Object.create(forwardingProxy(logger, (_, value) => value));
+    const keys = new Set(Reflect.ownKeys(own));
+    for (const key of keys) {
+      Object.defineProperty(view, key, {
+        ...Reflect.getOwnPropertyDescriptor(own, key),
+        enumerable: true,
+      });
+    }
+    for (
+      let source: object | null = logger;
+      source && source !== Object.prototype;
+      source = Reflect.getPrototypeOf(source)
+    ) {
+      for (const key of Reflect.ownKeys(source)) {
+        if (key === "constructor" || keys.has(key)) continue;
+        keys.add(key);
+        const member = Reflect.getOwnPropertyDescriptor(source, key);
+        Object.defineProperty(
+          view,
+          key,
+          typeof member?.value === "function"
+            ? {
+                enumerable: true,
+                configurable: true,
+                writable: true,
+                value: (...args: unknown[]) =>
+                  Reflect.apply(Reflect.get(logger, key), logger, args),
+              }
+            : {
+                enumerable: true,
+                configurable: true,
+                get: () => Reflect.get(logger, key),
+                set: (value: unknown) => {
+                  (logger as unknown as Record<PropertyKey, unknown>)[key] =
+                    value;
+                },
+              },
+        );
+      }
+    }
+    return view;
+  };
   let scopedLogger: AICallLogger | undefined;
   const loggerForRun = (logger: AICallLogger): AICallLogger =>
     (scopedLogger ??= overriding(logger, {
@@ -72,8 +125,11 @@ export function defineLazyAIContext<T extends object>(
       logBatchResults: (batchId, calls) =>
         logger.logBatchResults(batchId, calls.map(stamp)),
     }));
-  // ctx.aiLogger stores direct writes as given, and its flush covers them
-  // from the call until they settle.
+  // ctx.aiLogger stores direct writes as given. Its flush covers them from
+  // the call until they settle, and flushes the configured logger. A direct
+  // write reaches that logger once the run's write fence admits it, and a
+  // buffered logger sends it only when flushed, so the flush repeats until
+  // the direct writes settle, then once more for the logger's final counts.
   let stageLogger: AICallLogger | undefined;
   const directLogger = (logger: AICallLogger): AICallLogger => {
     const writes = new AICallWriteTracker();
@@ -81,7 +137,30 @@ export function defineLazyAIContext<T extends object>(
       logCall: (call) => trackedWrite(writes, () => logger.logCall(call)),
       logBatchResults: (batchId, calls) =>
         trackedWrite(writes, () => logger.logBatchResults(batchId, calls)),
-      flush: (options) => writes.flush(options),
+      flush: async (options = {}) => {
+        const timeoutMs = assertTimerMs(
+          "timeoutMs",
+          options.timeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
+          { allowZero: true },
+        );
+        const flush = logger.flush;
+        if (!flush) return writes.flush({ timeoutMs });
+        const deadline = Date.now() + timeoutMs;
+        const left = () => Math.max(0, deadline - Date.now());
+        let direct = await writes.flush({ timeoutMs: 0 });
+        for (;;) {
+          const configured = await boundedAIFlush(flush, left());
+          if (direct.pending === 0 || left() === 0) {
+            return {
+              failed: direct.failed + configured.failed,
+              pending: direct.pending + configured.pending,
+            };
+          }
+          direct = await writes.flush({
+            timeoutMs: Math.min(left(), DIRECT_WRITE_RECHECK_MS),
+          });
+        }
+      },
     });
   };
 
