@@ -11,6 +11,7 @@ import {
   createKernel,
   type Kernel,
   type MaintenanceTickCounts,
+  setLogger,
 } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
@@ -208,6 +209,51 @@ describe("NodeHost", () => {
     } finally {
       done.resolve({ failed: 0, pending: 0 });
       await stop;
+    }
+  });
+
+  it("reports host diagnostics to the process logger and completes a run when it throws", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const error = vi.fn(() => {
+      throw new Error("sink failure");
+    });
+    const fallback = vi.spyOn(console, "error").mockImplementation(() => {});
+    setLogger({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error });
+    try {
+      await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "process-logger",
+        workflowId: workflow.id,
+        input: { data: "hello" },
+      });
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "host-worker",
+        orchestrationIntervalMs: 50,
+        jobPollIntervalMs: 20,
+      });
+      await host.start();
+      await waitFor(
+        async () =>
+          (await persistence.getRunsByStatus("COMPLETED")).length === 1,
+      );
+
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("workerId mismatch"),
+        { workerId: "host-worker", transportWorkerId: "test-worker" },
+      );
+      expect(fallback.mock.calls).toMatchInlineSnapshot(`
+        [
+          [
+            "[NodeHost] workerId mismatch: this host is "host-worker" but its job transport stamps "test-worker" on the jobs it claims. Drop the workerId option from the transport (e.g. createPrismaJobQueue(prisma)) to let the host supply it.",
+          ],
+        ]
+      `);
+    } finally {
+      setLogger(undefined);
+      fallback.mockRestore();
     }
   });
 

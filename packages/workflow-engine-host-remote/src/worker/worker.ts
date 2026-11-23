@@ -1,7 +1,9 @@
-import { assertTimerMs } from "@bratsos/workflow-engine/kernel";
+import { assertTimerMs, createLogger } from "@bratsos/workflow-engine/kernel";
 import type { WorkerTransport } from "../transport.js";
 import type { RemoteStage } from "./run-activity.js";
 import { runActivity } from "./run-activity.js";
+
+const logger = createLogger();
 
 export interface ActivityWorkerConfig {
   registry: Map<string, RemoteStage>;
@@ -28,7 +30,7 @@ export interface ActivityWorkerConfig {
   idleDelayMs?: number;
   /**
    * Called whenever processOne() throws (e.g. a permanent lease/version
-   * mismatch). Defaults to console.error so failures are never silently
+   * mismatch). Defaults to the engine logger so failures are never silently
    * swallowed. Receives the running count of consecutive failures — the
    * loop also backs off (capped by maxBackoffMs) as this count grows.
    */
@@ -62,9 +64,15 @@ export function createActivityWorker(
   const onError =
     cfg.onError ??
     ((error: unknown, info: { consecutiveFailures: number }) => {
-      console.error(
-        `[activity-worker ${cfg.workerId}] processOne failed (consecutive failures: ${info.consecutiveFailures})`,
-        error,
+      const message = `processOne failed (consecutive failures: ${info.consecutiveFailures})`;
+      logger.error(
+        `[activity-worker] ${message}`,
+        {
+          workerId: cfg.workerId,
+          consecutiveFailures: info.consecutiveFailures,
+          error,
+        },
+        () => [`[activity-worker ${cfg.workerId}] ${message}`, error],
       );
     });
   let running = false;

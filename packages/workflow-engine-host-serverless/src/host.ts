@@ -12,11 +12,13 @@
 
 import {
   assertTimerMs,
+  createLogger,
   type EnginePruneResult,
   type EventSinkStatus,
   executeJobWithHeartbeat,
   flushOutboxWithin,
   HOST_DEFAULTS,
+  type HostJobMessage,
   type JobTransport,
   type Kernel,
   type MaintenanceTickHook,
@@ -27,6 +29,8 @@ import {
   type ServedDefinition,
   toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
+
+const logger = createLogger("ServerlessHost");
 
 // ============================================================================
 // Public interfaces
@@ -297,7 +301,8 @@ class ServerlessHostImpl implements ServerlessHost {
       try {
         await this.kernel.flush?.();
       } catch {
-        console.warn("[ServerlessHost] Call accounting drain failed");
+        const message = "Call accounting drain failed";
+        logger.warn(message, { workerId: this.workerId }, () => [message]);
       }
     }
   }
@@ -318,13 +323,21 @@ class ServerlessHostImpl implements ServerlessHost {
       logPrefix: "[ServerlessHost]",
     });
     if (this.flushOutboxAfterJob) {
-      await this.flushOutbox();
+      await this.flushOutbox(result.dead ? undefined : msg);
     }
     return result;
   }
 
   /** Publish pending outbox events, bounded by `outboxFlushTimeoutMs`. */
-  private async flushOutbox(): Promise<void> {
+  private async flushOutbox(job?: HostJobMessage): Promise<void> {
+    const fields = {
+      workerId: this.workerId,
+      ...(job && {
+        jobId: job.jobId,
+        workflowRunId: job.workflowRunId,
+        stageId: job.stageId,
+      }),
+    };
     try {
       const outcome = await flushOutboxWithin(
         this.kernel,
@@ -332,24 +345,33 @@ class ServerlessHostImpl implements ServerlessHost {
         this.outboxFlushTimeoutMs,
       );
       if (outcome === undefined) {
-        console.error(
-          "[ServerlessHost] outbox.flush after job timed out. Pending events remain for a later flush.",
-        );
+        const message =
+          "outbox.flush after job timed out. Pending events remain for a later flush.";
+        logger.error(message, fields, () => [message]);
       } else if (outcome.eventSinkStatus === "degraded") {
         // Stateless: no transition to detect, so say it every time.
-        console.error(
-          `[ServerlessHost] event sink DEGRADED: ${outcome.failed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
-            outcome.eventSinkError ?? "unknown"
-          }`,
+        const error = outcome.eventSinkError;
+        const message = `event sink DEGRADED: ${outcome.failed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${error ?? "unknown"}`;
+        logger.error(
+          message,
+          {
+            ...fields,
+            failed: outcome.failed,
+            ...(error !== undefined && { error }),
+          },
+          () => [message],
         );
       }
       if (outcome && outcome.deadLettered > 0) {
-        console.error(
-          `[ServerlessHost] event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+        const message = `event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`;
+        logger.error(
+          message,
+          { ...fields, deadLettered: outcome.deadLettered },
+          () => [message],
         );
       }
     } catch (error) {
-      console.error("[ServerlessHost] outbox.flush after job error:", error);
+      logger.caught("outbox.flush after job error:", error, fields);
     }
   }
 
@@ -429,15 +451,24 @@ class ServerlessHostImpl implements ServerlessHost {
       logPrefix: "[ServerlessHost]",
     });
     if (counts.eventSinkStatus === "degraded") {
-      console.error(
-        `[ServerlessHost] event sink DEGRADED: ${counts.eventsFailed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
-          counts.eventSinkError ?? "unknown"
-        }`,
+      const error = counts.eventSinkError;
+      const message = `event sink DEGRADED: ${counts.eventsFailed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${error ?? "unknown"}`;
+      logger.error(
+        message,
+        {
+          workerId: this.workerId,
+          failed: counts.eventsFailed,
+          ...(error !== undefined && { error }),
+        },
+        () => [message],
       );
     }
     if (counts.eventsDeadLettered > 0) {
-      console.error(
-        `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+      const message = `event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`;
+      logger.error(
+        message,
+        { workerId: this.workerId, deadLettered: counts.eventsDeadLettered },
+        () => [message],
       );
     }
     await runTickHook(

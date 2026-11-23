@@ -212,6 +212,13 @@ describe("kernel: outbox.flush with a misbehaving persistence port", () => {
           claimDurationMs: 1_000,
         }),
       ).toMatchObject({ eventSinkStatus: "degraded" });
+      expect(warn.mock.calls).toMatchInlineSnapshot(`
+        [
+          [
+            "outbox.flush claim expired before delivery",
+          ],
+        ]
+      `);
     } finally {
       warn.mockRestore();
     }

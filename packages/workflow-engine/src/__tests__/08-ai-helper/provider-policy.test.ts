@@ -12,6 +12,7 @@ import {
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AIAdapter } from "../../ai/types.js";
+import { setLogger } from "../../kernel/index.js";
 import type { AICallLogger } from "../../persistence/interface.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { kernelDatabase, realDatabase } from "../sqlite8-kernel-utils.js";
@@ -429,6 +430,38 @@ describe("helper provider policy", () => {
       /openai.*routing\.provider\.only/i,
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("gates audio source previews in application diagnostics", async () => {
+    const ai = makeHelper({ only: ["anthropic"] });
+    const debug = vi.fn();
+    const source = new URL("https://example.invalid/invoice/audio");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", undefined);
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", undefined);
+    setLogger({ debug, info: vi.fn(), warn: vi.fn(), error: vi.fn() });
+    try {
+      await expect(ai.transcribe("policy-transcribe", source)).rejects.toThrow(
+        /routing\.provider\.only/i,
+      );
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] transcribe request",
+        expect.objectContaining({ model: "policy-transcribe" }),
+      );
+      expect(JSON.stringify(debug.mock.calls)).not.toContain(source.href);
+
+      vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
+      await expect(ai.transcribe("policy-transcribe", source)).rejects.toThrow(
+        /routing\.provider\.only/i,
+      );
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] transcribe request",
+        expect.objectContaining({ audio: `[audio ${source.href}]` }),
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      setLogger(undefined);
+      vi.unstubAllEnvs();
+    }
   });
 
   it("allows a native transcription when its provider is listed", async () => {

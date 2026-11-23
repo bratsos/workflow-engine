@@ -24,7 +24,10 @@ import {
 import { schemaTargetForModel, withPortableSchema } from "./schema-portability";
 import type { AIHelperContext } from "./types";
 
-export const logger = createLogger("AIHelper");
+export const logger = createLogger(
+  "AIHelper",
+  ({ topic: _topic, ...fields }) => fields,
+);
 
 export interface OpenRouterRoutingOptions {
   /** Multiplier applied to the registry price for provider.max_price. Default 1.25. Pass 0 to omit max_price entirely. */

@@ -16,6 +16,7 @@ import type {
   PurgeableRunStatus,
   ServedDefinition,
 } from "../../persistence/interface.js";
+import { createLogger } from "../../utils/logger.js";
 import type {
   EnginePruneResult,
   EventSinkStatus,
@@ -25,6 +26,8 @@ import { jobTargetMissingReason } from "../errors.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
 import { toErrorMessage } from "./error-message.js";
+
+const logger = createLogger();
 
 // ============================================================================
 // Shared defaults
@@ -81,7 +84,7 @@ export function timerDurationMs(
 export const HOST_DEFAULTS = {
   /** Worker id used when a caller does not supply one. */
   workerId: "worker",
-  /** `console.error` prefix used when a caller does not supply one. */
+  /** Diagnostic prefix used when a caller does not supply one. */
   logPrefix: "[Host]",
   /** Stale lease threshold (ms) past which a job's lease is reclaimed. */
   staleLeaseThresholdMs: 300_000,
@@ -161,7 +164,7 @@ export interface ExecuteJobWithHeartbeatOptions {
    */
   jobHeartbeatIntervalMs?: number;
   /**
-   * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
+   * Prefix for this host's diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
    */
   logPrefix?: string;
@@ -251,16 +254,38 @@ export async function executeJobWithHeartbeat(
       .join("; ");
     const message = `Invalid job message: ${issues}`;
     const jobId = typeof job?.jobId === "string" ? job.jobId : undefined;
-    console.error(`${logPrefix} dead job ${jobId ?? "<no jobId>"}: ${message}`);
+    const fields = {
+      jobId,
+      workflowRunId:
+        typeof job?.workflowRunId === "string" ? job.workflowRunId : undefined,
+      stageId: typeof job?.stageId === "string" ? job.stageId : undefined,
+    };
+    logger.error(`${logPrefix} dead job: ${message}`, fields, () => [
+      `${logPrefix} dead job ${jobId ?? "<no jobId>"}: ${message}`,
+    ]);
     if (jobId) {
       try {
         await jobTransport.fail(jobId, message, false);
       } catch (failError) {
-        console.error(`${logPrefix} could not fail dead job:`, failError);
+        logger.caught(
+          `${logPrefix} could not fail dead job:`,
+          failError,
+          fields,
+        );
       }
     }
     return { outcome: "failed", error: message, dead: true };
   }
+
+  const { jobId, workflowRunId, stageId, workflowId, attempt } = job;
+  const jobFields = { jobId, workflowRunId, stageId, workflowId, attempt };
+  const warnSuperseded = () => {
+    const detail =
+      "acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded";
+    logger.warn(`${logPrefix} job ${detail}`, jobFields, () => [
+      `${logPrefix} job ${jobId} ${detail}`,
+    ]);
+  };
 
   const fence = job.startedAt
     ? { startedAt: job.startedAt, attempt: job.attempt }
@@ -320,14 +345,22 @@ export async function executeJobWithHeartbeat(
     // A branded error must name this job; any other value gets main's matcher.
     const message = jobTargetMissingReason(error, job);
     if (message === undefined) throw error;
-    console.error(
-      `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
+    logger.error(
+      `${logPrefix} dead job: missing target`,
+      { ...jobFields, error: message },
+      () => [
+        `${logPrefix} dead job ${jobId} (run ${workflowRunId}, stage ${stageId}): ${message}`,
+      ],
     );
     try {
       // Deliberately unfenced: an orphan queue row should acknowledge unconditionally.
       await jobTransport.fail(job.jobId, message, false);
     } catch (failError) {
-      console.error(`${logPrefix} could not fail dead job:`, failError);
+      logger.caught(
+        `${logPrefix} could not fail dead job:`,
+        failError,
+        jobFields,
+      );
     }
     return { outcome: "failed", error: message, dead: true };
   } finally {
@@ -337,9 +370,7 @@ export async function executeJobWithHeartbeat(
   if (result.outcome === "completed") {
     const outcome = await jobTransport.complete(job.jobId, fence);
     if (outcome === "superseded") {
-      console.warn(
-        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
-      );
+      warnSuperseded();
       return { outcome: "completed" };
     }
     await kernel.dispatch({
@@ -355,9 +386,7 @@ export async function executeJobWithHeartbeat(
       new Date(Date.now() + HOST_DEFAULTS.suspendFallbackMs);
     const outcome = await jobTransport.suspend(job.jobId, nextPollAt, fence);
     if (outcome === "superseded") {
-      console.warn(
-        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
-      );
+      warnSuperseded();
     }
     return { outcome: "suspended" };
   }
@@ -405,9 +434,7 @@ export async function executeJobWithHeartbeat(
       fence,
     );
     if (outcome === "superseded") {
-      console.warn(
-        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
-      );
+      warnSuperseded();
     }
     return {
       outcome: "failed",
@@ -433,9 +460,7 @@ export async function executeJobWithHeartbeat(
     fence,
   );
   if (outcome === "superseded") {
-    console.warn(
-      `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
-    );
+    warnSuperseded();
   }
   // Terminal failure: without this, the run lingers RUNNING until
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"
@@ -456,9 +481,10 @@ export async function executeJobWithHeartbeat(
         workflowRunId: job.workflowRunId,
       });
     } catch (error) {
-      console.error(
+      logger.caught(
         `${logPrefix} run.transition (terminal failure) error:`,
         error,
+        jobFields,
       );
     }
   }
@@ -587,7 +613,7 @@ export interface RunMaintenanceTickOptions {
   retention?: RetentionOptions;
   prune?: PruneOptions;
   /**
-   * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
+   * Prefix for this host's diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
    */
   logPrefix?: string;
@@ -665,7 +691,7 @@ export async function runTickHook(
     try {
       await hook({ ...counts });
     } catch (error) {
-      console.error(`${logPrefix} onTick hook error:`, error);
+      logger.caught(`${logPrefix} onTick hook error:`, error);
     }
   })();
   if (timeoutMs === undefined) return call;
@@ -676,7 +702,7 @@ export async function runTickHook(
   });
   try {
     if ((await Promise.race([call, bound])) === "timeout") {
-      console.warn(
+      logger.warn(
         `${logPrefix} onTick hook did not settle within ${timeoutMs} ms; not waiting for it (it keeps running)`,
       );
     }
@@ -736,7 +762,7 @@ export async function runMaintenanceTick(
     });
     claimed = claimResult.claimed.length;
   } catch (error) {
-    console.error(`${logPrefix} run.claimPending error:`, error);
+    logger.caught(`${logPrefix} run.claimPending error:`, error, { workerId });
   }
 
   // 2. Poll suspended stages → resume if ready
@@ -754,7 +780,9 @@ export async function runMaintenanceTick(
       });
     }
   } catch (error) {
-    console.error(`${logPrefix} stage.pollSuspended error:`, error);
+    logger.caught(`${logPrefix} stage.pollSuspended error:`, error, {
+      workerId,
+    });
   }
 
   // 3. Reap stale leases → release crashed worker locks
@@ -767,7 +795,7 @@ export async function runMaintenanceTick(
     staleReleased = reapResult.released;
     staleExpired = reapResult.expired;
   } catch (error) {
-    console.error(`${logPrefix} lease.reapStale error:`, error);
+    logger.caught(`${logPrefix} lease.reapStale error:`, error, { workerId });
   }
 
   // 4. Flush outbox → publish pending events through EventSink
@@ -781,7 +809,9 @@ export async function runMaintenanceTick(
     if (flushResult === undefined) {
       eventSinkStatus = "degraded";
       eventSinkError = `outbox.flush timed out after ${outboxFlushTimeoutMs}ms`;
-      console.error(`${logPrefix} ${eventSinkError}`);
+      logger.error(`${logPrefix} ${eventSinkError}`, { workerId }, () => [
+        `${logPrefix} ${eventSinkError}`,
+      ]);
     } else {
       eventsFlushed = flushResult.published;
       outboxDeferred = flushResult.deferred;
@@ -794,7 +824,7 @@ export async function runMaintenanceTick(
     // The flush itself failed (the outbox query, not an individual emit).
     // Nothing was delivered this tick either, so the sink is degraded from
     // an observer's point of view.
-    console.error(`${logPrefix} outbox.flush error:`, error);
+    logger.caught(`${logPrefix} outbox.flush error:`, error, { workerId });
     eventSinkStatus = "degraded";
     eventSinkError = toErrorMessage(error);
   }
@@ -809,7 +839,7 @@ export async function runMaintenanceTick(
     });
     stuckReaped = reapStuckResult.failed;
   } catch (error) {
-    console.error(`${logPrefix} run.reapStuck error:`, error);
+    logger.caught(`${logPrefix} run.reapStuck error:`, error, { workerId });
   }
 
   if (prune) {
@@ -836,7 +866,7 @@ export async function runMaintenanceTick(
         ...(prune.limit !== undefined && { limit: prune.limit }),
       });
     } catch (error) {
-      console.error(`${logPrefix} engine.prune error:`, error);
+      logger.caught(`${logPrefix} engine.prune error:`, error, { workerId });
     }
   }
 
@@ -853,7 +883,7 @@ export async function runMaintenanceTick(
       });
       purged = purgeResult.purged;
     } catch (error) {
-      console.error(`${logPrefix} run.purge error:`, error);
+      logger.caught(`${logPrefix} run.purge error:`, error, { workerId });
     }
   }
 
@@ -933,11 +963,11 @@ export interface EventSinkMonitor {
 }
 
 export interface CreateEventSinkMonitorOptions {
-  /** `console.error` prefix, e.g. "[NodeHost]". */
+  /** Diagnostic prefix, e.g. "[NodeHost]". */
   logPrefix?: string;
   /** Injectable clock for tests. Defaults to `Date.now`. */
   now?: () => number;
-  /** Sink for the transition lines. Defaults to `console.error`. */
+  /** Sink for the transition lines. Defaults to the engine logger. */
   log?: (message: string) => void;
 }
 
@@ -946,7 +976,10 @@ export function createEventSinkMonitor(
 ): EventSinkMonitor {
   const logPrefix = options.logPrefix ?? HOST_DEFAULTS.logPrefix;
   const now = options.now ?? (() => Date.now());
-  const log = options.log ?? ((message: string) => console.error(message));
+  const log = (message: string, fields?: Record<string, unknown>) => {
+    if (options.log) options.log(message);
+    else logger.error(message, fields, () => [message]);
+  };
 
   let status: EventSinkStatus = "healthy";
   let since: number | null = null;
@@ -963,6 +996,7 @@ export function createEventSinkMonitor(
         `${logPrefix} event sink DEGRADED: events are staying in the outbox and will be retried; runs keep progressing through the poller. Last error: ${
           lastError ?? "unknown"
         }`,
+        { error: lastError },
       );
     } else if (consecutiveFailures > 0 || lastError !== null) {
       log(`${logPrefix} event sink recovered: publishing again`);
@@ -986,6 +1020,7 @@ export function createEventSinkMonitor(
         // Always loud: a dead-lettered event no longer retries by itself.
         log(
           `${logPrefix} event sink DEAD-LETTERED ${flush.deadLettered} event(s) (${deadLettered} total in this process): they will not be delivered until replayed with the plugin.replayDLQ command`,
+          { deadLettered: flush.deadLettered, totalDeadLettered: deadLettered },
         );
       }
     },

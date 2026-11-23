@@ -147,6 +147,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
   );
 
   logger.debug(`evaluate request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
@@ -227,6 +228,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
     });
 
     logger.debug(`evaluate response`, {
+      topic: ctx.topic,
       model: modelKey,
       inputTokens,
       cost: cost.toFixed(6),
@@ -253,6 +255,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       metadata: { questionCount: questionIds.length },
     });
     logger.error(`evaluate error`, {
+      topic: ctx.topic,
       model: modelKey,
       error: errorMessage,
       durationMs,

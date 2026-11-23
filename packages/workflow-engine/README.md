@@ -62,7 +62,7 @@ session, under your row-level security policies.
 | **Parallel Execution** | Independent stages in one execution group run concurrently. Pipelines are linear -- there is no arbitrary DAG and no child workflows |
 | **Durable steps** | `ctx.step.*` results are keyed by name in a step ledger: exactly-once *recording*, at-least-once *execution*, with a derived `externalKey` so a reclaim adopts an external effect rather than repeating it |
 | **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |
-| **Environment-Agnostic** | Pure command kernel: no timers, no signals, no global state, no connection of its own. Node.js, serverless, edge, or inside your transaction |
+| **Environment-Agnostic** | Pure command kernel: no host timers or process signals, no connection of its own. Node.js, serverless, edge, or inside your transaction |
 
 What it does not do: no arbitrary DAG or child workflows (pipelines are linear execution groups); no exactly-once *execution* of a step body (exactly-once recording, at-least-once execution, with a derived `externalKey` so a repeat is recoverable); no per-tenant throttle, rate limit or debounce (the Postgres queue has priority and an opt-in per-group concurrency cap); TypeScript only. The [introduction](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/getting-started/intro.md) says where another project is the better choice.
 
@@ -627,7 +627,7 @@ export const inlineWorkflow = defineWorkflow("document-processor", { input: Inpu
 
 ### 4. Create the Kernel
 
-The kernel is the core command dispatcher. It's environment-agnostic -- no timers, no signals, no global state.
+The kernel is the core command dispatcher. It's environment-agnostic -- no host timers or process signals.
 
 ```typescript
 import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";

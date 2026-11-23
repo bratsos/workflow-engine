@@ -12,7 +12,7 @@ import {
  */
 
 import type { Persistence } from "../../kernel/ports";
-import { createLogger } from "../../utils/logger";
+import { createLogger, isTraceTextEnabled } from "../../utils/logger";
 import {
   ACTIVE_STATUSES,
   type DequeueOptions,
@@ -317,9 +317,10 @@ export class PrismaJobQueue implements JobQueue {
     });
 
     if (result.count > 0) {
-      logger.debug(
-        `Deleted ${result.count} job row(s) for run ${workflowRunId} stages [${stageIds.join(", ")}]`,
-      );
+      const message = `Deleted ${result.count} job row(s)`;
+      logger.debug(message, { workflowRunId, stageIds }, () => [
+        `${message} for run ${workflowRunId} stages [${stageIds.join(", ")}]`,
+      ]);
     }
     return result.count;
   }
@@ -570,8 +571,18 @@ export class PrismaJobQueue implements JobQueue {
       // and take the next row, instead of throwing out of the dequeue and
       // aborting the whole tick on that one row.
       if (typeof job.payload !== "object" || job.payload === null) {
-        const error = `Job ${job.id} has no payload (got ${job.payload === null ? "null" : typeof job.payload}); failed as a dead job`;
-        logger.error(error);
+        const payloadType = job.payload === null ? "null" : typeof job.payload;
+        const error = `Job ${job.id} has no payload (got ${payloadType}); failed as a dead job`;
+        logger.error(
+          "Job has no payload; failed as a dead job",
+          {
+            jobId: job.id,
+            workflowRunId: job.workflowRunId,
+            stageId: job.stageId,
+            payloadType,
+          },
+          () => [error],
+        );
         await this.prisma.jobQueue.update({
           where: { id: job.id },
           data: {
@@ -586,7 +597,17 @@ export class PrismaJobQueue implements JobQueue {
       }
 
       logger.debug(
-        `Dequeued job ${job.id} (stage: ${job.stageId}, attempt: ${job.attempt})`,
+        "Dequeued job",
+        {
+          jobId: job.id,
+          workflowRunId: job.workflowRunId,
+          stageId: job.stageId,
+          attempt: job.attempt,
+          workerId: this.workerId,
+        },
+        () => [
+          `Dequeued job ${job.id} (stage: ${job.stageId}, attempt: ${job.attempt})`,
+        ],
       );
 
       const payload = job.payload as Record<string, unknown>;
@@ -603,7 +624,7 @@ export class PrismaJobQueue implements JobQueue {
         startedAt: job.startedAt,
       };
     } catch (error) {
-      logger.error("Error dequeuing job:", error);
+      logger.caught("Error dequeuing job:", error, { workerId: this.workerId });
       // Rethrow rather than swallowing: a dead database must surface as
       // an error, not look like an indefinitely empty queue. Hosts
       // already treat dequeue failure as a non-fatal, back-off-and-retry
@@ -694,7 +715,17 @@ export class PrismaJobQueue implements JobQueue {
       }
 
       logger.debug(
-        `Dequeued job ${claimedJob.id} (stage: ${claimedJob.stageId}, attempt: ${claimedJob.attempt})`,
+        "Dequeued job",
+        {
+          jobId: claimedJob.id,
+          workflowRunId: claimedJob.workflowRunId,
+          stageId: claimedJob.stageId,
+          attempt: claimedJob.attempt,
+          workerId: this.workerId,
+        },
+        () => [
+          `Dequeued job ${claimedJob.id} (stage: ${claimedJob.stageId}, attempt: ${claimedJob.attempt})`,
+        ],
       );
 
       const claimedPayload = claimedJob.payload as Record<string, unknown>;
@@ -716,7 +747,7 @@ export class PrismaJobQueue implements JobQueue {
         startedAt: now,
       };
     } catch (error) {
-      logger.error("Error dequeuing job:", error);
+      logger.caught("Error dequeuing job:", error, { workerId: this.workerId });
       throw error;
     }
   }
@@ -740,9 +771,10 @@ export class PrismaJobQueue implements JobQueue {
 
   private ackOutcome(jobId: string, count: number, op: string): JobAckOutcome {
     if (count === 0) {
-      logger.warn(
-        `Job ${jobId}: ${op} acknowledgement superseded — the job is no longer the RUNNING attempt this worker claimed`,
-      );
+      const detail = `${op} acknowledgement superseded — the job is no longer the RUNNING attempt this worker claimed`;
+      logger.warn(detail, { jobId, workerId: this.workerId }, () => [
+        `Job ${jobId}: ${detail}`,
+      ]);
       return "superseded";
     }
     return "acknowledged";
@@ -769,7 +801,7 @@ export class PrismaJobQueue implements JobQueue {
         completedAt: new Date(),
       },
     });
-    logger.debug(`Job ${jobId} completed`);
+    logger.debug("Job completed", { jobId }, () => [`Job ${jobId} completed`]);
     return "acknowledged";
   }
 
@@ -802,7 +834,9 @@ export class PrismaJobQueue implements JobQueue {
         lockedAt: null,
       },
     });
-    logger.debug(`Job ${jobId} suspended until ${nextPollAt.toISOString()}`);
+    logger.debug("Job suspended", { jobId, nextPollAt }, () => [
+      `Job ${jobId} suspended until ${nextPollAt.toISOString()}`,
+    ]);
     return "acknowledged";
   }
 
@@ -834,9 +868,9 @@ export class PrismaJobQueue implements JobQueue {
       return this.ackOutcome(jobId, result.count, "defer");
     }
     await this.prisma.jobQueue.update({ where: { id: jobId }, data });
-    logger.debug(
+    logger.debug("Job deferred", { jobId, nextPollAt, reason }, () => [
       `Job ${jobId} deferred until ${nextPollAt.toISOString()}: ${reason}`,
-    );
+    ]);
     return "acknowledged";
   }
 
@@ -883,7 +917,9 @@ export class PrismaJobQueue implements JobQueue {
           nextPollAt: nextPollAt,
         },
       });
-      logger.debug(`Job ${jobId} failed, will retry in ${backoffMs}ms`);
+      logger.debug("Job failed, will retry", { jobId, backoffMs }, () => [
+        `Job ${jobId} failed, will retry in ${backoffMs}ms`,
+      ]);
       return "acknowledged";
     } else {
       if (fence) {
@@ -906,7 +942,11 @@ export class PrismaJobQueue implements JobQueue {
           lastError: error,
         },
       });
-      logger.debug(`Job ${jobId} failed permanently: ${error}`);
+      logger.debug(
+        "Job failed permanently",
+        { jobId, ...(isTraceTextEnabled() && { error }) },
+        () => [`Job ${jobId} failed permanently: ${error}`],
+      );
       return "acknowledged";
     }
   }

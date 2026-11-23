@@ -22,6 +22,7 @@
  * ```
  */
 
+export { type Logger, setLogger } from "../utils/logger";
 // Export interfaces and types
 export type {
   AICallLogger,

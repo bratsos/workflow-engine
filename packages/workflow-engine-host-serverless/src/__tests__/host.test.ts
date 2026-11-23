@@ -516,6 +516,11 @@ describe("ServerlessHost", () => {
       dead: true,
       error: expect.stringContaining("workflowId"),
     });
+    await expect(host.handleJob(null!)).resolves.toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("Invalid job message"),
+    });
   });
 
   it("finalises the job row when a suspended stage fails for good from the poll path", async () => {

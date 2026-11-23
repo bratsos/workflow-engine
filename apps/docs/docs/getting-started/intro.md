@@ -27,7 +27,7 @@ Where something is a design that other projects also ship, this page says so.
 ### The kernel can run inside your transaction, under row-level security
 
 The kernel is a pure command dispatcher: no timers, no signals, no global
-state, no connection of its own. You give it a persistence port. If you build
+state apart from the process-wide logger (`setLogger`), no connection of its own. You give it a persistence port. If you build
 that port over a Prisma *transaction* client with
 `skipInteractiveTransactions`, the whole tick — claiming a run, executing a
 stage, writing the outbox — happens inside the transaction you opened, on the

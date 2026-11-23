@@ -12,6 +12,7 @@
 import {
   assertTimerMs,
   createEventSinkMonitor,
+  createLogger,
   type EventSinkHealth,
   type EventSinkMonitor,
   executeJobWithHeartbeat,
@@ -29,6 +30,8 @@ import {
   toErrorMessage,
   toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
+
+const logger = createLogger("NodeHost");
 
 // ============================================================================
 // Public interfaces
@@ -367,9 +370,14 @@ class NodeHostImpl implements NodeHost {
       transportWorkerId !== undefined &&
       transportWorkerId !== this.workerId
     ) {
-      console.error(
-        `[NodeHost] workerId mismatch: this host is "${this.workerId}" but its job transport stamps "${transportWorkerId}" on the jobs it claims. ` +
-          "Drop the workerId option from the transport (e.g. createPrismaJobQueue(prisma)) to let the host supply it.",
+      const hint =
+        "Drop the workerId option from the transport (e.g. createPrismaJobQueue(prisma)) to let the host supply it.";
+      logger.error(
+        `workerId mismatch between host and job transport. ${hint}`,
+        { workerId: this.workerId, transportWorkerId },
+        () => [
+          `workerId mismatch: this host is "${this.workerId}" but its job transport stamps "${transportWorkerId}" on the jobs it claims. ${hint}`,
+        ],
       );
     }
 
@@ -451,7 +459,8 @@ class NodeHostImpl implements NodeHost {
     const flush = Promise.resolve()
       .then(() => this.kernel.flush?.({ timeoutMs: this.shutdownTimeoutMs }))
       .catch(() => {
-        console.warn("[NodeHost] Call accounting drain failed");
+        const message = "Call accounting drain failed";
+        logger.warn(message, { workerId: this.workerId }, () => [message]);
       });
     await withTimeout(flush, this.shutdownTimeoutMs);
   }
@@ -464,8 +473,8 @@ class NodeHostImpl implements NodeHost {
       for (;;) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) {
-          console.error(
-            "[NodeHost] outbox.flush on stop(): timed out before the outbox was empty",
+          logger.error(
+            "outbox.flush on stop(): timed out before the outbox was empty",
           );
           return;
         }
@@ -475,8 +484,8 @@ class NodeHostImpl implements NodeHost {
           remaining,
         );
         if (flushed === undefined) {
-          console.error(
-            "[NodeHost] outbox.flush on stop(): timed out before the outbox was empty",
+          logger.error(
+            "outbox.flush on stop(): timed out before the outbox was empty",
           );
           return;
         }
@@ -484,7 +493,9 @@ class NodeHostImpl implements NodeHost {
         if (flushed.published < this.maxOutboxFlushPerTick) return;
       }
     } catch (error) {
-      console.error("[NodeHost] outbox.flush on stop() error:", error);
+      logger.caught("outbox.flush on stop() error:", error, {
+        workerId: this.workerId,
+      });
       this.eventSinkMonitor.observeError(error);
     }
   }
@@ -523,7 +534,9 @@ class NodeHostImpl implements NodeHost {
     if (this.tickInFlight || !this.isCurrent(lifecycle)) return;
     this.tickInFlight = this.orchestrationTick(lifecycle)
       .catch((error) => {
-        console.error("[NodeHost] orchestration tick error:", error);
+        logger.caught("orchestration tick error:", error, {
+          workerId: this.workerId,
+        });
       })
       .finally(() => {
         this.tickInFlight = null;
@@ -603,8 +616,8 @@ class NodeHostImpl implements NodeHost {
       this.hookSkippedDuringCall = true;
       if (!this.hookSkipLogged) {
         this.hookSkipLogged = true;
-        console.warn(
-          `[NodeHost] onTick hook is still running after ${Date.now() - this.hookStartedAt} ms and ticks skip it while it runs; this is logged once until a call finishes without being skipped`,
+        logger.warn(
+          `onTick hook is still running after ${Date.now() - this.hookStartedAt} ms and ticks skip it while it runs; this is logged once until a call finishes without being skipped`,
         );
       }
       return;
@@ -692,7 +705,9 @@ class NodeHostImpl implements NodeHost {
         }
       } catch (error) {
         // Job processing errors are non-fatal — back off and retry
-        console.error("[NodeHost] Job processing error:", error);
+        logger.caught("Job processing error:", error, {
+          workerId: this.workerId,
+        });
         lastRunId = null;
         drainingBacklog = false;
         await this.sleep(5_000);
@@ -714,6 +729,8 @@ class NodeHostImpl implements NodeHost {
     job: NonNullable<Awaited<ReturnType<JobTransport["dequeue"]>>>,
   ): Promise<void> {
     if (!this.jobTransport.defer) return;
+    const { jobId, workflowRunId, stageId } = job;
+    const fields = { workerId: this.workerId, jobId, workflowRunId, stageId };
     const fence = job.startedAt
       ? { startedAt: job.startedAt, attempt: job.attempt }
       : undefined;
@@ -730,12 +747,11 @@ class NodeHostImpl implements NodeHost {
         .then(() => true);
       if (!(await withTimeout(returned, this.shutdownTimeoutMs))) {
         returned.catch(() => {});
-        console.error(
-          `[NodeHost] Returning an unstarted job took longer than shutdownTimeoutMs (${this.shutdownTimeoutMs} ms); the job is recovered when its lease expires if the return did not commit.`,
-        );
+        const message = `Returning an unstarted job took longer than shutdownTimeoutMs (${this.shutdownTimeoutMs} ms); the job is recovered when its lease expires if the return did not commit.`;
+        logger.error(message, fields, () => [message]);
       }
     } catch (error) {
-      console.error("[NodeHost] Could not return an unstarted job:", error);
+      logger.caught("Could not return an unstarted job:", error, fields);
     }
   }
 

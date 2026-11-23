@@ -176,15 +176,19 @@ export class PrismaAICallLogger implements AICallLogger {
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
 
-  #trackWrite(write: () => Promise<void>): Promise<void> {
+  #trackWrite(
+    write: () => Promise<void>,
+    fields: Record<string, unknown>,
+  ): Promise<void> {
     const done = this.writes.begin();
     const result = Promise.resolve().then(write);
     void result.then(done, (error: unknown) => {
       this.writes.fail();
       done();
-      logger.warn(
-        "Failed to persist AI call",
-        ...(isTraceTextEnabled() ? [error] : []),
+      const message = "Failed to persist AI call";
+      const includeError = isTraceTextEnabled();
+      logger.warn(message, includeError ? { ...fields, error } : fields, () =>
+        includeError ? [message, error] : [message],
       );
     });
     return result;
@@ -195,29 +199,38 @@ export class PrismaAICallLogger implements AICallLogger {
    * callers, so callers coordinating run erasure can wait for it.
    */
   logCall(call: CreateAICallInput): Promise<void> {
-    return this.#trackWrite(async () => {
-      await sqliteCheckFor(this);
-      await this.prisma.aICall.create({
-        data: {
-          topic: call.topic,
-          callType: call.callType,
-          modelKey: call.modelKey,
-          modelId: call.modelId,
-          prompt: call.prompt,
-          response: call.response,
-          inputTokens: call.inputTokens,
-          outputTokens: call.outputTokens,
-          cost: call.cost,
-          ...costColumns(call),
-          ...attributionColumns(call),
-          metadata: call.metadata,
-          ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
-          ...(call.requestId !== undefined
-            ? { requestId: call.requestId }
-            : {}),
-        },
-      });
-    });
+    return this.#trackWrite(
+      async () => {
+        await sqliteCheckFor(this);
+        await this.prisma.aICall.create({
+          data: {
+            topic: call.topic,
+            callType: call.callType,
+            modelKey: call.modelKey,
+            modelId: call.modelId,
+            prompt: call.prompt,
+            response: call.response,
+            inputTokens: call.inputTokens,
+            outputTokens: call.outputTokens,
+            cost: call.cost,
+            ...costColumns(call),
+            ...attributionColumns(call),
+            metadata: call.metadata,
+            ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
+            ...(call.requestId !== undefined
+              ? { requestId: call.requestId }
+              : {}),
+          },
+        });
+      },
+      {
+        workflowRunId: call.workflowRunId,
+        topic: call.topic,
+        batchId: call.batchId,
+        requestId: call.requestId,
+        model: call.modelKey,
+      },
+    );
   }
 
   flush(options?: AICallFlushOptions) {
@@ -231,10 +244,13 @@ export class PrismaAICallLogger implements AICallLogger {
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
-    return this.#trackWrite(async () => {
-      await sqliteCheckFor(this);
-      await this.#insertBatchResults(batchId, results);
-    });
+    return this.#trackWrite(
+      async () => {
+        await sqliteCheckFor(this);
+        await this.#insertBatchResults(batchId, results);
+      },
+      { batchId },
+    );
   }
 
   async #insertBatchResults(
@@ -248,7 +264,11 @@ export class PrismaAICallLogger implements AICallLogger {
       if (requestId === undefined) {
         logger.warn(
           "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
-          { batchId },
+          { batchId, topic: call.topic, workflowRunId: call.workflowRunId },
+          () => [
+            "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
+            { batchId },
+          ],
         );
       }
 

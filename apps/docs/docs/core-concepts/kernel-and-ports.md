@@ -310,6 +310,27 @@ run their own loop can use `createEventSinkMonitor()` from
 
 ---
 
+## Process diagnostics
+
+Call `setLogger` during startup to send engine diagnostics to your application's logger. The kernel, Node, serverless and remote hosts, standalone AI helpers, and Prisma adapters share the configured sink, including adapter diagnostics from the operational console. Each worker process or JavaScript worker installs its own sink.
+
+```typescript
+import { setLogger } from "@bratsos/workflow-engine/kernel";
+
+setLogger({
+  debug: (message, fields) => appLogger.debug(fields ?? {}, message),
+  info: (message, fields) => appLogger.info(fields ?? {}, message),
+  warn: (message, fields) => appLogger.warn(fields ?? {}, message),
+  error: (message, fields) => appLogger.error(fields ?? {}, message),
+});
+```
+
+Each method receives a message and an optional `Record<string, unknown>`. Entries include identifiers such as `workflowRunId`, `stageId` and `jobId` when available. The application sink receives all emitted levels and controls filtering. If a method throws or rejects, the engine tries the console sink once for that entry and continues.
+
+The default console sink emits warnings and errors and enables debug and info with `WORKFLOW_ENGINE_TRACE=1` (or `true`). Call `setLogger(undefined)` to restore it. Set `WORKFLOW_ENGINE_TRACE_TEXT=1` (or `true`) to include AI prompt and response previews in either sink. Error details use their usual log levels and retain the original error values or messages. Provider error messages can echo input text. Persisted workflow logs and AI call records have their own storage configuration.
+
+---
+
 ## Idempotency Engine
 
 To support safe retries in distributed networks, commands like `run.create`, `job.execute`, `run.redrive` and `run.rerunFrom` accept an optional `idempotencyKey`.

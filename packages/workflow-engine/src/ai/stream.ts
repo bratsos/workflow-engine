@@ -126,6 +126,7 @@ export function streamText(
 
   // Trace log before stream starts
   logger.debug(`streamText request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     prompt:
@@ -208,6 +209,7 @@ export function streamText(
     }
 
     logger.debug(`streamText response`, {
+      topic: ctx.topic,
       model: modelKey,
       response:
         responseText.substring(0, 500) +

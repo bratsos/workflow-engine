@@ -182,6 +182,7 @@ export async function transcribe(
   );
 
   logger.debug(`transcribe request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
@@ -256,6 +257,7 @@ export async function transcribe(
     });
 
     logger.debug(`transcribe response`, {
+      topic: ctx.topic,
       model: modelKey,
       durationInSeconds,
       characters: result.text.length,
@@ -287,6 +289,7 @@ export async function transcribe(
       error,
     });
     logger.error(`transcribe error`, {
+      topic: ctx.topic,
       model: modelKey,
       error: errorMessage,
       durationMs,

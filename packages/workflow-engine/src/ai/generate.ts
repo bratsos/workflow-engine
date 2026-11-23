@@ -410,6 +410,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
   // Trace log before AI call
   logger.debug(`generateText request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     prompt:
@@ -543,6 +544,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
     // Trace log after successful AI call
     logger.debug(`generateText response`, {
+      topic: ctx.topic,
       model: modelKey,
       response: text.substring(0, 500) + (text.length > 500 ? "..." : ""),
       inputTokens,
@@ -582,6 +584,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       },
     });
     logger.error(`generateText error`, {
+      topic: ctx.topic,
       model: modelKey,
       error: errorMessage,
       durationMs,
@@ -662,6 +665,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
   // Trace log before AI call
   logger.debug(`generateObject request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     prompt:
@@ -778,6 +782,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     // Trace log after successful AI call
     const responseStr = JSON.stringify(object);
     logger.debug(`generateObject response`, {
+      topic: ctx.topic,
       model: modelKey,
       response:
         responseStr.substring(0, 500) + (responseStr.length > 500 ? "..." : ""),
@@ -816,6 +821,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       },
     });
     logger.error(`generateObject error`, {
+      topic: ctx.topic,
       model: modelKey,
       error: errorMessage,
       durationMs,

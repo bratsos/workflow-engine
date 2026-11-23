@@ -2,8 +2,15 @@
  * Kernel API - Public Entry Point
  *
  * Pure command kernel for workflow orchestration.
- * Environment-agnostic: no timers, no process signals, no global singletons.
+ * Environment-agnostic: no timers, and no process signals.
  */
+
+export {
+  createLogger,
+  type Logger,
+  type LogLevel,
+  setLogger,
+} from "../utils/logger.js";
 
 // Command types
 export type {
