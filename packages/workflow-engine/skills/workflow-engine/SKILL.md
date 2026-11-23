@@ -325,6 +325,7 @@ const host = createNodeHost({
 await host.start();   // Starts polling loops + signal handlers
 await host.stop();    // Graceful shutdown (waits for the in-flight job, then a final outbox.flush)
 host.getStats();      // { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs, eventSink }
+host.wake();          // Look for work now (idle wait + tick); wire it to a Postgres LISTEN on "workflow_engine_runs" (references/03-runtime-setup.md)
 ```
 
 ### Serverless Host

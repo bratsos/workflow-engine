@@ -63,6 +63,7 @@ Creates a new Node host instance.
 |--------|---------|-------------|
 | `start()` | `Promise<void>` | Start polling loops and register SIGTERM/SIGINT handlers |
 | `stop()` | `Promise<void>` | Graceful shutdown -- clears timers and signal handlers, waits (bounded) for the in-flight job, then attempts a final `outbox.flush` before exit |
+| `wake()` | `void` | Look for work now: end the job loop's idle wait and run an orchestration tick at once. Calls coalesce; no-op before `start()` and after `stop()` (see [Waking the host](#waking-the-host)) |
 | `getStats()` | `HostStats` | Runtime statistics |
 
 ### `HostStats`
@@ -121,6 +122,46 @@ The loop now pauses for a uniform draw over `[0, postJobYieldMs)` after a **comp
 The pause is skipped while the loop is draining a backlog: once `dequeue()` hands it a job from a run other than the one it just completed, it stops pausing until the queue comes back empty, so a queue with real work in it costs at most one pause rather than one per job.
 
 On failure, the job loop marks the job failed with a retry flag while the job has attempts left (`maxAttempts` on the transport); the kernel has already left the stage `PENDING` with the error, and the queue re-delivers it with backoff. Once the attempts are exhausted the stage is `FAILED` and `run.transition` is dispatched immediately.
+
+## Waking the host
+
+A run created between two ticks waits for the next orchestration tick (up to `orchestrationIntervalMs`) and then for the job loop's idle wait (up to `jobPollIntervalMs`). `host.wake()` removes both waits for a host that learns of new runs some other way. It returns at once, ends the job loop's idle wait and runs a tick now; when that tick ends the job loop looks for work again, so a run the tick claimed has its first stage dequeued without waiting.
+
+- Calls coalesce. A call that arrives while a tick or a job pass is running is remembered, and exactly one more pass of that kind follows, however many calls came. Two passes of a kind never run at once.
+- It does nothing before `start()` and after `stop()`.
+- The timers remain the fallback. A job loop that is pausing after a completed job (`postJobYieldMs`) or backing off after an error finishes that pause first.
+- The tick is the whole tick and claims at most `maxClaimsPerTick` runs; a larger burst continues on the next wake or timer tick.
+
+The engine adds no dependency and opens no `LISTEN` connection (Prisma cannot hold one). On PostgreSQL, `run.create` issues `pg_notify('workflow_engine_runs', <run id>)` when it creates a run; PostgreSQL delivers it when the creating transaction commits and drops it on rollback. Listen on that channel from your own connection and call `host.wake()`. A listener needs a session-level connection (a transaction-mode pooler such as PgBouncer does not deliver notifications). Notifications reach only connected listeners, so wake once after every (re)subscribe; the tick covers the rest. A process that both creates and hosts runs can call `host.wake()` after the creating transaction commits instead (this also works on SQLite).
+
+With `pg` (node-postgres):
+
+```typescript
+import pg from "pg";
+
+const listener = new pg.Client({ connectionString: process.env.DATABASE_URL });
+listener.on("notification", () => host.wake());
+await listener.connect();
+await listener.query("LISTEN workflow_engine_runs");
+host.wake(); // runs created before the listener was up
+```
+
+A production listener also reconnects when the connection drops; the [Node host page](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/hosts/node.md#starting-runs-promptly-with-wake) has a reconnecting version.
+
+With Bun 1.4's built-in client (`sql.listen` is supported; checked on Bun 1.4.2). Bun keeps one dedicated connection, reconnects with backoff, and runs the third callback after the first subscribe and after every reconnect:
+
+```typescript
+import { SQL } from "bun";
+
+const sql = new SQL(process.env.DATABASE_URL!);
+const subscription = await sql.listen(
+  "workflow_engine_runs",
+  () => host.wake(),
+  () => host.wake(),
+);
+```
+
+The serverless host has no `wake()`: it has no loop and no idle wait to interrupt, so call `runMaintenanceTick()` and `processAvailableJobs()` from whatever learns of the run.
 
 ## Worker Process Pattern
 

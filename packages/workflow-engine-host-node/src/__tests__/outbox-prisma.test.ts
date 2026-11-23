@@ -9,6 +9,7 @@ import {
   InMemoryBlobStore,
 } from "@bratsos/workflow-engine/kernel/testing";
 import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -437,5 +438,135 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await other.stop();
       }
     }, 30_000);
+
+    describe("wake()", () => {
+      const sleep = (ms: number) =>
+        new Promise((resolve) => setTimeout(resolve, ms));
+      const waitUntil = async (check: () => Promise<boolean> | boolean) => {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          if (await check()) return;
+          await sleep(10);
+        }
+        throw new Error("timed out waiting for the host");
+      };
+      const schema = z.object({ value: z.string() });
+      const workflow = new WorkflowBuilder(
+        "node-wake",
+        "node-wake",
+        "node-wake",
+        schema,
+        schema,
+      )
+        .pipe(
+          defineStage({
+            id: "stage",
+            name: "stage",
+            schemas: { input: schema, output: schema, config: z.object({}) },
+            async execute(ctx) {
+              return { output: ctx.input };
+            },
+          }),
+        )
+        .build();
+
+      // A host on the real persistence and job queue, idle for 60 s at a time.
+      const idleHost = async () => {
+        const persistence = store(client);
+        const queue = createPrismaJobQueue(client, {
+          databaseType: sqlite ? "sqlite" : "postgresql",
+        });
+        let dequeues = 0;
+        const dequeue = queue.dequeue.bind(queue);
+        queue.dequeue = async (...args) => {
+          dequeues++;
+          return dequeue(...args);
+        };
+        const kernel = createKernel({
+          persistence,
+          jobTransport: queue,
+          blobStore: new InMemoryBlobStore(),
+          clock: { now: () => new Date() },
+          registry: { getWorkflow: () => workflow },
+          eventSink: { async emit() {} },
+        });
+        const host = createNodeHost({
+          kernel,
+          jobTransport: queue,
+          workerId: "node-wake",
+          orchestrationIntervalMs: 60_000,
+          jobPollIntervalMs: 60_000,
+          postJobYieldMs: 0,
+          flushOutboxOnStop: false,
+        });
+        await host.start();
+        await waitUntil(
+          () => host.getStats().orchestrationTicks === 1 && dequeues >= 1,
+        );
+        await sleep(200);
+        const create = (key: string) =>
+          kernel.dispatch({
+            type: "run.create",
+            workflowId: workflow.id,
+            idempotencyKey: key,
+            input: { value: "x" },
+          });
+        const status = async (runId: string) =>
+          (await persistence.getRun(runId))?.status;
+        return { host, create, status };
+      };
+      const clean = async () => {
+        await client.jobQueue.deleteMany();
+        await client.workflowRun.deleteMany();
+        await client.idempotencyKey.deleteMany();
+        await client.outboxEvent.deleteMany();
+      };
+
+      it("starts a run created while the host is idle, well before either interval", async () => {
+        const { host, create, status } = await idleHost();
+        try {
+          const { workflowRunId } = await create("node-wake-1");
+          await sleep(200);
+          expect(await status(workflowRunId)).toBe("PENDING");
+          const at = Date.now();
+          host.wake();
+          await waitUntil(
+            async () => (await status(workflowRunId)) === "COMPLETED",
+          );
+          expect(Date.now() - at).toBeLessThan(3_000);
+        } finally {
+          await host.stop();
+          await clean();
+        }
+      });
+
+      it.skipIf(sqlite)(
+        "starts a run when a LISTEN handler hears a NOTIFY sent from another connection",
+        async () => {
+          const { host, create, status } = await idleHost();
+          const listener = new pg.Client({ connectionString: databaseUrl });
+          const notifier = new pg.Client({ connectionString: databaseUrl });
+          try {
+            listener.on("notification", () => host.wake());
+            await listener.connect();
+            await notifier.connect();
+            await listener.query("LISTEN workflow_engine_runs");
+            const { workflowRunId } = await create("node-wake-notify");
+            await notifier.query(
+              "SELECT pg_notify('workflow_engine_runs', $1)",
+              [workflowRunId],
+            );
+            await waitUntil(
+              async () => (await status(workflowRunId)) === "COMPLETED",
+            );
+          } finally {
+            await listener.end();
+            await notifier.end();
+            await host.stop();
+            await clean();
+          }
+        },
+      );
+    });
   },
 );

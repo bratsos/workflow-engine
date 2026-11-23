@@ -181,6 +181,21 @@ export interface HostStats {
 export interface NodeHost {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /**
+   * Ask the host to look for work now instead of at its next timer: it ends
+   * the job loop's idle wait (`jobPollIntervalMs`) and runs an orchestration
+   * tick at once, whose claimed runs the job loop then picks up. Wire it to
+   * whatever learns of new work (a Postgres `LISTEN`, a webhook); the timers
+   * remain the fallback when no wake arrives.
+   *
+   * Calls coalesce. A wake that arrives while a tick or a job pass is running
+   * is remembered and exactly one more pass follows it, so a burst of wakes
+   * is one extra pass and two passes of a kind never overlap. A job loop that
+   * is pausing after a completed job (`postJobYieldMs`) or backing off after
+   * an error finishes that pause first. Does nothing before `start()` and
+   * after `stop()`.
+   */
+  wake(): void;
   getStats(): HostStats;
 }
 
@@ -198,6 +213,12 @@ class NodeHostImpl implements NodeHost {
   private jobLoop: Promise<void> | null = null;
   /** The orchestration tick currently running, if any. */
   private tickInFlight: Promise<void> | null = null;
+  /** A `wake()` came while a tick ran: one more tick follows it. */
+  private tickWakePending = false;
+  /** A `wake()` came since the job loop's current pass began: its next idle wait is skipped. */
+  private jobWakePending = false;
+  /** Ends the job loop's idle wait early; set only while the loop is waiting. */
+  private endIdleWait: (() => void) | null = null;
   /** `start()` while it is still verifying the storage, so a second call joins it. */
   private starting: Promise<void> | null = null;
   /** Incremented by every stop(), so a start whose storage check settles after it does not begin. */
@@ -328,6 +349,8 @@ class NodeHostImpl implements NodeHost {
   private begin(lifecycle: number): void {
     this.running = true;
     this.startTime = Date.now();
+    this.tickWakePending = false;
+    this.jobWakePending = false;
 
     // Hand this host's id to the job transport, so `job_queue.workerId`
     // names the same worker `run.claimPending` does. A transport built
@@ -386,6 +409,8 @@ class NodeHostImpl implements NodeHost {
     if (!this.running) return;
 
     this.running = false;
+    // A job loop parked in its idle wait leaves now, not after jobPollIntervalMs.
+    this.endIdleWait?.();
 
     if (this.orchestrationTimer) {
       clearInterval(this.orchestrationTimer);
@@ -453,6 +478,13 @@ class NodeHostImpl implements NodeHost {
     }
   }
 
+  wake(): void {
+    if (!this.running) return;
+    this.wakeJobLoop();
+    if (this.tickInFlight) this.tickWakePending = true;
+    else this.startOrchestrationTick(this.lifecycle, true);
+  }
+
   getStats(): HostStats {
     return {
       workerId: this.workerId,
@@ -472,9 +504,11 @@ class NodeHostImpl implements NodeHost {
    * Runs a tick unless one is still in flight, in which case this firing
    * is skipped (not queued): a replay that outlasts the interval must not
    * overlap the next tick in the same process. `orchestrationTicks` counts
-   * only ticks that ran.
+   * only ticks that ran. A tick that `wake()` asked for wakes the job loop
+   * when it ends, because its claim may have enqueued the jobs to run; a
+   * `wake()` that arrived while it ran starts one more tick.
    */
-  private startOrchestrationTick(lifecycle: number): void {
+  private startOrchestrationTick(lifecycle: number, woken = false): void {
     if (this.tickInFlight || !this.isCurrent(lifecycle)) return;
     this.tickInFlight = this.orchestrationTick(lifecycle)
       .catch((error) => {
@@ -482,6 +516,12 @@ class NodeHostImpl implements NodeHost {
       })
       .finally(() => {
         this.tickInFlight = null;
+        if (!this.isCurrent(lifecycle)) return;
+        if (woken) this.wakeJobLoop();
+        if (this.tickWakePending) {
+          this.tickWakePending = false;
+          this.startOrchestrationTick(lifecycle, true);
+        }
       });
   }
 
@@ -588,6 +628,8 @@ class NodeHostImpl implements NodeHost {
     let drainingBacklog = false;
 
     while (this.isCurrent(lifecycle)) {
+      // A wake from here on is for a pass that has not looked yet.
+      this.jobWakePending = false;
       try {
         const serves = this.dequeueServes();
         const job = await this.jobTransport.dequeue(
@@ -603,7 +645,7 @@ class NodeHostImpl implements NodeHost {
         if (!job) {
           lastRunId = null;
           drainingBacklog = false;
-          await this.sleep(this.jobPollIntervalMs);
+          await this.idleWait(this.jobPollIntervalMs);
           continue;
         }
 
@@ -687,6 +729,28 @@ class NodeHostImpl implements NodeHost {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private wakeJobLoop(): void {
+    this.jobWakePending = true;
+    this.endIdleWait?.();
+  }
+
+  /**
+   * The job loop's wait on an empty queue: `ms`, unless a wake came while the
+   * loop was busy or comes during the wait, or `stop()` is called.
+   */
+  private idleWait(ms: number): Promise<void> {
+    if (this.jobWakePending) return Promise.resolve();
+    return new Promise((resolve) => {
+      const end = () => {
+        clearTimeout(timer);
+        if (this.endIdleWait === end) this.endIdleWait = null;
+        resolve();
+      };
+      const timer = setTimeout(end, ms);
+      this.endIdleWait = end;
+    });
   }
 }
 
