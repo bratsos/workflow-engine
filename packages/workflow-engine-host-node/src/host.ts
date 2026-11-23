@@ -97,7 +97,7 @@ export interface NodeHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
-  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  /** Fallback absolute cap (ms) for jobs without a deadline. Set 0 for no fallback. */
   jobAbsoluteTimeoutMs?: number;
 
   /** Max pending runs to claim per orchestration tick (default: 10). */

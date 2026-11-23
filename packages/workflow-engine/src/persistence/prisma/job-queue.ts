@@ -47,6 +47,7 @@ import {
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
+const absoluteCapReason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
 
 /**
  * Bounds retry loops for optimistic-lock dequeue paths so heavy contention
@@ -1481,8 +1482,6 @@ export class PrismaJobQueue implements JobQueue {
    * `run.reapStuck` on its next pass.
    */
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
-    const reason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
-
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
       // than destructuring it into a local first -- Prisma's runtime reads
@@ -1495,7 +1494,7 @@ export class PrismaJobQueue implements JobQueue {
           status = 'FAILED',
           "completedAt" = (now() AT TIME ZONE 'UTC'),
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
-          "lastError" = ${reason}
+          "lastError" = ${absoluteCapReason}
         WHERE status = 'RUNNING'
           AND ("absoluteExpiresAt" < (now() AT TIME ZONE 'UTC')
             OR ("absoluteExpiresAt" IS NULL AND "startedAt" <
@@ -1513,18 +1512,42 @@ export class PrismaJobQueue implements JobQueue {
 
     const now = this.now();
     const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
+    return this.expireJobsByFilter({
+      OR: [
+        { absoluteExpiresAt: { lt: now } },
+        { absoluteExpiresAt: null, startedAt: { lt: cutoff } },
+      ],
+    });
+  }
+
+  async expireExplicitDeadlines(): Promise<number> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      const expired = await rawFor(this.prisma, { id: "text" }).$queryRaw!<
+        Array<{ id: string }>
+      >`
+        UPDATE "job_queue"
+        SET status = 'FAILED',
+            "completedAt" = (now() AT TIME ZONE 'UTC'),
+            "updatedAt" = (now() AT TIME ZONE 'UTC'),
+            "lastError" = ${absoluteCapReason}
+        WHERE status = 'RUNNING'
+          AND "absoluteExpiresAt" < (now() AT TIME ZONE 'UTC')
+        RETURNING id
+      `;
+      return expired.length;
+    }
+    return this.expireJobsByFilter({ absoluteExpiresAt: { lt: this.now() } });
+  }
+
+  private async expireJobsByFilter(
+    filter: Record<string, unknown>,
+  ): Promise<number> {
     const result = await this.prisma.jobQueue.updateMany({
-      where: {
-        status: this.enums.status("RUNNING"),
-        OR: [
-          { absoluteExpiresAt: { lt: now } },
-          { absoluteExpiresAt: null, startedAt: { lt: cutoff } },
-        ],
-      },
+      where: { status: this.enums.status("RUNNING"), ...filter },
       data: {
         status: this.enums.status("FAILED"),
         completedAt: this.now(),
-        lastError: reason,
+        lastError: absoluteCapReason,
       },
     });
     return result.count;

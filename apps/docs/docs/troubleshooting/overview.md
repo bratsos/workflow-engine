@@ -193,4 +193,4 @@ When a workflow fails, the error details are persisted inside the `WorkflowRun.o
 | **`CLAIM_FAILED`** | `run.claimPending` | An unexpected database exception occurred while claiming. The run is failed, but other runs in the batch continue processing. |
 | **`STUCK_RUN_REAPED`** | `run.reapStuck` | The workflow run ceased database updates and exceeded the stuck threshold. |
 | **`LEASE_HEARTBEAT_LOST`** | `lease.reapStale` (prefix on `job_queue.lastError`) | The job's lease went unheartbeated past `staleLeaseThresholdMs`; the job was requeued. |
-| **`LEASE_ABSOLUTE_CAP`** | `lease.reapStale` (prefix on `job_queue.lastError`) | The job ran past `jobAbsoluteTimeoutMs`; it was failed terminally. |
+| **`LEASE_ABSOLUTE_CAP`** | `lease.reapStale` (prefix on `job_queue.lastError`) | The job passed its explicit deadline or the host fallback `jobAbsoluteTimeoutMs` and failed terminally. |

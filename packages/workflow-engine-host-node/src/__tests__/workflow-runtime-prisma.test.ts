@@ -296,36 +296,44 @@ describe.skipIf(!realDatabase)(
       }
     });
 
-    it("expires a heartbeating claim at its absolute deadline", async () => {
+    it("expires explicit deadlines when the host default cap is zero", async () => {
       const gate = Promise.withResolvers<void>();
-      const workflow = defineWorkflow("absolute", {
-        input: schemas.input,
-        absoluteTimeoutMs: 550,
-        leaseTimeoutMs: 60_000,
-      })
-        .stage("work", {
-          schemas,
-          async execute() {
-            await gate.promise;
-            return { output: {} };
-          },
-        })
-        .build();
-      const { host, kernel } = makeHost([workflow], db.client, {
-        jobHeartbeatIntervalMs: 50,
-      });
-      const id = await createRun(kernel, workflow.id);
+      const workflow = (id: string, absoluteTimeoutMs?: number) =>
+        defineWorkflow(id, { input: schemas.input, absoluteTimeoutMs })
+          .stage("work", {
+            schemas,
+            async execute() {
+              await gate.promise;
+              return { output: {} };
+            },
+          })
+          .build();
+      const { host, kernel } = makeHost(
+        [workflow("explicit-cap", 900), workflow("no-cap")],
+        db.client,
+        { jobAbsoluteTimeoutMs: 0, jobHeartbeatIntervalMs: 50, concurrency: 2 },
+      );
+      const id = await createRun(kernel, "explicit-cap");
+      const ordinary = await createRun(kernel, "no-cap");
       try {
         await host.start();
+        await expect
+          .poll(() => jobOf(ordinary), poll)
+          .toMatchObject({ status: "RUNNING", absoluteExpiresAt: null });
         await expect
           .poll(() => jobOf(id), poll)
           .toMatchObject({ status: "FAILED", attempt: 1 });
         const job = await jobOf(id);
         expect(job.lastError).toMatch(/^LEASE_ABSOLUTE_CAP/);
         expect(job.absoluteExpiresAt.getTime() - job.startedAt.getTime()).toBe(
-          550,
+          900,
         );
         expect(job.lockedAt.getTime()).toBeGreaterThan(job.startedAt.getTime());
+        expect(await jobOf(ordinary)).toMatchObject({
+          status: "RUNNING",
+          attempt: 1,
+          absoluteExpiresAt: null,
+        });
       } finally {
         gate.resolve();
       }

@@ -754,7 +754,7 @@ export function createSpillingJobTransport(
       transport.cancelByRun(workflowRunId),
     touchJob: (jobId, leaseMs, fence) =>
       transport.touchJob(jobId, leaseMs, fence),
-    // Both optional methods are forwarded only when the wrapped transport
+    // Optional methods are forwarded only when the wrapped transport
     // has them, so wrapping never claims a capability the inner transport
     // lacks — and never hides one it has.
     ...(transport.expireRunawayJobs
@@ -763,6 +763,9 @@ export function createSpillingJobTransport(
             transport.expireRunawayJobs?.(absoluteTimeoutMs) ??
             Promise.resolve(0),
         }
+      : {}),
+    ...(transport.expireExplicitDeadlines
+      ? { expireExplicitDeadlines: () => transport.expireExplicitDeadlines!() }
       : {}),
     ...(transport.getJobStats
       ? { getJobStats: () => transport.getJobStats!() }

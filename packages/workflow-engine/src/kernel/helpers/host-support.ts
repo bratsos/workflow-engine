@@ -618,7 +618,7 @@ export interface RunMaintenanceTickOptions {
   outboxFlushSignal?: Pick<AbortSignal, "aborted">;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
-  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
+  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the default cap. */
   jobAbsoluteTimeoutMs?: number;
   /**
    * Delete terminal runs older than `retention.olderThanMs` through

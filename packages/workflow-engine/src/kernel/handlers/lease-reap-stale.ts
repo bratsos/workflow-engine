@@ -24,12 +24,11 @@ export async function handleLeaseReapStale(
     command.staleThresholdMs,
   );
 
-  let expired = 0;
-  if (command.absoluteTimeoutMs && deps.jobTransport.expireRunawayJobs) {
-    expired = await deps.jobTransport.expireRunawayJobs(
-      command.absoluteTimeoutMs,
-    );
-  }
+  const expired = command.absoluteTimeoutMs
+    ? ((await deps.jobTransport.expireRunawayJobs?.(
+        command.absoluteTimeoutMs,
+      )) ?? 0)
+    : ((await deps.jobTransport.expireExplicitDeadlines?.()) ?? 0);
 
   return { released, expired, _events: [] };
 }

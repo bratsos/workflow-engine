@@ -213,6 +213,7 @@ interface JobQueue {
   defer?(jobId: string, nextPollAt: Date, reason: string, fence?: JobAckFence): Promise<JobAckOutcome>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
   expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
+  expireExplicitDeadlines?(): Promise<number>;
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
   touchJob(jobId: string): Promise<void>;
@@ -335,13 +336,15 @@ silently ignoring it.
 
 ### Two-tier lease expiry
 
-`releaseStaleJobs` is the fine-grained tier: it compares `lockedAt`, which
-`touchJob` refreshes on every heartbeat, so it catches a worker that *stopped*.
-It cannot catch a worker that is alive but wedged, because that worker keeps
-heartbeating. `expireRunawayJobs(absoluteTimeoutMs)` -- optional on the port, so
-an older adapter still compiles -- is the coarse backstop: it compares
-`startedAt`, stamped once per claim and refreshed by nothing, and fails the job
-terminally.
+`releaseStaleJobs` requeues jobs whose lease expired. With a configured
+lease it checks the stored lease deadline. With an inherited lease it checks
+`lockedAt`, which each heartbeat refreshes.
+
+`expireRunawayJobs(absoluteTimeoutMs)` fails running jobs past their explicit
+deadline or, for jobs without one, past the fallback measured from
+`startedAt`. The host calls `expireExplicitDeadlines()` when the fallback is
+zero. Custom job transports can implement this optional method to sweep
+explicit deadlines while leaving claims with NULL deadlines running.
 
 Both stamp `lastError` with an exported prefix so the two are distinguishable
 after the fact: `LEASE_HEARTBEAT_LOST` (requeued `PENDING`) and

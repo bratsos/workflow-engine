@@ -91,7 +91,7 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys; optional `getActiveWorkStats(now)` (read by `engine.stats`) |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueueParallel` (idempotent on `(workflowRunId, stageId)`; the legacy `enqueue` left the port at 1.0), `deleteByRunAndStages` (used by `run.redrive` / `run.rerunFrom`), `dequeue(options?)` (`options.serves` filters by definition version; returns `startedAt`), `complete`, `suspend(jobId, nextPollAt, fence?)`, `fail(jobId, error, shouldRetry?, fence?)` (all three take an optional `JobAckFence` and return `"acknowledged" \| "superseded"`), `defer` (optional: decline a job without spending an attempt), `releaseStaleJobs`, `expireRunawayJobs` (optional, absolute lease tier), `cancelByRun`, `touchJob` (lease heartbeat), `getJobsByWorkflowRun`, `adoptWorkerId` (optional), `fairnessGroupBy` (optional readonly property, read by `createSpillingJobTransport`) |
+| `jobTransport` | `JobTransport` | `enqueueParallel` (idempotent on `(workflowRunId, stageId)`; the legacy `enqueue` left the port at 1.0), `deleteByRunAndStages` (used by `run.redrive` / `run.rerunFrom`), `dequeue(options?)` (`options.serves` filters by definition version; returns `startedAt`), `complete`, `suspend(jobId, nextPollAt, fence?)`, `fail(jobId, error, shouldRetry?, fence?)` (all three take an optional `JobAckFence` and return `"acknowledged" \| "superseded"`), `defer` (optional: decline a job without spending an attempt), `releaseStaleJobs`, `expireRunawayJobs` and `expireExplicitDeadlines` (optional, absolute lease tier), `cancelByRun`, `touchJob` (lease heartbeat), `getJobsByWorkflowRun`, `adoptWorkerId` (optional), `fairnessGroupBy` (optional readonly property, read by `createSpillingJobTransport`) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
 | `clock` | `Clock` | `now()` - returns `Date` |
 | `registry` | `WorkflowRegistry` | `getWorkflow(id)`, plus optional `listWorkflows()` (implemented by `createWorkflowRegistry`) that enables definition-version filtering |
@@ -118,7 +118,7 @@ const host = createNodeHost({
   jobPollIntervalMs: 1_000,           // Dequeue and execute jobs
   postJobYieldMs: 1_000,              // v0.4.4+: randomised pause after a completed job (default: jobPollIntervalMs)
   staleLeaseThresholdMs: 300_000,     // Release stale job leases (default 300_000 as of v0.11, was 60_000)
-  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+: absolute cap on one claim, fires even while heartbeating (0 disables)
+  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+: fallback absolute cap, fires even while heartbeating (0 for no fallback)
   jobHeartbeatIntervalMs: 60_000,     // v0.11+: heartbeat a job's lease while it executes
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
@@ -157,12 +157,10 @@ tier: it is measured from `lockedAt`, which `touchJob` refreshes on every
 heartbeat, so it detects a worker that *stopped*. It cannot detect a worker that
 is alive but wedged — a hung HTTP call with no timeout, an infinite loop in a
 stage — because such a worker keeps heartbeating and holds the job forever.
-Shipping only a heartbeat is the configuration pg-boss's design treats as
-dangerous, so there is a second, coarse tier: `jobAbsoluteTimeoutMs` (default
-**one hour**, twelve times the default stale threshold) is measured from
-`startedAt`, which is stamped once per claim and which no heartbeat refreshes,
-so it always fires. Set it to `0` to disable it and get the pre-1.0.0-alpha.9
-heartbeat-only behaviour; raise it above the longest stage you legitimately run.
+The absolute tier fails a job at its explicit workflow or stage deadline.
+Jobs without a deadline use `jobAbsoluteTimeoutMs` (default one hour),
+measured from `startedAt`. Heartbeats leave both deadlines unchanged.
+Set the host fallback to `0` to give jobs without an explicit deadline no cap.
 
 The two outcomes are told apart by the `lastError` the sweep writes, prefixed
 with an exported constant so an operator (or an alert) can match on it:
@@ -170,25 +168,24 @@ with an exported constant so an operator (or an alert) can match on it:
 | Tier | Measured from | Outcome | `lastError` prefix |
 | --- | --- | --- | --- |
 | `staleLeaseThresholdMs` | `lockedAt` (heartbeat refreshes it) | requeued `PENDING` for another worker | `LEASE_HEARTBEAT_LOST` |
-| `jobAbsoluteTimeoutMs` | `startedAt` (never refreshed) | `FAILED` — dead-lettered | `LEASE_ABSOLUTE_CAP` |
+| `absoluteTimeoutMs` or `jobAbsoluteTimeoutMs` | `startedAt` (never refreshed) | `FAILED` — dead-lettered | `LEASE_ABSOLUTE_CAP` |
 
 The heartbeat tier sweeps first, so a *dead* worker's job is retried rather than
 dead-lettered; only a job whose worker is still heartbeating reaches the cap.
 The absolute tier is deliberately terminal — a job that hung for a whole hour
 will hang again — and the run it belonged to is resolved by `run.reapStuck` on a
 later pass. `lease.reapStale` returns both counts (`{ released, expired }`), and
-`runMaintenanceTick` surfaces them as `staleReleased` / `staleExpired`. A custom
-`JobTransport` that does not implement the optional `expireRunawayJobs` simply
-has no absolute tier.
+`runMaintenanceTick` surfaces them as `staleReleased` / `staleExpired`. A custom `JobTransport` can implement
+`expireRunawayJobs` to enforce deadlines with a host fallback and
+`expireExplicitDeadlines` to enforce explicit deadlines with a zero fallback.
 
 **The job lease runs on the database clock (Postgres).** `PrismaJobQueue` stamps
 `lockedAt`/`startedAt` with `now() AT TIME ZONE 'UTC'` at claim time, renews it
 the same way from `touchJob`, and `releaseStaleJobs` derives the deadline in the
 same statement (`"lockedAt" < now() AT TIME ZONE 'UTC' - <threshold> * interval
-'1 millisecond'`). No expiry is computed in application code and none is stored,
-which is the shape pg-boss, Graphile Worker, River and Oban all use: a host whose
-system clock drifts can neither shorten nor extend a lease, and two hosts can
-never disagree about when one expires. `staleLeaseThresholdMs` is therefore a
+'1 millisecond'`). The queue stamps explicit lease and absolute deadlines using the same
+database clock. A host whose system clock drifts cannot shorten or extend a
+lease. `staleLeaseThresholdMs` is therefore a
 *duration*, measured by the database, not a deadline your process computes. On
 SQLite the comparison stays in application code -- one process, one clock.
 
@@ -270,7 +267,7 @@ const host = createServerlessHost({
 
   // Optional tuning (same as Node host)
   staleLeaseThresholdMs: 300_000,     // default as of v0.11 (was 60_000)
-  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+ (0 disables the absolute tier)
+  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+ (0 for no fallback)
   jobHeartbeatIntervalMs: 60_000,     // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,

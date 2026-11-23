@@ -602,8 +602,19 @@ export class InMemoryJobQueue implements JobQueue {
    * a worker that is alive but wedged as readily as on one that died.
    */
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    return this.expireJobs(absoluteTimeoutMs);
+  }
+
+  async expireExplicitDeadlines(): Promise<number> {
+    return this.expireJobs();
+  }
+
+  private expireJobs(absoluteTimeoutMs?: number): number {
     const now = this.now();
-    const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
+    const cutoff =
+      absoluteTimeoutMs === undefined
+        ? undefined
+        : new Date(now.getTime() - absoluteTimeoutMs);
     const reason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
     let expired = 0;
 
@@ -612,7 +623,9 @@ export class InMemoryJobQueue implements JobQueue {
         job.status === "RUNNING" &&
         (job.absoluteExpiresAt
           ? job.absoluteExpiresAt < now
-          : job.startedAt !== null && job.startedAt < cutoff)
+          : cutoff !== undefined &&
+            job.startedAt !== null &&
+            job.startedAt < cutoff)
       ) {
         const updated: JobRecord = {
           ...job,

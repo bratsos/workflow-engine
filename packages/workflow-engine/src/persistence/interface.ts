@@ -1458,6 +1458,9 @@ export interface JobQueue {
    */
   expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
 
+  /** Fail RUNNING jobs with overdue explicit deadlines when the host has no default cap. */
+  expireExplicitDeadlines?(): Promise<number>;
+
   /**
    * Cancel all pending/suspended jobs for a workflow run.
    * Returns count of cancelled jobs.

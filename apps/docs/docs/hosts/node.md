@@ -59,7 +59,7 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`postJobYieldMs`** | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause this worker takes after *completing* a job before asking for the next one, so a multi-stage run is not pinned to the worker that advanced it. Skipped while draining a backlog; `0` disables it. |
 | **`concurrency`** | `number` | `1` | Number of independent job execution slots in this host. |
 | **`staleLeaseThresholdMs`** | `number` | `300000` (5m) | Default time a job lease may go without a heartbeat before `lease.reapStale` releases it for retry (measured on the database clock on PostgreSQL). |
-| **`jobAbsoluteTimeoutMs`** | `number` | `3600000` (1h) | Default absolute cap on one job claim, measured from `startedAt`, which no heartbeat refreshes. A job past it is failed terminally (`LEASE_ABSOLUTE_CAP`); a stage that legitimately runs longer must raise it. `0` disables the tier. |
+| **`jobAbsoluteTimeoutMs`** | `number` | `3600000` (1h) | Fallback absolute cap on a claim without a workflow or stage deadline, measured from `startedAt`. A job past its deadline fails with `LEASE_ABSOLUTE_CAP`. Set `0` for no fallback. Explicit deadlines still apply. |
 | **`jobHeartbeatIntervalMs`**| `number` | `60000` (60s) | Maximum interval between heartbeats. A workflow or stage lease override caps this interval at one third of the override. Each beat renews the lease and checks for cancellation or lease loss. |
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
