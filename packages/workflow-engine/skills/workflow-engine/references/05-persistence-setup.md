@@ -1219,6 +1219,8 @@ The Prisma 8 SQLite wrapper queues every engine write made through one root clie
 
 Change `journal_mode` on a database the engine is using only through the wrapped client's root connection, after the adapter's first call and outside a `$transaction` callback (sent from inside one, the statement waits for that transaction and times out). In the SQLite that `node:sqlite` ships on Node 22 and 24, a connection that leaves WAL keeps its page cache as of its last read, and its next write then loses rows that another connection committed. The wrapper drops the root connection's page cache, attached databases included, after any root statement that names `journal_mode`, however it is spelled and whichever API sends it (the wrapper, `db.query`, `db.orm`, `db.sql`). A mode change from any other connection or process (the `sqlite3` tool, a plain Prisma 8 client), or sent to the root before the adapter's first call, is not covered: it can lose rows the engine committed, so make it before the engine starts.
 
+Known limitation under Bun: changing `journal_mode` at runtime, or leaving WAL, after the engine has committed a transaction can fail with `database is locked`. Bun's `node:sqlite` `close()` leaves a connection (its locks and WAL membership) open until its statements are collected, and the Prisma 8 driver gives each transaction a connection of its own. Staying in one journal mode is unaffected; set it before the engine starts.
+
 Use this contract for a fresh Prisma 8 file. For an existing file, follow the [SQLite major-switch procedure](https://workflow-engine.dev/persistence/prisma-setup#switching-sqlite-prisma-majors).
 
 
