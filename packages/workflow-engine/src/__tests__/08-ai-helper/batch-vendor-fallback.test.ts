@@ -163,7 +163,12 @@ describe("vendor batch SDK missing", () => {
       undefined,
       undefined,
       {
-        routing: { provider: { only: ["anthropic"], allowFallbacks: true } },
+        routing: {
+          provider: {
+            only: ["anthropic", "openai"],
+            order: ["anthropic", "openai"],
+          },
+        },
       },
     );
     const batch = ai.batch("fallback-haiku", "anthropic", { fetch: fetchFn });
@@ -172,5 +177,35 @@ describe("vendor batch SDK missing", () => {
       batch.submit([{ id: "r1", prompt: "Summarize the invoice." }]),
     ).rejects.toThrow(/OpenRouter batch.*provider policy/i);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+  it("sends the supported policy when a native batch falls back to OpenRouter", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ id: "batch-1", status: "validating" }, { status: 202 }),
+      );
+    const ai = createAIHelper(
+      "batch-policy",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      {
+        routing: { provider: { only: ["anthropic"], allowFallbacks: true } },
+      },
+    );
+    await expect(
+      ai
+        .batch("fallback-haiku", "anthropic", {
+          apiKey: "test",
+          fetch: fetchFn,
+        })
+        .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),
+    ).resolves.toMatchObject({ provider: "openrouter" });
+    expect(
+      JSON.parse(String(fetchFn.mock.calls[0]![1]?.body)).provider,
+    ).toEqual({
+      only: ["anthropic"],
+      allow_fallbacks: true,
+    });
   });
 });

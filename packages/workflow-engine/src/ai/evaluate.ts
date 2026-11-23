@@ -16,9 +16,9 @@ import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
   buildOpenRouterRoutingProvider,
   logger,
+  mergeOpenRouterProviderOptions,
   type OpenRouterRoutingOptions,
   resolveCost,
-  withoutOpenRouterProviderOverride,
 } from "./shared";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
@@ -162,7 +162,11 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       ctx.routing?.provider !== undefined &&
       modelConfig.provider === "openrouter" &&
       !evaluationProviderRegistry.has("openrouter")
-        ? withoutOpenRouterProviderOverride(callProviderOptions)
+        ? mergeOpenRouterProviderOptions(
+            callProviderOptions,
+            modelConfig,
+            ctx.routing,
+          )
         : callProviderOptions;
     const result = await runWithCallTimeout(timeout, (signal) =>
       aiEvaluate({

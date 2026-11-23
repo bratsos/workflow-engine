@@ -7,6 +7,8 @@
 
 import { google } from "@ai-sdk/google";
 import type {
+  JSONObject,
+  JSONValue,
   LanguageModelV4,
   SharedV4ProviderOptions,
 } from "@ai-sdk/provider";
@@ -78,7 +80,8 @@ export function assertAdapterProviderPolicy(
 export function buildOpenRouterRoutingProvider(
   modelConfig: ModelConfig,
   routing?: OpenRouterRoutingOptions,
-) {
+  requestProvider?: unknown,
+): JSONObject {
   const policy = routing?.provider;
   if (policy?.only?.length === 0) {
     throw new Error(
@@ -86,7 +89,7 @@ export function buildOpenRouterRoutingProvider(
     );
   }
   const priceHeadroom = routing?.priceHeadroom ?? 1.25;
-  return {
+  const configured = {
     ...(policy?.order?.length
       ? {}
       : { sort: routing?.sort ?? ("throughput" as const) }),
@@ -106,16 +109,182 @@ export function buildOpenRouterRoutingProvider(
       ? { data_collection: policy.dataCollection }
       : {}),
   };
+  if (requestProvider == null) return configured;
+  if (!isRoutingObject(requestProvider)) {
+    throw new Error("OpenRouter provider options must be an object.");
+  }
+
+  const merged: JSONObject = { ...configured, ...requestProvider };
+  const requestOnly = providerSlugs(requestProvider.only, "only");
+  let only = policy?.only;
+  if (requestOnly !== undefined) {
+    only =
+      only === undefined
+        ? requestOnly
+        : intersectProviderSlugs(only, requestOnly);
+  }
+  const allowFallbacks =
+    policy?.allowFallbacks === false ||
+    requestProvider.allow_fallbacks === false
+      ? false
+      : (policy?.allowFallbacks ?? requestProvider.allow_fallbacks);
+  const requestOrder = providerSlugs(requestProvider.order, "order");
+  const helperOrder = policy?.order;
+  let order = requestOrder?.length
+    ? requestOrder
+    : (helperOrder ?? requestOrder);
+  if (helperOrder?.length && requestOrder?.length) {
+    if (allowFallbacks === false) {
+      const overlap = intersectProviderSlugs(helperOrder, requestOrder);
+      const reverse = intersectProviderSlugs(requestOrder, helperOrder);
+      if (overlap.length === 0 || !sameProviderOrder(overlap, reverse)) {
+        throw new Error(
+          "The helper and per-call OpenRouter provider orders conflict.",
+        );
+      }
+      order = overlap;
+    } else {
+      const shorter =
+        helperOrder.length < requestOrder.length ? helperOrder : requestOrder;
+      const longer = shorter === helperOrder ? requestOrder : helperOrder;
+      if (!sameProviderOrder(shorter, longer.slice(0, shorter.length))) {
+        throw new Error(
+          "The helper and per-call OpenRouter provider orders conflict.",
+        );
+      }
+      order = longer;
+    }
+  }
+  if (
+    policy?.allowFallbacks === false &&
+    !helperOrder?.length &&
+    order &&
+    order.length > 1
+  ) {
+    throw new Error(
+      "The per-call provider order would add fallbacks to the helper's OpenRouter policy.",
+    );
+  }
+  if (
+    only?.length === 0 ||
+    (only &&
+      order?.length &&
+      allowFallbacks === false &&
+      !intersectProviderSlugs(only, order).length)
+  ) {
+    throw new Error(
+      "The merged OpenRouter provider allowlist permits no provider.",
+    );
+  }
+
+  if (only !== undefined) merged.only = only;
+  if (order !== undefined) merged.order = order;
+  if (order?.length) delete merged.sort;
+  if (allowFallbacks !== undefined) merged.allow_fallbacks = allowFallbacks;
+  if (
+    policy?.dataCollection === "deny" ||
+    requestProvider.data_collection === "deny"
+  ) {
+    merged.data_collection = "deny";
+  } else if (policy?.dataCollection === "allow") {
+    merged.data_collection = "allow";
+  }
+  if (
+    configured.require_parameters ||
+    requestProvider.require_parameters === true
+  ) {
+    merged.require_parameters = true;
+  }
+  if (configured.max_price) {
+    const requestPrice = requestProvider.max_price;
+    if (requestPrice != null && !isRoutingObject(requestPrice)) {
+      throw new Error("OpenRouter provider max_price must be an object.");
+    }
+    const prices: JSONObject = { ...configured.max_price, ...requestPrice };
+    for (const [unit, cap] of Object.entries(configured.max_price)) {
+      const requested = requestPrice?.[unit];
+      if (requested == null || priceLimit(requested) >= cap) prices[unit] = cap;
+    }
+    merged.max_price = prices;
+  }
+  return merged;
 }
 
-/** The SDK merges call options after model settings, so keep routing at the model boundary. */
-export function withoutOpenRouterProviderOverride(
+function isRoutingObject(value: unknown): value is JSONObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function providerSlugs(
+  value: JSONValue | undefined,
+  field: string,
+): string[] | undefined {
+  if (value == null) return undefined;
+  if (
+    !Array.isArray(value) ||
+    !value.every((slug) => typeof slug === "string" && slug.length > 0)
+  ) {
+    throw new Error(
+      `OpenRouter provider ${field} must be an array of provider slugs.`,
+    );
+  }
+  return value;
+}
+
+function sameProviderOrder(first: string[], second: string[]): boolean {
+  return (
+    first.length === second.length &&
+    first.every((slug, index) => slug === second[index])
+  );
+}
+
+/** Base slugs include their variants. Variant slugs match only that endpoint. */
+export function intersectProviderSlugs(
+  first: string[],
+  second: string[],
+): string[] {
+  const intersection = new Set<string>();
+  for (const a of first) {
+    for (const b of second) {
+      if (a === b || (!b.includes("/") && a.startsWith(`${b}/`)))
+        intersection.add(a);
+      else if (!a.includes("/") && b.startsWith(`${a}/`)) intersection.add(b);
+    }
+  }
+  return [...intersection];
+}
+
+function priceLimit(value: JSONValue): number {
+  const limit =
+    typeof value === "number" || (typeof value === "string" && value.trim())
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(limit) || limit < 0) {
+    throw new Error(
+      "OpenRouter provider max_price must use non-negative price limits.",
+    );
+  }
+  return limit;
+}
+
+/** The SDK sends the whole per-call provider object in place of the model's provider settings. */
+export function mergeOpenRouterProviderOptions(
   options: SharedV4ProviderOptions | undefined,
+  modelConfig: ModelConfig,
+  routing: OpenRouterRoutingOptions,
 ): SharedV4ProviderOptions | undefined {
   const openrouterOptions = options?.openrouter;
   if (!openrouterOptions || !("provider" in openrouterOptions)) return options;
-  const { provider: _provider, ...rest } = openrouterOptions;
-  return { ...options, openrouter: rest };
+  return {
+    ...options,
+    openrouter: {
+      ...openrouterOptions,
+      provider: buildOpenRouterRoutingProvider(
+        modelConfig,
+        routing,
+        openrouterOptions.provider,
+      ),
+    },
+  };
 }
 
 export function getModelProvider(
@@ -139,8 +308,10 @@ export function getModelProvider(
         async transformParams({ params }) {
           return {
             ...params,
-            providerOptions: withoutOpenRouterProviderOverride(
+            providerOptions: mergeOpenRouterProviderOptions(
               params.providerOptions,
+              modelConfig,
+              routing,
             ),
           };
         },
@@ -336,6 +507,31 @@ export function extractServedBy(
   return typeof served === "string" && served.length > 0 ? served : undefined;
 }
 
+export function extractStepProvider(value: unknown): string | null {
+  const step = value as ProviderResultLike | undefined;
+  const reported = extractServedBy(step);
+  if (reported !== undefined) return reported;
+  const transport = step?.model?.provider?.split(".")[0];
+  return transport === "google" ||
+    transport === "openai" ||
+    transport === "anthropic"
+    ? transport
+    : null;
+}
+
+export function summarizeStepProviders(steps: (string | null)[]): {
+  servedBy?: string;
+  servedBySteps?: (string | null)[];
+} {
+  const servedBy = [...new Set(steps.filter((name) => name !== null))].join(
+    ",",
+  );
+  return {
+    ...(servedBy ? { servedBy } : {}),
+    ...(steps.length ? { servedBySteps: [...steps] } : {}),
+  };
+}
+
 export interface CostResolution {
   /** Authoritative figure: reported when available, else estimated. */
   cost: number;
@@ -439,27 +635,12 @@ export function resolveCost(
     );
   const reportedCostUsd = extractReportedCost(providerResult);
   const steps = providerResult?.steps;
-  const servedBySteps =
-    steps && steps.length > 1
-      ? steps.map((value) => {
-          const step = value as ProviderResultLike | undefined;
-          const transport = step?.model?.provider?.split(".")[0];
-          const directProvider =
-            transport === "google" ||
-            transport === "openai" ||
-            transport === "anthropic"
-              ? transport
-              : null;
-          return extractServedBy(step) ?? directProvider;
-        })
-      : undefined;
-  const servedBy = servedBySteps
-    ? [...new Set(servedBySteps.filter((name) => name !== null))].join(",") ||
-      undefined
-    : extractServedBy(providerResult);
+  const providers =
+    Array.isArray(steps) && steps.length > 1
+      ? summarizeStepProviders(steps.map(extractStepProvider))
+      : { servedBy: extractServedBy(providerResult) };
   const extras = {
-    ...(servedBy !== undefined ? { servedBy } : {}),
-    ...(servedBySteps !== undefined ? { servedBySteps } : {}),
+    ...providers,
     ...usageDetails,
   };
 

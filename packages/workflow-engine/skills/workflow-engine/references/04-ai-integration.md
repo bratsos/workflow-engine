@@ -146,7 +146,9 @@ Per-call `timeoutMs` on text, object, embed and stream options overrides `timeou
 
 OpenRouter's "No endpoints found that can handle the requested parameters" is the outcome of `requireParameters: true` excluding endpoints that ignore a requested parameter (typically `maxTokens`); the error names `routing: { requireParameters: false }` as the change to make.
 
-Set `routing.provider` with `only` (provider slugs), `order`, `allowFallbacks` and `dataCollection` (`"allow"` or `"deny"`) to apply an upstream policy to a helper and its children. Built-in OpenRouter calls send the policy and give it precedence over per-call provider options. Direct built-in calls, including transcription and native batches, check their vendor against `only` when set. They reject `dataCollection: "deny"` and an excluded vendor when `order` is set and fallbacks are disabled. OpenRouter batch submissions refuse a configured policy, including when the helper would otherwise fall back from a native batch transport. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
+Set `routing.provider` with `only` (provider slugs), `order`, `allowFallbacks` and `dataCollection` (`"allow"` or `"deny"`) to apply an upstream policy to a helper and its children. Built-in OpenRouter calls intersect per-call and helper allow-lists, follow the stricter privacy and fallback settings, and preserve compatible extra restrictions such as `zdr`. Direct built-in calls, including transcription and native batches, check their vendor against `only` when set. They reject `dataCollection: "deny"` and an excluded vendor when `order` is set and fallbacks are disabled.
+
+OpenRouter text batches and native-to-OpenRouter fallbacks send the allow-list and fallback settings at the top level. A policy that requires ranking multiple providers or denying data collection is refused before submission, as is a provider restriction on the embeddings batch endpoint. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
 
 The `providerResolver` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument and must honour it. Calls handled by an `AIAdapter` refuse a configured provider policy.
 
@@ -890,7 +892,7 @@ Every call row (`AICallRecord`, read back with `aiLogger.listCalls(topicPrefix)`
 | `estimatedCost` | The registry figure, always computed: `inputCostPerMillion` / `outputCostPerMillion` (or the long-context tier), with cached input tokens priced at `cachedInputCostPerMillion` when the registry has one. |
 | `reportedCost` | The provider's own USD figure (OpenRouter's `usage.cost`, BYOK-adjusted; an adapter's `costUsd`). Absent when the provider reports none. |
 | `costSource` | `"reported"` or `"estimated"` — which of the two `cost` is. |
-| `servedBy` | The serving provider or comma-separated distinct providers for a multi-step call. `metadata.servedBySteps` records each provider in step order with `null` for an unknown provider. |
+| `servedBy` | The serving provider or comma-separated distinct providers for a multi-step call. `metadata.servedBySteps` records each provider in step order, including the steps reported before a call failed, with `null` for an unknown provider. |
 | `cachedInputTokens` | Input tokens served from the prompt cache. Part of `inputTokens`, not in addition to it. |
 | `reasoningTokens` | Reasoning tokens the model emitted. Part of `outputTokens` and billed as output; no separate charge. |
 

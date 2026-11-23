@@ -71,7 +71,11 @@ const ai = createAIHelper(topic, logger, undefined, undefined, {
 });
 ```
 
-Built-in OpenRouter text, object, streaming, embedding and evaluation calls send the policy on every request. The helper's policy takes precedence over per-call OpenRouter provider options. Direct built-in calls, including transcription and native batches, require their vendor to appear in `only` when set. They also reject a provider outside `order` when fallbacks are disabled and reject `dataCollection: "deny"` because the direct transports cannot enforce that setting. The OpenRouter batch transport rejects submissions with a helper policy, including fallback from a native transport. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
+Built-in OpenRouter text, object, streaming, embedding and evaluation calls combine the helper policy with per-call OpenRouter provider settings. Allow-lists intersect, the stricter privacy and fallback settings win, and extra restrictions such as `zdr` are preserved. Conflicting constraints may cause the call to fail before submission.
+
+Direct built-in calls, including transcription and native batches, require their vendor to appear in `only` when set. They also reject a provider outside `order` when fallbacks are disabled and reject `dataCollection: "deny"` because the direct transports cannot enforce that setting.
+
+OpenRouter text batches, including fallback from a native transport, send supported constraints in the top-level `provider` object. The batch supports an allow-list and fallback control. A policy that requires ranking multiple providers or denying data collection is refused before submission, as is a provider restriction on the embeddings batch endpoint. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
 
 `providerResolver(modelConfig, policy)` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument. The application is responsible for enforcing it in those models. Calls handled by an `AIAdapter` refuse a configured provider policy.
 
@@ -270,5 +274,5 @@ Every AI result exposes `reportedCostUsd` (the provider's own figure, when it re
 
 The `ai_calls` row behind each result keeps both figures rather than the winner alone: `cost` (the authoritative number `getStats` sums and `WorkflowRun.totalCost` rolls up), `estimatedCost` (the registry figure, always computed), `reportedCost` (the provider's figure, when any), `costSource` (which of the two `cost` is), `servedBy` (the serving provider or comma-separated distinct providers), plus `cachedInputTokens` and `reasoningTokens` (breakdowns of `inputTokens` and `outputTokens`, not additions to them). The estimate prices cached input tokens at the model's `cachedInputCostPerMillion` when the registry has one (`workflow-engine-sync` emits it from OpenRouter's `input_cache_read` price) and at the full input rate otherwise; reasoning tokens are billed as output. `aiLogger.listCalls(topicPrefix)` reads the rows back. OpenRouter's `max_price` guard is the same registry price times `routing.priceHeadroom` (default 1.25). Comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic, not proof of an overcharge: cache-read rates are not guarded and `priceHeadroom: 0` disables the guard, so unexpected differences should prompt checking the endpoint's rates, caching, routing, and fees.
 
-Multi-step call rows store the provider for each step in order under `metadata.servedBySteps`. Unknown providers are represented as `null`.
+Multi-step call rows store the provider for each step in order under `metadata.servedBySteps`. Failed text, object and stream calls preserve the steps the SDK reported before the failure. Unknown providers are represented as `null`.
 

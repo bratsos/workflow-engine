@@ -4,6 +4,7 @@ import {
   extractReportedCost,
   extractServedBy,
   extractUsageDetails,
+  intersectProviderSlugs,
   type OpenRouterRoutingOptions,
 } from "../shared";
 import {
@@ -31,14 +32,48 @@ export interface OpenRouterBatchConfig {
     | "/v1/embeddings"; // default "/v1/chat/completions"
 }
 
-export function assertOpenRouterBatchProviderPolicy(
+export function openRouterBatchProvider(
   policy: OpenRouterRoutingOptions["provider"],
-): void {
-  if (policy !== undefined) {
+  endpoint: OpenRouterBatchConfig["endpoint"],
+): { only?: string[]; allow_fallbacks?: boolean } | undefined {
+  if (policy === undefined) return undefined;
+  let { only } = policy;
+  const { order, allowFallbacks, dataCollection } = policy;
+  if (only?.length === 0) {
+    throw new Error("OpenRouter batch provider policy has an empty allowlist.");
+  }
+  if (dataCollection === "deny") {
     throw new Error(
-      "OpenRouter batch submissions cannot honour the helper's provider policy. OpenRouter does not enforce provider routing in individual batch items.",
+      'OpenRouter batch cannot enforce provider policy dataCollection: "deny".',
     );
   }
+  if (order?.length) {
+    const ordered = only ? intersectProviderSlugs(order, only) : order;
+    if (allowFallbacks === false && ordered.length === 1) {
+      // A single eligible provider can be pinned through the batch allowlist.
+      only = ordered;
+    } else if (
+      allowFallbacks === false ||
+      (ordered.length > 0 &&
+        (only?.length !== 1 || ordered.length !== 1 || ordered[0] !== only[0]))
+    ) {
+      throw new Error(
+        "OpenRouter batch cannot enforce the provider policy order.",
+      );
+    }
+  }
+  if (only === undefined && allowFallbacks === undefined) return undefined;
+  if (endpoint === "/v1/embeddings") {
+    throw new Error(
+      "OpenRouter batch embeddings do not support provider policy fields.",
+    );
+  }
+  return {
+    ...(only !== undefined ? { only } : {}),
+    ...(allowFallbacks !== undefined
+      ? { allow_fallbacks: allowFallbacks }
+      : {}),
+  };
 }
 
 const OpenRouterBatchResultItemSchema = z.object({
@@ -289,7 +324,7 @@ export function createOpenRouterBatchModel(
       requests: EngineBatchRequest[],
       opts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
-      assertOpenRouterBatchProviderPolicy(cfg.routing?.provider);
+      const provider = openRouterBatchProvider(cfg.routing?.provider, endpoint);
       const items = requests.map((req) => {
         const body: Record<string, unknown> = {
           messages: req.system
@@ -330,16 +365,13 @@ export function createOpenRouterBatchModel(
         };
       });
 
-      // LOAD-BEARING: OpenRouter stream-parses the body and returns 400 if `requests`
-      // appears before `endpoint` and `model`. Must build string directly.
-      const payload =
-        '{"endpoint":' +
-        JSON.stringify(endpoint) +
-        ',"model":' +
-        JSON.stringify(modelId) +
-        ',"requests":' +
-        JSON.stringify(items) +
-        "}";
+      // OpenRouter stream-parses the body. Routing fields must precede requests.
+      const payload = JSON.stringify({
+        endpoint,
+        model: modelId,
+        ...(provider !== undefined ? { provider } : {}),
+        requests: items,
+      });
 
       // NEVER auto-retry the POST. There is no idempotency key; a retry after a network timeout
       // would create and bill a second batch. Retry only GETs, and honor Retry-After when present.

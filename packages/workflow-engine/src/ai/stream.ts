@@ -13,6 +13,7 @@ import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
+  extractStepProvider,
   logger,
   resolveCost,
   resolveLanguageModel,
@@ -59,10 +60,16 @@ export function streamText(
 
   // Track whether we've logged an error (to avoid duplicate logs)
   let errorLogged = false;
+  let sdkError: { error: unknown } | undefined;
+  const stepProviders: (string | null)[] = [];
+  const onStepEnd: StreamOptions["onStepEnd"] = async (step) => {
+    stepProviders.push(extractStepProvider(step));
+    await options.onStepEnd?.(step);
+  };
 
   // Error handler that logs the error to DB
   const logError = (error: unknown) => {
-    if (errorLogged) return;
+    if (errorLogged || usageResolved) return;
     errorLogged = true;
     const callError = timeoutErrorIfExpired(timeout, error);
 
@@ -74,6 +81,7 @@ export function streamText(
       prompt: promptForLog,
       startTime,
       error: callError,
+      stepProviders,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -135,6 +143,7 @@ export function streamText(
     );
     const durationMs = Date.now() - startTime;
 
+    if (sdkError) logError(sdkError.error);
     usageResolved = true;
     cachedUsage = {
       inputTokens,
@@ -143,6 +152,9 @@ export function streamText(
       ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
       costSource,
     };
+
+    // The SDK can finish with buffered step usage after emitting an error.
+    if (errorLogged) return cachedUsage;
 
     logger.debug(`streamText response`, {
       model: modelKey,
@@ -226,11 +238,21 @@ export function streamText(
     ...(hasTools && {
       tools: options.tools,
       stopWhen: options.stopWhen,
-      onStepEnd: options.onStepEnd,
     }),
-    // Error callback to log streaming errors
+    onStepEnd,
+    // A failed stream can still report its final step after the error chunk.
     onError: ({ error }: { error: unknown }) => {
-      logError(error);
+      if (sdkError) return;
+      sdkError = { error };
+      const sdkResult = result;
+      if (!sdkResult) {
+        logError(error);
+        return;
+      }
+      const recordError = () => logError(error);
+      void runWithCallTimeout(timeout, () => sdkResult.steps)
+        .then(recordError, recordError)
+        .catch(() => logger.error("Failed to record a stream call error."));
     },
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
@@ -260,7 +282,7 @@ export function streamText(
           ? { messages: input.messages }
           : { prompt: (input as { prompt: string }).prompt }),
         ...(input.instructions ? { instructions: input.instructions } : {}),
-        options: { ...options, abortSignal: timeout.signal },
+        options: { ...options, abortSignal: timeout.signal, onStepEnd },
       });
     } else {
       result =
@@ -305,7 +327,7 @@ export function streamText(
             return { done: false, value };
           } catch (error) {
             // Log streaming error before re-throwing
-            logError(error);
+            if (!sdkError) logError(error);
             throw timeoutErrorIfExpired(timeout, error);
           }
         },

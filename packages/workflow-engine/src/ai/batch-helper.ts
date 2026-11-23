@@ -20,8 +20,8 @@ import {
   type EngineBatchRequest,
 } from "./batch/model";
 import {
-  assertOpenRouterBatchProviderPolicy,
   createOpenRouterBatchModel,
+  openRouterBatchProvider,
 } from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
 import { restorePortableValue } from "./schema-portability";
@@ -269,8 +269,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             getProviderModelId(this.modelKey, "openrouter") ??
             (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
           if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
-          if (forSubmit)
-            assertOpenRouterBatchProviderPolicy(this.ctx.routing?.provider);
+          const openRouterModel = this.createOpenRouterModel(forSubmit);
           const derived = modelConfig.batchModelId === undefined;
           warn(
             `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
@@ -280,12 +279,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             }; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
           );
           this.provider = "openrouter";
-          return this.createOpenRouterModel();
+          return openRouterModel;
         }
       }
 
       if (this.provider === "openrouter") {
-        return this.createOpenRouterModel();
+        return this.createOpenRouterModel(forSubmit);
       }
 
       const _exhaustive: never = this.provider;
@@ -293,7 +292,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     })());
   }
 
-  private createOpenRouterModel(): EngineBatchModel {
+  private createOpenRouterModel(forSubmit: boolean): EngineBatchModel {
+    if (forSubmit)
+      openRouterBatchProvider(
+        this.ctx.routing?.provider,
+        this.options?.endpoint,
+      );
     const modelConfig = getModel(this.modelKey);
     const apiKey =
       this.options?.apiKey ??
@@ -445,9 +449,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     const policy = this.ctx.routing?.provider;
-    if (this.provider === "openrouter")
-      assertOpenRouterBatchProviderPolicy(policy);
-    else assertDirectProviderPolicy(this.provider, policy);
+    if (this.provider !== "openrouter")
+      assertDirectProviderPolicy(this.provider, policy);
     const batchModel = await this.provider$(true);
     const modelConfig = getModel(this.modelKey);
 

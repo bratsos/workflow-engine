@@ -63,6 +63,7 @@ export function registerEmbeddingProvider(
 export function getEmbeddingModelProvider(
   modelConfig: ModelConfig,
   routing?: OpenRouterRoutingOptions,
+  requestProvider?: unknown,
 ) {
   // Custom providers registered by consumer
   const customFactory = embeddingProviderRegistry.get(modelConfig.provider);
@@ -74,7 +75,12 @@ export function getEmbeddingModelProvider(
 
   // Built-in providers
   if (modelConfig.provider === "openrouter") {
-    const provider = buildOpenRouterRoutingProvider(modelConfig, routing);
+    // The embedding SDK reads routing from model settings.
+    const provider = buildOpenRouterRoutingProvider(
+      modelConfig,
+      routing,
+      requestProvider,
+    );
     return openrouter.textEmbeddingModel(modelConfig.id, {
       extraBody: {
         usage: { include: true },
@@ -132,7 +138,11 @@ export async function embed(
     if (isAdapter) assertAdapterProviderPolicy(ctx.routing?.provider);
     const embeddingModel = isAdapter
       ? undefined
-      : getEmbeddingModelProvider(modelConfig, ctx.routing);
+      : getEmbeddingModelProvider(
+          modelConfig,
+          ctx.routing,
+          options.providerOptions?.openrouter?.provider,
+        );
     const providerOptions = {
       ...(modelConfig.provider === "google" && {
         google: {
