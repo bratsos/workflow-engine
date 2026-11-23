@@ -135,15 +135,17 @@ import type { NodeHost } from "@bratsos/workflow-engine-host-node";
 
 export function listenForRuns(host: NodeHost, connectionString: string) {
   let client: pg.Client | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
 
   const connect = async () => {
+    if (closed) return;
     const next = new pg.Client({ connectionString });
     let lost = false;
     const retry = () => {
       if (lost || closed) return;
       lost = true;
-      setTimeout(connect, 1_000);
+      timer = setTimeout(connect, 1_000);
     };
     next.on("error", (error) => {
       console.error("[run listener]", error.message);
@@ -154,6 +156,10 @@ export function listenForRuns(host: NodeHost, connectionString: string) {
     try {
       await next.connect();
       await next.query("LISTEN workflow_engine_runs");
+      if (closed) {
+        await next.end(); // stopped while this connection was being made
+        return;
+      }
       client = next;
       host.wake(); // runs created while nothing was listening
     } catch (error) {
@@ -166,6 +172,7 @@ export function listenForRuns(host: NodeHost, connectionString: string) {
 
   return async () => {
     closed = true;
+    clearTimeout(timer);
     await client?.end();
   };
 }
