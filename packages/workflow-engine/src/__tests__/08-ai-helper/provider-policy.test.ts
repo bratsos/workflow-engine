@@ -552,6 +552,170 @@ describe("helper provider policy", () => {
     expect(body).toContain(requests[0]!.prompt);
   });
 
+  const nativeBatches = [
+    ["anthropic", "policy-anthropic"],
+    ["google", "policy-google"],
+    ["openai", "policy-text"],
+  ] as const;
+
+  function anthropicBatchStarted() {
+    return Response.json({
+      id: "batch-next",
+      type: "message_batch",
+      processing_status: "in_progress",
+      request_counts: {
+        processing: 1,
+        succeeded: 0,
+        errored: 0,
+        canceled: 0,
+        expired: 0,
+      },
+      created_at: "2026-01-01T00:00:00Z",
+      expires_at: "2026-01-02T00:00:00Z",
+    });
+  }
+
+  describe.each(nativeBatches)("%s batch submission policy", (vendor, key) => {
+    it.each([
+      ["allowlist", { only: ["azure"] }, /excluded by routing\.provider\.only/],
+      [
+        "data collection",
+        { dataCollection: "deny" },
+        /Direct provider .* cannot enforce routing\.provider\.dataCollection/,
+      ],
+    ] satisfies [
+      string,
+      NonNullable<OpenRouterRoutingOptions["provider"]>,
+      RegExp,
+    ][])("enforces %s during a concurrent poll of a saved OpenRouter batch", async (_rule, policy, error) => {
+      const options = { apiKey: "test", fetch: fetchMock };
+      fetchMock.mockImplementation(async (url, init) => {
+        const path = String(url);
+        if (
+          path === "https://openrouter.ai/api/v1/batches" &&
+          init?.method === "POST"
+        ) {
+          return Response.json(
+            { id: "batch-previous", status: "validating" },
+            { status: 202 },
+          );
+        }
+        if (
+          path === "https://openrouter.ai/api/v1/batches/batch-previous" &&
+          init?.method === "GET"
+        ) {
+          return Response.json({ id: "batch-previous", status: "in_progress" });
+        }
+        return Response.json(
+          { error: { message: "Unexpected request" } },
+          { status: 400 },
+        );
+      });
+
+      const previous = await makeHelper({ only: ["azure"] })
+        .batch(key, "openrouter", options)
+        .submit([{ id: "previous", prompt: "Previous job" }]);
+      const metadata = JSON.parse(JSON.stringify({ batchRefs: previous.refs }));
+      fetchMock.mockClear();
+      const batch = makeHelper(policy).batch(key, vendor, options);
+
+      const [submission, status] = await Promise.allSettled([
+        batch.submit(requests),
+        batch.getStatus(previous.id, metadata),
+      ]);
+      expect(
+        fetchMock.mock.calls.map(([url, init]) => [String(url), init?.method]),
+      ).toEqual([
+        ["https://openrouter.ai/api/v1/batches/batch-previous", "GET"],
+      ]);
+      expect(submission).toMatchObject({
+        status: "rejected",
+        reason: { message: expect.stringMatching(error) },
+      });
+      expect(status).toMatchObject({
+        status: "fulfilled",
+        value: {
+          id: previous.id,
+          status: "processing",
+          provider: "openrouter",
+        },
+      });
+
+      // Resolving a historical ref must also leave later submissions on the configured transport.
+      await expect(batch.submit(requests)).rejects.toThrow(error);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("attributes an allowed native submission to its transport during a saved OpenRouter poll", async () => {
+    const options = { apiKey: "test", fetch: fetchMock };
+    fetchMock.mockImplementation(async (url, init) => {
+      const path = String(url);
+      if (
+        path === "https://openrouter.ai/api/v1/batches" &&
+        init?.method === "POST"
+      ) {
+        return Response.json(
+          { id: "batch-previous", status: "validating" },
+          { status: 202 },
+        );
+      }
+      if (
+        path === "https://openrouter.ai/api/v1/batches/batch-previous" &&
+        init?.method === "GET"
+      ) {
+        return Response.json({ id: "batch-previous", status: "in_progress" });
+      }
+      if (
+        path === "https://api.anthropic.com/v1/messages/batches" &&
+        init?.method === "POST"
+      ) {
+        return anthropicBatchStarted();
+      }
+      return Response.json(
+        { error: { message: "Unexpected request" } },
+        { status: 400 },
+      );
+    });
+    const ai = makeHelper({ only: ["anthropic"] });
+    const previous = await ai
+      .batch("policy-anthropic", "openrouter", options)
+      .submit(requests);
+    const current = ai.batch("policy-anthropic", "anthropic", options);
+    const [submitted, status] = await Promise.all([
+      current.submit(requests),
+      current.getStatus(previous.id, { batchRefs: previous.refs }),
+    ]);
+    expect(status.provider).toBe("openrouter");
+    expect(submitted).toMatchObject({
+      id: "batch-next",
+      provider: "anthropic",
+      refs: [{ id: "batch-next", provider: "anthropic.messages" }],
+    });
+  });
+
+  it("checks the policy when building each native batch partition", async () => {
+    const policy = { only: ["anthropic"] };
+    fetchMock.mockImplementationOnce(async () => {
+      policy.only = ["azure"];
+      return anthropicBatchStarted();
+    });
+    const batch = makeHelper(policy).batch("policy-anthropic", "anthropic", {
+      apiKey: "test",
+      fetch: fetchMock,
+      maxRequestsPerBatch: 1,
+    });
+    await expect(
+      batch.submit([...requests, { id: "job-2", prompt: "Check the order" }]),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(
+        /partition 2\/2.*excluded by routing\.provider\.only/,
+      ),
+      createdRefs: [{ id: "batch-next", provider: "anthropic.messages" }],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     { only: ["openai"], allowFallbacks: false },
     { order: ["openai"], allowFallbacks: false },

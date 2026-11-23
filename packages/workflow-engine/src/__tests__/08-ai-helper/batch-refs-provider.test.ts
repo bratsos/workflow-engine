@@ -6,10 +6,8 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import {
-  AIBatchImpl,
-  batchProviderFromRefProvider,
-} from "../../ai/batch-helper.js";
+import { batchProviderFromRefProvider } from "../../ai/batch/model.js";
+import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 

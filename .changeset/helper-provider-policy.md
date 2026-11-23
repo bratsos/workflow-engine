@@ -6,6 +6,8 @@ Set `AIHelperOptions.routing.provider` to configure an upstream allowlist, provi
 
 Regional endpoints remain in the merged ranking when a matching variant is allowed. OpenRouter batches can pin a single eligible regional endpoint with fallbacks disabled.
 
+New batch submissions enforce the policy on the transport that builds each request. A concurrent poll of a saved batch follows that batch's stored refs, and new handles identify the transport that submitted them.
+
 Multi-step call rows store the distinct serving providers in `servedBy` and the ordered provider for each step in `metadata.servedBySteps`, including steps the SDK reported before a call failed. Calls keep their billable usage and cost if reading structured output fails or a stream callback throws.
 
 Rolling-safe. The policy is opt-in and provider attribution uses the existing call-log fields.

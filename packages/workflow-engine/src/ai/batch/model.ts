@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { OpenRouterRoutingOptions } from "../shared";
+import type { AIBatchProvider } from "../types";
 
 /** Versioned, JSON-serializable handle. Safe to persist in suspendedState. */
 export interface EngineBatchRef {
@@ -7,6 +9,17 @@ export interface EngineBatchRef {
   readonly id: string;
   readonly provider: string;
   readonly modelId: string;
+}
+
+/** The built-in transport behind the provider ID on a stored batch ref. */
+export function batchProviderFromRefProvider(
+  providerId: string,
+): AIBatchProvider | undefined {
+  if (providerId === "openrouter") return "openrouter";
+  if (providerId.startsWith("google")) return "google";
+  if (providerId.startsWith("anthropic")) return "anthropic";
+  if (providerId.startsWith("openai")) return "openai";
+  return undefined;
 }
 
 export interface EngineBatchStatus {
@@ -101,6 +114,8 @@ export interface EngineBatchCancelResult {
 export interface EngineBatchStartOptions {
   abortSignal?: AbortSignal;
   headers?: Record<string, string>;
+  /** Upstream policy for this native submission. */
+  providerPolicy?: OpenRouterRoutingOptions["provider"];
   /**
    * Deterministic key naming this batch, from `StepRunContext.externalKey`.
    * Adapters stamp it into whatever provider-side field survives creation so

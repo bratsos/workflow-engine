@@ -9,6 +9,7 @@ import type {
   SharedV4Warning,
 } from "@ai-sdk/provider";
 import { toPortableJsonSchema } from "../schema-portability";
+import { assertDirectProviderPolicy } from "../shared";
 import {
   adoptedRef,
   adoptGoogleBatch,
@@ -23,6 +24,7 @@ import {
   toGoogleResponseSchema,
 } from "./google-json-schema";
 import {
+  batchProviderFromRefProvider,
   type EngineBatchCancelResult,
   type EngineBatchItemResult,
   type EngineBatchModel,
@@ -430,6 +432,10 @@ function buildEngineBatchModel(
       requests: EngineBatchRequest[],
       callOpts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
+      assertDirectProviderPolicy(
+        batchProviderFromRefProvider(opts.provider) ?? opts.provider,
+        callOpts?.providerPolicy,
+      );
       const batchRequests: LanguageModelBatchRequest[] = requests.map((req) => {
         let responseFormat:
           | LanguageModelV4CallOptions["responseFormat"]

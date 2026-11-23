@@ -1,6 +1,10 @@
-import { batchProviderFromRefProvider } from "../batch-helper";
+import type { BatchOptions } from "../types";
 import { type AiSdkBatchModelOptions, resolveAiSdkBatchModel } from "./ai-sdk";
-import type { EngineBatchModel, EngineBatchRef } from "./model";
+import {
+  batchProviderFromRefProvider,
+  type EngineBatchModel,
+  type EngineBatchRef,
+} from "./model";
 import { createOpenRouterBatchModel } from "./openrouter";
 
 /**
@@ -16,9 +20,7 @@ import { createOpenRouterBatchModel } from "./openrouter";
  */
 export async function resolveBatchModelForRef(
   ref: EngineBatchRef,
-  options: AiSdkBatchModelOptions & {
-    endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages";
-  } = {},
+  options: AiSdkBatchModelOptions & Pick<BatchOptions, "endpoint"> = {},
 ): Promise<EngineBatchModel> {
   const provider = batchProviderFromRefProvider(ref.provider);
   if (provider === undefined) {

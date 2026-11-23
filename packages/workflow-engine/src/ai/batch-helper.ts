@@ -13,6 +13,7 @@ import {
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
+  batchProviderFromRefProvider,
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -23,9 +24,11 @@ import {
   createOpenRouterBatchModel,
   openRouterBatchProvider,
 } from "./batch/openrouter";
+import { resolveBatchModelForRef } from "./batch/resolve-ref";
 import { getModel, type ModelKey } from "./model-helper";
 import { restorePortableValue } from "./schema-portability";
 import {
+  assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
   logger,
@@ -134,24 +137,7 @@ function toEpochMs(value: unknown): number | undefined {
   return undefined;
 }
 
-/**
- * The engine batch provider behind a stored ref's provider id
- * (`"openrouter"`, `"google.generative-ai"`, `"anthropic.messages"`,
- * `"openai.responses"`, ...).
- */
-export function batchProviderFromRefProvider(
-  providerId: string,
-): AIBatchProvider | undefined {
-  if (providerId === "openrouter") return "openrouter";
-  if (providerId.startsWith("google")) return "google";
-  if (providerId.startsWith("anthropic")) return "anthropic";
-  if (providerId.startsWith("openai")) return "openai";
-  return undefined;
-}
-
 export class AIBatchImpl<T = string> implements AIBatch<T> {
-  private providerPromise?: Promise<EngineBatchModel>;
-
   /**
    * Schemas keyed by batchId -> requestId, populated at submit() time.
    */
@@ -183,113 +169,55 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   constructor(
     private ctx: AIHelperContext,
     private modelKey: ModelKey,
-    private provider: AIBatchProvider,
+    private readonly configuredProvider: AIBatchProvider,
     private batchLogFn?: BatchLogFn,
     private options?: BatchOptions,
     /** Pre-resolved backend; skips provider resolution. Used by tests and adapters. */
-    backend?: EngineBatchModel,
-  ) {
-    if (backend) {
-      this.providerPromise = Promise.resolve(backend);
-      this.backendInjected = true;
+    private readonly backend?: EngineBatchModel,
+  ) {}
+
+  /** A submission owns its transport, including its provider's request state. */
+  private async resolveDefaultModel(
+    forSubmit = false,
+  ): Promise<EngineBatchModel> {
+    if (this.backend) return this.backend;
+    const provider = this.configuredProvider;
+    if (provider === "openrouter") return this.createOpenRouterModel(forSubmit);
+
+    const nativeModelId = resolveModelForProvider(this.modelKey, provider);
+    const warn = (message: string) => {
+      if (this.batchLogFn) this.batchLogFn("WARN", message);
+      else logger.warn(message);
+    };
+    try {
+      return await resolveAiSdkBatchModel(provider, nativeModelId, {
+        apiKey: this.options?.apiKey,
+        baseURL: this.options?.baseURL,
+        fetch: this.options?.fetch,
+        onWarning: warn,
+      });
+    } catch (error) {
+      // Optional SDKs and older releases may lack the native batch seam.
+      const missingSdk =
+        error instanceof Error &&
+        /Package ".*" is required/.test(error.message);
+      const noBatchSeam = isNotBatchCapableError(error);
+      const modelConfig = getModel(this.modelKey);
+      const viaOpenRouter =
+        getProviderModelId(this.modelKey, "openrouter") ??
+        (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
+      if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
+      const openRouterModel = this.createOpenRouterModel(forSubmit);
+      const derived = modelConfig.batchModelId === undefined;
+      warn(
+        `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
+          derived
+            ? ` (assuming OpenRouter serves "${modelConfig.id}:batch"; the catalog entry has no batchModelId — regenerate it with workflow-engine-sync)`
+            : ""
+        }; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
+      );
+      return openRouterModel;
     }
-  }
-
-  private backendInjected = false;
-
-  /**
-   * A batch that was submitted elsewhere (a poll or collect after a
-   * suspend/resume, or in another process) must be read through the
-   * transport that created it, which the stored refs name — not through
-   * whatever the live registry resolves for the model key today. A
-   * `batchProvider` change between submit and poll would otherwise strand
-   * the run with "belongs to unknown provider".
-   */
-  private adoptProviderFromRefs(metadata?: Record<string, unknown>): void {
-    // An injected backend is authoritative (tests, adapters).
-    if (this.backendInjected) return;
-    const rawRefs = metadata?.batchRefs;
-    if (!Array.isArray(rawRefs) || rawRefs.length === 0) return;
-    const first = rawRefs[0];
-    const providerId =
-      typeof first === "object" && first !== null
-        ? (first as { provider?: unknown }).provider
-        : undefined;
-    if (typeof providerId !== "string") return;
-    const provider = batchProviderFromRefProvider(providerId);
-    if (provider === undefined || provider === this.provider) return;
-    this.provider = provider;
-    this.providerPromise = undefined;
-  }
-
-  /**
-   * Lazy memoized backend resolution. Never runs in the constructor.
-   */
-  private async provider$(forSubmit = false): Promise<EngineBatchModel> {
-    return (this.providerPromise ??= (async () => {
-      if (
-        this.provider === "google" ||
-        this.provider === "anthropic" ||
-        this.provider === "openai"
-      ) {
-        const nativeModelId = resolveModelForProvider(
-          this.modelKey,
-          this.provider,
-        );
-        const warn = (message: string) => {
-          if (this.batchLogFn) this.batchLogFn("WARN", message);
-          else logger.warn(message);
-        };
-        try {
-          return await resolveAiSdkBatchModel(this.provider, nativeModelId, {
-            apiKey: this.options?.apiKey,
-            baseURL: this.options?.baseURL,
-            fetch: this.options?.fetch,
-            onWarning: warn,
-          });
-        } catch (error) {
-          // The vendor SDK is an optional peer, and a release can expose
-          // neither batch seam the engine drives. In either case, when
-          // OpenRouter can batch the model (a ":batch" catalog row), use the
-          // transport the consumer already has a key for rather than failing
-          // the submit. A batch already submitted natively is not affected:
-          // its ref names the native provider and is refused below rather
-          // than polled on OpenRouter.
-          const missingSdk =
-            error instanceof Error &&
-            /Package ".*" is required/.test(error.message);
-          const noBatchSeam = isNotBatchCapableError(error);
-          // A catalog generated before `batchModelId` existed names no
-          // ":batch" sibling; derive it the way the sync CLI does
-          // (`<id>:batch`) rather than failing on the install instruction.
-          // OpenRouter answers "does not have a :batch endpoint" (explained
-          // at submit) when the derived row is not live.
-          const modelConfig = getModel(this.modelKey);
-          const viaOpenRouter =
-            getProviderModelId(this.modelKey, "openrouter") ??
-            (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
-          if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
-          const openRouterModel = this.createOpenRouterModel(forSubmit);
-          const derived = modelConfig.batchModelId === undefined;
-          warn(
-            `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
-              derived
-                ? ` (assuming OpenRouter serves "${modelConfig.id}:batch"; the catalog entry has no batchModelId — regenerate it with workflow-engine-sync)`
-                : ""
-            }; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
-          );
-          this.provider = "openrouter";
-          return openRouterModel;
-        }
-      }
-
-      if (this.provider === "openrouter") {
-        return this.createOpenRouterModel(forSubmit);
-      }
-
-      const _exhaustive: never = this.provider;
-      throw new Error(`Unsupported batch provider "${_exhaustive}".`);
-    })());
   }
 
   private createOpenRouterModel(forSubmit: boolean): EngineBatchModel {
@@ -322,13 +250,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     });
   }
 
-  private resolveRefs(
+  private storedRefs(
     batchId: string,
     metadata?: Record<string, unknown>,
-    batchModel?: EngineBatchModel,
-  ): EngineBatchRef[] {
-    let targetRefs: EngineBatchRef[] = [];
-
+  ): EngineBatchRef[] | undefined {
     if (
       metadata &&
       "batchRefs" in metadata &&
@@ -345,35 +270,44 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           `Invalid metadata.batchRefs: batchRefs array cannot be empty`,
         );
       }
-      for (const item of rawBatchRefs) {
+      return rawBatchRefs.map((item) => {
         const parsed = EngineBatchRefSchema.safeParse(item);
         if (!parsed.success) {
           throw new Error(
             `Corrupted batch ref in metadata.batchRefs: ${parsed.error.message}`,
           );
         }
-        if (batchModel && parsed.data.provider !== batchModel.provider) {
-          throw new Error(
-            `Batch ref provider "${parsed.data.provider}" does not match model provider "${batchModel.provider}"`,
-          );
-        }
-        targetRefs.push(parsed.data);
-      }
-      return targetRefs;
+        return parsed.data;
+      });
     }
 
-    const inMemoryRefs = this.refsByBatch.get(batchId);
-    if (inMemoryRefs && inMemoryRefs.length > 0) {
-      if (batchModel) {
-        for (const ref of inMemoryRefs) {
-          if (ref.provider !== batchModel.provider) {
-            throw new Error(
-              `Batch ref provider "${ref.provider}" does not match model provider "${batchModel.provider}"`,
-            );
-          }
+    return this.refsByBatch.get(batchId);
+  }
+
+  /** Stored refs select the transport for this operation alone. */
+  private async resolveBatch(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ) {
+    const refs = this.storedRefs(batchId, metadata);
+    const first = refs?.[0];
+    const batchModel =
+      this.backend ??
+      (first
+        ? await resolveBatchModelForRef(first, this.options)
+        : await this.resolveDefaultModel());
+    const provider =
+      batchProviderFromRefProvider(batchModel.provider) ??
+      this.configuredProvider;
+    if (refs?.length) {
+      for (const ref of refs) {
+        if (ref.provider !== batchModel.provider) {
+          throw new Error(
+            `Batch ref provider "${ref.provider}" does not match model provider "${batchModel.provider}"`,
+          );
         }
       }
-      return inMemoryRefs;
+      return { batchModel, refs, provider };
     }
 
     // Legacy / single-batch fallback: synthesize one ref from the batch id.
@@ -400,10 +334,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       version: 1,
       type: "text",
       id: batchId,
-      provider: batchModel?.provider ?? this.provider,
-      modelId: batchModel?.modelId ?? getModel(this.modelKey).id,
+      provider: batchModel.provider,
+      modelId: batchModel.modelId,
     };
-    return [ref];
+    return { batchModel, refs: [ref], provider };
   }
 
   async submit(
@@ -430,7 +364,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         version: 1,
         type: "text",
         id: emptyBatchId,
-        provider: this.provider,
+        provider: this.configuredProvider,
         modelId: modelConfig.id,
       };
       this.schemasByBatch.set(emptyBatchId, new Map());
@@ -440,7 +374,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return {
         id: emptyBatchId,
         status: "completed",
-        provider: this.provider,
+        provider: this.configuredProvider,
         refs: [ref],
         batchIds: [emptyBatchId],
         requestCounts: { total: 0, completed: 0, failed: 0 },
@@ -449,13 +383,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     const policy = this.ctx.routing?.provider;
-    const batchModel = await this.provider$(true);
-    if (this.provider !== "openrouter")
-      assertDirectProviderPolicy(this.provider, policy);
+    if (this.backend) assertAdapterProviderPolicy(policy);
+    const batchModel = await this.resolveDefaultModel(true);
+    const provider =
+      batchProviderFromRefProvider(batchModel.provider) ??
+      this.configuredProvider;
+    // Refuse a disallowed submission before recovery or request construction.
+    if (provider !== "openrouter") assertDirectProviderPolicy(provider, policy);
     const modelConfig = getModel(this.modelKey);
 
     logger.debug(`batch submit request`, {
-      provider: this.provider,
+      provider,
       model: this.modelKey,
       requestCount: requests.length,
       requestIds: requests.slice(0, 10).map((r) => r.id),
@@ -540,7 +478,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       batchModel.recovery !== "metadata" &&
       existing.length < partitions.length
     ) {
-      throw new BatchNotAdoptableError(this.provider, externalKey);
+      throw new BatchNotAdoptableError(provider, externalKey);
     }
     for (let i = existing.length; i < partitions.length; i++) {
       const partition = partitions[i]!;
@@ -565,7 +503,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             !excluded.includes(adopted.id)
           ) {
             logger.debug(`adopted batch created before the worker crashed`, {
-              provider: this.provider,
+              provider,
               batchId: adopted.id,
               externalKey: partitionKey,
             });
@@ -581,6 +519,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         }
         const res = await batchModel.start(partition.engineRequests, {
           abortSignal: this.options?.abortSignal,
+          ...(provider !== "openrouter" &&
+            policy !== undefined && { providerPolicy: policy }),
           ...(partitionKey !== undefined ? { externalKey: partitionKey } : {}),
         });
         const ref: EngineBatchRef = {
@@ -637,7 +577,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     this.submittedAtByBatch.set(primaryBatchId, Date.now());
 
     logger.debug(`batch submitted`, {
-      provider: this.provider,
+      provider,
       batchId: primaryBatchId,
       batchIds,
       requestCount: requests.length,
@@ -647,7 +587,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     return {
       id: primaryBatchId,
       status: "pending",
-      provider: this.provider,
+      provider,
       refs,
       batchIds,
       requestCounts: {
@@ -673,14 +613,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           version: 1,
           type: "text",
           id: batchId,
-          provider: this.provider,
+          provider: this.configuredProvider,
           modelId: getModel(this.modelKey).id,
         },
       ];
       return {
         id: batchId,
         status: "completed",
-        provider: this.provider,
+        provider: this.configuredProvider,
         refs,
         batchIds: refs.map((r) => r.id),
         requestCounts: { total: 0, completed: 0, failed: 0 },
@@ -688,9 +628,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       };
     }
 
-    this.adoptProviderFromRefs(metadata);
-    const batchModel = await this.provider$();
-    const refs = this.resolveRefs(batchId, metadata, batchModel);
+    const { batchModel, refs, provider } = await this.resolveBatch(
+      batchId,
+      metadata,
+    );
 
     const statuses = await Promise.all(
       refs.map((ref) =>
@@ -758,7 +699,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     return {
       id: batchId,
       status: aggregatedStatus,
-      provider: this.provider,
+      provider,
       refs,
       batchIds: refs.map((r) => r.id),
       requestCounts: hasCounts
@@ -770,7 +711,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   }
 
   async canAdopt(): Promise<boolean> {
-    return typeof (await this.provider$()).adopt === "function";
+    return typeof (await this.resolveDefaultModel()).adopt === "function";
   }
 
   async cancel(
@@ -784,9 +725,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return [];
     }
 
-    this.adoptProviderFromRefs(metadata);
-    const batchModel = await this.provider$();
-    const refs = this.resolveRefs(batchId, metadata, batchModel);
+    const { batchModel, refs } = await this.resolveBatch(batchId, metadata);
     const cancel = batchModel.cancel?.bind(batchModel);
     if (!cancel) {
       return refs.map((ref) => ({ ref, outcome: "unsupported" as const }));
@@ -833,9 +772,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return emptyResults;
     }
 
-    this.adoptProviderFromRefs(metadata);
-    const batchModel = await this.provider$();
-    const targetRefs = this.resolveRefs(batchId, metadata, batchModel);
+    const {
+      batchModel,
+      refs: targetRefs,
+      provider,
+    } = await this.resolveBatch(batchId, metadata);
 
     const expectedTotal =
       (typeof metadata?.totalRequests === "number"
@@ -986,7 +927,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             // pairs; restore the original shape before validating — see
             // schema-portability.ts.
             const candidate =
-              this.provider === "openai" || this.provider === "openrouter"
+              provider === "openai" || provider === "openrouter"
                 ? restorePortableValue(parsedJson, z.toJSONSchema(schema))
                 : parsedJson;
             validation = schema.safeParse(candidate);
@@ -1103,7 +1044,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     // Auto-record results
-    await this.recordResults(batchId, results, { batchDurationMs: durationMs });
+    await this.recordResults(batchId, results, {
+      batchDurationMs: durationMs,
+      provider,
+    });
 
     return results;
   }
@@ -1118,7 +1062,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   async recordResults(
     batchId: string,
     results: AIBatchResult<T>[],
-    extra: { batchDurationMs?: number } = {},
+    extra: { batchDurationMs?: number; provider?: AIBatchProvider } = {},
   ): Promise<void> {
     if (this.recordedBatchIds.has(batchId)) {
       logger.debug(`Batch ${batchId} already recorded, skipping.`);
@@ -1139,6 +1083,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         }
 
         const modelConfig = getModel(this.modelKey);
+        const provider =
+          extra.provider ??
+          batchProviderFromRefProvider(
+            this.refsByBatch.get(batchId)?.[0]?.provider ?? "",
+          ) ??
+          this.configuredProvider;
 
         await this.ctx.aiCallLogger.logBatchResults(
           batchId,
@@ -1148,7 +1098,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               r.inputTokens,
               r.outputTokens,
               true,
-              this.provider,
+              provider,
             );
             // A transport that bills per request (OpenRouter) is the
             // authority on that request's cost; otherwise the batch rate.
