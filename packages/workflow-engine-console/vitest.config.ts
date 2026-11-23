@@ -15,5 +15,10 @@ export default defineConfig({
       "@bratsos/workflow-engine": path.join(coreSrc, "index.ts"),
     },
   },
-  test: { globals: false },
+  test: {
+    globals: false,
+    // Vitest on Bun drops zod's named `z` export (it reads `export default z`
+    // as CJS interop); inlining zod avoids that. Nothing changes under Node.
+    server: { deps: { inline: process.versions.bun ? ["zod"] : [] } },
+  },
 });

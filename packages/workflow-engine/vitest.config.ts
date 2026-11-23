@@ -11,4 +11,10 @@ import { defineConfig } from "vitest/config";
  * presence stops that upward search, so `pnpm test` here keeps running
  * only this package's suite, exactly as before.
  */
-export default defineConfig({});
+export default defineConfig({
+  test: {
+    // Vitest on Bun drops zod's named `z` export (it reads `export default z`
+    // as CJS interop); inlining zod avoids that. Nothing changes under Node.
+    server: { deps: { inline: process.versions.bun ? ["zod"] : [] } },
+  },
+});
