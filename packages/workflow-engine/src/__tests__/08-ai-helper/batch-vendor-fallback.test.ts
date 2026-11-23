@@ -5,23 +5,26 @@
  * failing the submit.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createAIHelper } from "../../ai/ai-helper.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createAIHelper,
+  type OpenRouterRoutingOptions,
+} from "../../ai/ai-helper.js";
 import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 const resolveError = vi.hoisted(() => ({
-  next: (): Error =>
+  next: (vendor: string): Error =>
     new Error(
-      'Package "@ai-sdk/anthropic" is required to use vendor "anthropic". Please install @ai-sdk/anthropic.',
+      `Package "@ai-sdk/${vendor}" is required to use vendor "${vendor}". Please install @ai-sdk/${vendor}.`,
     ),
 }));
 
 vi.mock("../../ai/batch/ai-sdk.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../ai/batch/ai-sdk.js")>()),
-  resolveAiSdkBatchModel: async () => {
-    throw resolveError.next();
+  resolveAiSdkBatchModel: async (vendor: string) => {
+    throw resolveError.next(vendor);
   },
 }));
 
@@ -47,11 +50,215 @@ registerModels({
 });
 
 describe("vendor batch SDK missing", () => {
+  const openRouterKey = "test-openrouter-environment";
+  const nativeKey = "test-native-option";
+  const openRouterBatches = "https://openrouter.ai/api/v1/batches";
+  const nativeClients = [
+    ["openai", "fallback-nano-no-batch-id", "https://api.openai.com/v1"],
+    ["anthropic", "fallback-haiku", "https://api.anthropic.com/v1"],
+  ] as const;
+
+  beforeEach(() => {
+    vi.stubEnv("OPENROUTER_API_KEY", openRouterKey);
+    vi.stubEnv("OPENAI_API_KEY", "test-openai-environment");
+    vi.stubEnv("ANTHROPIC_API_KEY", "test-anthropic-environment");
+  });
+
   afterEach(() => {
-    resolveError.next = () =>
+    vi.unstubAllEnvs();
+    resolveError.next = (vendor) =>
       new Error(
-        'Package "@ai-sdk/anthropic" is required to use vendor "anthropic". Please install @ai-sdk/anthropic.',
+        `Package "@ai-sdk/${vendor}" is required to use vendor "${vendor}". Please install @ai-sdk/${vendor}.`,
       );
+  });
+
+  function helperWithPolicy(provider?: OpenRouterRoutingOptions["provider"]) {
+    return createAIHelper(
+      "batch-options",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      {
+        routing: { provider },
+      },
+    );
+  }
+
+  describe.each(
+    nativeClients,
+  )("%s transport options", (vendor, modelKey, nativeUrl) => {
+    const requests = [{ id: "order-1", prompt: "Classify the order." }];
+    const policy = { only: ["azure"], allowFallbacks: false };
+    const explicitOptions = [
+      ["baseURL", { baseURL: nativeUrl }],
+      ["apiKey", { apiKey: nativeKey }],
+      ["baseURL and apiKey", { baseURL: nativeUrl, apiKey: nativeKey }],
+    ] as const;
+
+    it.each(
+      explicitOptions,
+    )("refuses fallback with explicit %s, with or without a policy", async (_setting, options) => {
+      const fetchFn = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () =>
+          Response.json(
+            { id: "batch-1", status: "validating" },
+            { status: 202 },
+          ),
+        );
+      for (const constraint of [policy, undefined]) {
+        await expect(
+          helperWithPolicy(constraint)
+            .batch(modelKey, vendor, {
+              ...options,
+              fetch: fetchFn,
+            })
+            .submit(requests),
+        ).rejects.toThrow(/configure.*OpenRouter.*explicitly/i);
+      }
+      expect(fetchFn).not.toHaveBeenCalled();
+    });
+
+    it("uses the OpenRouter destination and environment credential for fallback", async () => {
+      const fetchFn = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          Response.json(
+            { id: "batch-1", status: "validating" },
+            { status: 202 },
+          ),
+        );
+      const batch = helperWithPolicy(policy).batch(modelKey, vendor, {
+        fetch: fetchFn,
+      });
+      await expect(batch.submit(requests)).resolves.toMatchObject({
+        provider: "openrouter",
+      });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchFn.mock.calls[0]!;
+      expect(String(url)).toBe(openRouterBatches);
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        `Bearer ${openRouterKey}`,
+      );
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        provider: { only: ["azure"], allow_fallbacks: false },
+        requests: [
+          {
+            custom_id: "order-1",
+            body: { messages: [{ content: requests[0]!.prompt }] },
+          },
+        ],
+      });
+    });
+
+    it.each(
+      explicitOptions,
+    )("uses saved OpenRouter credentials and destination across %s overrides", async (_setting, options) => {
+      const fetchFn = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (_url, init) =>
+          init?.method === "POST"
+            ? Response.json(
+                { id: "batch-saved", status: "validating" },
+                { status: 202 },
+              )
+            : Response.json({
+                id: "batch-saved",
+                status: "completed",
+                request_counts: { total: 1, completed: 1 },
+                results: [
+                  {
+                    custom_id: "order-1",
+                    response: {
+                      status_code: 200,
+                      body: { choices: [{ message: { content: "Approved" } }] },
+                    },
+                  },
+                ],
+              }),
+        );
+      const ai = helperWithPolicy(policy);
+      const saved = await ai
+        .batch(modelKey, "openrouter", { fetch: fetchFn })
+        .submit(requests);
+      const metadata = JSON.parse(JSON.stringify({ batchRefs: saved.refs }));
+      fetchFn.mockClear();
+      const batch = ai.batch(modelKey, vendor, { ...options, fetch: fetchFn });
+
+      const [status, items, cancellation] = await Promise.all([
+        batch.getStatus(saved.id, metadata),
+        batch.getResults(saved.id, metadata),
+        batch.cancel!(saved.id, metadata),
+      ]);
+      expect(status).toMatchObject({
+        status: "completed",
+        provider: "openrouter",
+      });
+      expect(items).toMatchObject([{ id: "order-1", result: "Approved" }]);
+      expect(cancellation).toMatchObject([{ outcome: "unsupported" }]);
+      expect(
+        fetchFn.mock.calls.map(([url, init]) => ({
+          url: String(url),
+          method: init?.method,
+          credential: new Headers(init?.headers).get("authorization"),
+          body: init?.body,
+        })),
+      ).toEqual(
+        Array.from({ length: 2 }, () => ({
+          url: `${openRouterBatches}/${saved.id}`,
+          method: "GET",
+          credential: `Bearer ${openRouterKey}`,
+          body: undefined,
+        })),
+      );
+    });
+  });
+
+  it("honours explicit OpenRouter options for its submissions and saved refs", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ id: "batch-1", status: "validating" }, { status: 202 }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ id: "batch-1", status: "in_progress" }),
+      );
+    const batch = helperWithPolicy({ only: ["azure"] }).batch(
+      "fallback-haiku",
+      "openrouter",
+      {
+        apiKey: "test-openrouter-option",
+        baseURL: "https://router.example.test/api/v1",
+        fetch: fetchFn,
+      },
+    );
+    const saved = await batch.submit([
+      { id: "order-1", prompt: "Classify the order." },
+    ]);
+    await expect(
+      batch.getStatus(saved.id, { batchRefs: saved.refs }),
+    ).resolves.toMatchObject({
+      status: "processing",
+      provider: "openrouter",
+    });
+    expect(
+      fetchFn.mock.calls.map(([url, init]) => [
+        String(url),
+        init?.method,
+        new Headers(init?.headers).get("authorization"),
+      ]),
+    ).toEqual([
+      [
+        "https://router.example.test/api/v1/batches",
+        "POST",
+        "Bearer test-openrouter-option",
+      ],
+      [
+        "https://router.example.test/api/v1/batches/batch-1",
+        "GET",
+        "Bearer test-openrouter-option",
+      ],
+    ]);
   });
 
   it("submits through OpenRouter and warns", async () => {
@@ -73,7 +280,7 @@ describe("vendor batch SDK missing", () => {
       "fallback-haiku",
       "anthropic",
       (level, message) => logs.push(`${level}: ${message}`),
-      { apiKey: "sk-or-test", fetch: fetchFn as never },
+      { fetch: fetchFn },
     );
 
     const handle = await batch.submit([{ id: "r1", prompt: "hello" }]);
@@ -107,7 +314,7 @@ describe("vendor batch SDK missing", () => {
       "fallback-nano-no-batch-id",
       "openai",
       (level, message) => logs.push(`${level}: ${message}`),
-      { apiKey: "sk-or-test", fetch: fetchFn as never },
+      { fetch: fetchFn },
     );
 
     const handle = await batch.submit([{ id: "r1", prompt: "hello" }]);
@@ -142,7 +349,7 @@ describe("vendor batch SDK missing", () => {
       "fallback-haiku",
       "anthropic",
       (level, message) => logs.push(`${level}: ${message}`),
-      { apiKey: "sk-or-test", fetch: fetchFn as never },
+      { fetch: fetchFn },
     );
 
     const handle = await batch.submit([{ id: "r1", prompt: "hello" }]);
@@ -196,7 +403,6 @@ describe("vendor batch SDK missing", () => {
     await expect(
       ai
         .batch("fallback-haiku", "anthropic", {
-          apiKey: "test",
           fetch: fetchFn,
         })
         .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),
@@ -236,7 +442,6 @@ describe("vendor batch SDK missing", () => {
     await expect(
       ai
         .batch("fallback-haiku", "anthropic", {
-          apiKey: "test",
           fetch: fetchFn,
         })
         .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),
@@ -273,7 +478,6 @@ describe("vendor batch SDK missing", () => {
     await expect(
       ai
         .batch("fallback-haiku", "anthropic", {
-          apiKey: "test",
           fetch: fetchFn,
         })
         .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),

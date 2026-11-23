@@ -10,8 +10,9 @@ import { createOpenRouterBatchModel } from "./openrouter";
 /**
  * The built-in transport for a stored batch ref, for a process that did not
  * create the batch (`run.cancel` is the caller). The ref names the provider
- * and the native model id; the credentials come from `options` or, as for any
- * AI SDK provider, the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+ * and the native model id. Pass only options that belong to that provider.
+ * Without explicit options, the resolver uses the provider's default URL and
+ * environment credentials (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
  * `GOOGLE_GENERATIVE_AI_API_KEY` / `GEMINI_API_KEY`, `OPENROUTER_API_KEY`).
  *
  * Throws when no built-in transport serves the ref's provider, when the vendor

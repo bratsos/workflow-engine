@@ -14,7 +14,8 @@
  *   https://openrouter.ai/docs/projects/docs/batch-quickstart
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAIHelper } from "../../ai/ai-helper.js";
 import {
   createOpenRouterBatchModel,
   type EngineBatchModel,
@@ -28,6 +29,7 @@ import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 interface Seen {
   method: string;
+  host: string;
   path: string;
   headers: Headers;
 }
@@ -45,6 +47,7 @@ function fakeProvider(opts: {
     const method = (init?.method ?? "GET").toUpperCase();
     seen.push({
       method,
+      host: url.host,
       path: decodeURIComponent(url.pathname),
       headers: new Headers(init?.headers),
     });
@@ -168,12 +171,57 @@ const vendors: Vendor[] = [
 ];
 
 describe.each(vendors)("$vendor batch cancel", (v) => {
+  afterEach(() => vi.unstubAllEnvs());
+
   async function modelFor(provider: ReturnType<typeof fakeProvider>) {
     return resolveAiSdkBatchModel(v.vendor, v.modelId, {
       apiKey: "sk-test",
       fetch: provider.fetchFn as never,
     });
   }
+
+  it("uses the saved provider's destination and credentials on cross-provider cancellation", async () => {
+    const [key, host, credential] = (
+      {
+        openai: [
+          "OPENAI_API_KEY",
+          "api.openai.com",
+          "Bearer test-native-environment",
+        ],
+        anthropic: [
+          "ANTHROPIC_API_KEY",
+          "api.anthropic.com",
+          "test-native-environment",
+        ],
+        google: [
+          "GOOGLE_GENERATIVE_AI_API_KEY",
+          "generativelanguage.googleapis.com",
+          "test-native-environment",
+        ],
+      } as const
+    )[v.vendor];
+    vi.stubEnv(key, "test-native-environment");
+    const provider = fakeProvider({
+      current: () => v.body(v.active),
+      cancelBody: v.cancelBody,
+    });
+    const batch = createAIHelper(
+      "batch-cancel",
+      new InMemoryAICallLogger(),
+    ).batch("cancel-test-model", "openrouter", {
+      baseURL: "https://router.example.test/api/v1",
+      apiKey: "test-router-option",
+      fetch: provider.fetchFn,
+    });
+    await expect(
+      batch.cancel!(v.ref.id, { batchRefs: [v.ref] }),
+    ).resolves.toEqual([{ ref: v.ref, outcome: "cancelled" }]);
+    expect(provider.seen.map((call) => call.host)).toEqual([host, host]);
+    expect(
+      provider.seen.map((call) => call.headers.get(v.authHeader[0])),
+    ).toEqual([credential, credential]);
+    expect(provider.calls()[1]).toBe(v.cancelCall);
+  });
 
   it("reads the batch, then sends the documented cancel call", async () => {
     const provider = fakeProvider({

@@ -83,7 +83,7 @@ flowchart TD
     repair --> results
 ```
 
-`auto` uses batch when there are at least `auto.batchAbove` items, the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. The provider resolves in this order: `batch.provider` on the call, the model's `batchProvider` registry field, the native vendor (the entry's `provider` when it is `"google"`, `"anthropic"` or `"openai"`, else the vendor named by the slug), then OpenRouter. Register `batchProvider: "openrouter"` on a model you call through OpenRouter to batch it there. When a vendor SDK is not installed, or its release exposes no batch interface the engine can drive, and OpenRouter can batch the model, the helper falls back to OpenRouter with a WARN.
+`auto` uses batch when there are at least `auto.batchAbove` items, the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. The provider resolves in this order: `batch.provider` on the call, the model's `batchProvider` registry field, the native vendor (the entry's `provider` when it is `"google"`, `"anthropic"` or `"openai"`, else the vendor named by the slug), then OpenRouter. Register `batchProvider: "openrouter"` on a model you call through OpenRouter to batch it there. When the native SDK is unavailable or lacks a batch interface and OpenRouter can batch the model, automatic fallback requires a native client with neither `apiKey` nor `baseURL` set.
 
 Once a batch is submitted, its polls and collect go through the transport recorded in the stored refs, whatever the registry resolves later.
 
@@ -206,7 +206,7 @@ A repeated `run.cancel` does the same: it takes the row over, repeats the cancel
 
 The native transports work with every release of the vendor packages. Earlier releases put the batch methods on the language model (`experimental_doStartBatch` and siblings); `@ai-sdk/google` 4.0.65 and the current `@ai-sdk/openai` / `@ai-sdk/anthropic` moved them to the provider (`provider.experimental_batch()`). The engine drives whichever the installed release exposes. The HTTP requests are the same either way, so crash recovery and Google's schema substitution behave identically, and a batch submitted before a vendor upgrade is polled and collected after it.
 
-When a native transport can't be used, the helper falls back to the OpenRouter transport with a WARN, provided OpenRouter can batch the model. That happens when the vendor package is not installed (`@ai-sdk/anthropic` and `@ai-sdk/openai` are optional peers), or when its release exposes neither batch interface (`NotBatchCapableError`). A batch already submitted natively is never polled on OpenRouter; it fails with a provider-mismatch error instead.
+If the native SDK is absent or exposes neither batch interface (`NotBatchCapableError`), the helper can fall back to OpenRouter with a WARN when OpenRouter supports the model. Automatic fallback uses the default OpenRouter URL and `OPENROUTER_API_KEY`. A native client's explicit `baseURL` or `apiKey` causes fallback to fail before any request is sent. Set `batch.provider: "openrouter"` or use `ai.batch(modelKey, "openrouter", options)` to configure OpenRouter explicitly.
 
 > **Pricing:** Batch pricing is per-model (`batchInputCostPerMillion` / `batchOutputCostPerMillion` in the registry, or the OpenRouter `:batch` catalog row), not a flat 50% discount. Exactly one adjustment is applied — the batch discount never compounds with a cache discount — so on a Google batch that hits the implicit cache the flat figure *overstates* cost for the cached tokens, and OpenRouter does not discount non-token components at all.
 
@@ -225,7 +225,7 @@ batch: {
 }
 ```
 
-`apiKey`, `baseURL` and `fetch` are honoured by every vendor transport.
+`apiKey` and `baseURL` apply to the configured provider. If `batchRefs` name a different provider, `getStatus()`, `getResults()` and `cancel()` use that provider's default URL and read its credential from the environment. To use a custom URL or an injected key for a saved batch, create a client configured for the provider named by the ref. The injected `fetch` applies across transports.
 
 ### OpenRouter Batch Transport Caveats
 

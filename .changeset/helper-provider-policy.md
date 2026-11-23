@@ -8,6 +8,8 @@ Regional endpoints remain in the merged ranking when a matching variant is allow
 
 New batch submissions enforce the policy on the transport that builds each request. A concurrent poll of a saved batch follows that batch's stored refs, and new handles identify the transport that submitted them.
 
+Batch credentials and base URLs apply to the configured provider. Automatic fallback to OpenRouter requires provider defaults. Use an explicit OpenRouter client when supplying its URL or key. A saved batch on another provider uses that provider's default URL and environment credential.
+
 Multi-step call rows store the distinct serving providers in `servedBy` and the ordered provider for each step in `metadata.servedBySteps`, including steps the SDK reported before a call failed. Calls keep their billable usage and cost if reading structured output fails or a stream callback throws.
 
 Rolling-safe. The policy is opt-in and provider attribution uses the existing call-log fields.
