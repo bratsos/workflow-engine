@@ -20,17 +20,25 @@ export async function handleJobHeartbeat(
 ): Promise<HandlerResult<JobHeartbeatResult>> {
   // The touch is a no-op on a row that is not RUNNING; the row read below
   // is what reports that.
-  await deps.jobTransport.touchJob(command.jobId);
+  const fence =
+    command.startedAt && command.attempt !== undefined
+      ? { startedAt: command.startedAt, attempt: command.attempt }
+      : undefined;
+  await deps.jobTransport.touchJob(command.jobId, command.leaseMs, fence);
 
   const [runStatus, jobs] = await Promise.all([
     deps.persistence.getRunStatus(command.workflowRunId),
-    deps.jobTransport.getJobsByWorkflowRun(command.workflowRunId),
+    deps.jobTransport.getJobsByWorkflowRun(command.workflowRunId, {
+      includePayload: false,
+    }),
   ]);
   const job = jobs.find((row) => row.id === command.jobId);
   const leaseHeld =
     job !== undefined &&
     job.status === "RUNNING" &&
-    (command.attempt === undefined || job.attempt === command.attempt);
+    (command.attempt === undefined || job.attempt === command.attempt) &&
+    (command.startedAt === undefined ||
+      job.startedAt?.getTime() === command.startedAt.getTime());
 
   return { runStatus, leaseHeld, _events: [] };
 }

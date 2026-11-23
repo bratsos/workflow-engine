@@ -78,6 +78,7 @@ type DequeuedJobRow = {
   attempt: number;
   maxAttempts: number;
   retryPolicy: JobRetryBackoff | null;
+  leaseTimeoutMs: number | null;
   payload: unknown;
   startedAt: Date;
 };
@@ -91,6 +92,7 @@ const DEQUEUED_JOB_COLUMNS: RawColumns = {
   attempt: "int",
   maxAttempts: "int",
   retryPolicy: "json",
+  leaseTimeoutMs: "int",
   payload: "json",
   startedAt: "timestamp",
 };
@@ -227,6 +229,9 @@ export class PrismaJobQueue implements JobQueue {
       ...(job.retryPolicy !== undefined
         ? { retryPolicy: job.retryPolicy }
         : {}),
+      ...(job.leaseTimeoutMs !== undefined
+        ? { leaseTimeoutMs: job.leaseTimeoutMs }
+        : {}),
     };
   }
 
@@ -340,13 +345,14 @@ export class PrismaJobQueue implements JobQueue {
    */
   async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      const claim = () => this.dequeueSqlite(0, options?.serves);
+      const claim = () =>
+        this.dequeueSqlite(0, options?.serves, options?.leaseTimeoutMs);
       const turn = sqliteClaims.get(this.prisma);
       const claimed = turn ? turn.then(claim, claim) : claim();
       sqliteClaims.set(this.prisma, claimed);
       return claimed;
     }
-    return this.dequeuePostgres(options?.serves);
+    return this.dequeuePostgres(options?.serves, options?.leaseTimeoutMs);
   }
 
   /**
@@ -403,9 +409,10 @@ export class PrismaJobQueue implements JobQueue {
    */
   private async dequeuePostgres(
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
   ): Promise<DequeueResult | null> {
     for (let i = 0; i < MAX_DEQUEUE_ATTEMPTS; i++) {
-      const job = await this.dequeuePostgresOnce(serves);
+      const job = await this.dequeuePostgresOnce(serves, hostLeaseMs);
       if (job !== "dead") return job;
     }
     return null;
@@ -414,6 +421,7 @@ export class PrismaJobQueue implements JobQueue {
   /** One claim; `"dead"` when the claimed row was failed as unexecutable. */
   private async dequeuePostgresOnce(
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
   ): Promise<DequeueResult | null | "dead"> {
     const {
       active: servesActive,
@@ -485,6 +493,8 @@ export class PrismaJobQueue implements JobQueue {
           "workerId" = ${this.workerId},
           "lockedAt" = (now() AT TIME ZONE 'UTC'),
           "startedAt" = (now() AT TIME ZONE 'UTC'),
+          "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "leaseTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT j.id
@@ -522,7 +532,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE OF j SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
       `
         : await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
             DequeuedJobRow[]
@@ -533,6 +543,8 @@ export class PrismaJobQueue implements JobQueue {
           "workerId" = ${this.workerId},
           "lockedAt" = (now() AT TIME ZONE 'UTC'),
           "startedAt" = (now() AT TIME ZONE 'UTC'),
+          "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "leaseTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
@@ -566,7 +578,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -600,6 +612,7 @@ export class PrismaJobQueue implements JobQueue {
             lastError: error,
             workerId: null,
             lockedAt: null,
+            leaseExpiresAt: null,
           },
         });
         return "dead";
@@ -619,6 +632,7 @@ export class PrismaJobQueue implements JobQueue {
         ],
       );
 
+      const leaseMs = job.leaseTimeoutMs ?? hostLeaseMs;
       const payload = job.payload as Record<string, unknown>;
       const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
@@ -631,6 +645,14 @@ export class PrismaJobQueue implements JobQueue {
         maxAttempts: job.maxAttempts,
         ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
         payload: rest,
+        ...(leaseMs !== undefined
+          ? {
+              leaseMs,
+              ...(job.leaseTimeoutMs == null
+                ? { usesHostLease: true as const }
+                : {}),
+            }
+          : {}),
         startedAt: job.startedAt,
       };
     } catch (error) {
@@ -653,6 +675,7 @@ export class PrismaJobQueue implements JobQueue {
   private async dequeueSqlite(
     attempt = 0,
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
   ): Promise<DequeueResult | null> {
     try {
       if (attempt >= MAX_DEQUEUE_ATTEMPTS) {
@@ -705,6 +728,10 @@ export class PrismaJobQueue implements JobQueue {
           workerId: this.workerId,
           lockedAt: now,
           startedAt: now,
+          leaseExpiresAt:
+            job.leaseTimeoutMs == null
+              ? null
+              : new Date(now.getTime() + job.leaseTimeoutMs),
           attempt: { increment: 1 },
         },
       });
@@ -712,7 +739,7 @@ export class PrismaJobQueue implements JobQueue {
       if (result.count === 0) {
         // Another worker claimed it, retry (bounded to avoid unbounded
         // recursion under heavy contention)
-        return this.dequeueSqlite(attempt + 1, serves);
+        return this.dequeueSqlite(attempt + 1, serves, hostLeaseMs);
       }
 
       // Fetch the updated job to get the new attempt count
@@ -738,6 +765,7 @@ export class PrismaJobQueue implements JobQueue {
         ],
       );
 
+      const leaseMs = claimedJob.leaseTimeoutMs ?? hostLeaseMs;
       const claimedPayload = claimedJob.payload as Record<string, unknown>;
       const {
         _workflowId: claimedWfId,
@@ -757,6 +785,14 @@ export class PrismaJobQueue implements JobQueue {
           ? { retryPolicy: claimedJob.retryPolicy }
           : {}),
         payload: claimedRest,
+        ...(leaseMs !== undefined
+          ? {
+              leaseMs,
+              ...(claimedJob.leaseTimeoutMs == null
+                ? { usesHostLease: true as const }
+                : {}),
+            }
+          : {}),
         startedAt: now,
       };
     } catch (error) {
@@ -834,6 +870,7 @@ export class PrismaJobQueue implements JobQueue {
           nextPollAt,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
         },
       });
       return this.ackOutcome(jobId, result.count, "suspend");
@@ -845,6 +882,7 @@ export class PrismaJobQueue implements JobQueue {
         nextPollAt,
         workerId: null,
         lockedAt: null,
+        leaseExpiresAt: null,
       },
     });
     logger.debug("Job suspended", { jobId, nextPollAt }, () => [
@@ -870,6 +908,7 @@ export class PrismaJobQueue implements JobQueue {
       nextPollAt,
       workerId: null,
       lockedAt: null,
+      leaseExpiresAt: null,
       lastError: reason,
       attempt: { decrement: 1 },
     };
@@ -914,6 +953,7 @@ export class PrismaJobQueue implements JobQueue {
             lastError: error,
             workerId: null,
             lockedAt: null,
+            leaseExpiresAt: null,
             nextPollAt: nextPollAt,
           },
         });
@@ -927,6 +967,7 @@ export class PrismaJobQueue implements JobQueue {
           lastError: error,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
           nextPollAt: nextPollAt,
         },
       });
@@ -1046,6 +1087,12 @@ export class PrismaJobQueue implements JobQueue {
         priority: job.priority,
         workerId: job.workerId,
         lockedAt: job.lockedAt,
+        ...(job.leaseTimeoutMs != null
+          ? { leaseTimeoutMs: job.leaseTimeoutMs }
+          : {}),
+        ...(job.leaseExpiresAt != null
+          ? { leaseExpiresAt: job.leaseExpiresAt }
+          : {}),
         startedAt: job.startedAt,
         completedAt: job.completedAt,
         attempt: job.attempt,
@@ -1078,7 +1125,11 @@ export class PrismaJobQueue implements JobQueue {
   /**
    * Refresh a running job's lease without changing status.
    */
-  async touchJob(jobId: string): Promise<void> {
+  async touchJob(
+    jobId: string,
+    leaseMs?: number,
+    fence?: JobAckFence,
+  ): Promise<void> {
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // Renew the lease from the database clock: a heartbeat written from
       // the application clock while the sweeper reads the database clock
@@ -1086,14 +1137,28 @@ export class PrismaJobQueue implements JobQueue {
       await rawFor(this.prisma, {}).$queryRaw!`
         UPDATE "job_queue"
         SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
+            "leaseExpiresAt" = CASE WHEN ${leaseMs ?? null}::integer IS NULL
+              THEN "leaseExpiresAt"
+              ELSE (now() AT TIME ZONE 'UTC') + ${leaseMs ?? null}::integer * interval '1 millisecond'
+            END,
             "updatedAt" = (now() AT TIME ZONE 'UTC')
         WHERE id = ${jobId} AND status = 'RUNNING'
+          AND ((${fence?.startedAt.toISOString() ?? null}::timestamptz AT TIME ZONE 'UTC') IS NULL
+            OR ("startedAt" = (${fence?.startedAt.toISOString() ?? null}::timestamptz AT TIME ZONE 'UTC') AND attempt = ${fence?.attempt ?? null}::integer))
       `;
       return;
     }
+    const now = new Date();
     await this.prisma.jobQueue.updateMany({
-      where: { id: jobId, status: this.enums.status("RUNNING") },
-      data: { lockedAt: new Date() },
+      where: fence
+        ? this.fenceWhere(jobId, fence)
+        : { id: jobId, status: this.enums.status("RUNNING") },
+      data: {
+        lockedAt: now,
+        ...(leaseMs !== undefined
+          ? { leaseExpiresAt: new Date(now.getTime() + leaseMs) }
+          : {}),
+      },
     });
   }
 
@@ -1113,7 +1178,7 @@ export class PrismaJobQueue implements JobQueue {
    * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
-    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
+    const reason = `${LEASE_HEARTBEAT_LOST}: lease expired without a heartbeat; released for another worker`;
 
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
@@ -1127,13 +1192,14 @@ export class PrismaJobQueue implements JobQueue {
           status = 'PENDING',
           "workerId" = NULL,
           "lockedAt" = NULL,
+          "leaseExpiresAt" = NULL,
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
           "lastError" = ${reason}
         WHERE status = 'RUNNING'
-          AND "lockedAt" IS NOT NULL
-          AND "lockedAt" <
+          AND ("leaseExpiresAt" < (now() AT TIME ZONE 'UTC')
+            OR ("leaseExpiresAt" IS NULL AND "lockedAt" <
               (now() AT TIME ZONE 'UTC')
-              - ${staleThresholdMs}::double precision * interval '1 millisecond'
+              - ${staleThresholdMs}::double precision * interval '1 millisecond'))
         RETURNING id
       `;
       if (released.length > 0) {
@@ -1144,17 +1210,22 @@ export class PrismaJobQueue implements JobQueue {
       return released.length;
     }
 
-    const thresholdDate = new Date(Date.now() - staleThresholdMs);
+    const now = new Date();
+    const thresholdDate = new Date(now.getTime() - staleThresholdMs);
 
     const result = await this.prisma.jobQueue.updateMany({
       where: {
         status: this.enums.status("RUNNING"),
-        lockedAt: { lt: thresholdDate },
+        OR: [
+          { leaseExpiresAt: { lt: now } },
+          { leaseExpiresAt: null, lockedAt: { lt: thresholdDate } },
+        ],
       },
       data: {
         status: this.enums.status("PENDING"),
         workerId: null,
         lockedAt: null,
+        leaseExpiresAt: null,
         lastError: reason,
       },
     });

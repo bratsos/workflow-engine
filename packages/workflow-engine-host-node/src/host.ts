@@ -657,9 +657,10 @@ class NodeHostImpl implements NodeHost {
       this.jobWakePending = false;
       try {
         const serves = this.dequeueServes();
-        const job = await this.jobTransport.dequeue(
-          serves !== undefined ? { serves } : undefined,
-        );
+        const job = await this.jobTransport.dequeue({
+          serves,
+          leaseTimeoutMs: this.staleLeaseThresholdMs,
+        });
         if (!this.isCurrent(lifecycle)) {
           // The dequeue counted an attempt. Give it back instead of leaving
           // the job RUNNING for the reaper, which keeps the attempt.

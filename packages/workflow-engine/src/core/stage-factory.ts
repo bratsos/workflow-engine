@@ -448,7 +448,7 @@ function buildStage<
     description: definition.description,
     mode: isAsyncBatch ? "async-batch" : "sync",
     dependencies: definition.dependencies,
-    ...jobRuntimeSchema.parse({ jobRetry: definition.jobRetry }),
+    ...jobRuntimeSchema.parse(definition),
 
     inputSchema: inputSchema as any,
     outputSchema: definition.schemas.output,

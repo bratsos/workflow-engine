@@ -397,6 +397,8 @@ export interface JobRecord {
   attempt: number;
   maxAttempts: number;
   retryPolicy?: JobRetryBackoff | null;
+  leaseTimeoutMs?: number | null;
+  leaseExpiresAt?: Date | null;
   lastError: string | null;
   nextPollAt: Date | null;
   payload: Record<string, unknown>;
@@ -641,6 +643,7 @@ export interface EnqueueJobInput {
   priority?: number;
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
+  leaseTimeoutMs?: number;
   maxAttempts?: number;
   retryPolicy?: JobRetryBackoff;
   /**
@@ -669,6 +672,10 @@ export interface DequeueResult {
   attempt: number;
   maxAttempts: number;
   retryPolicy?: JobRetryBackoff;
+  /** Effective lease duration for the claim. */
+  leaseMs?: number;
+  /** This claim uses the host’s existing lease and heartbeat settings. */
+  usesHostLease?: true;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp this claim wrote to `startedAt`. Hand it back as a
@@ -688,6 +695,8 @@ export interface DequeueOptions {
    * version-ghost deferral is the backstop.
    */
   serves?: readonly ServedDefinition[];
+  /** Host fallback when the job has no lease override. */
+  leaseTimeoutMs?: number;
 }
 
 /**
@@ -1460,7 +1469,7 @@ export interface JobQueue {
    * Called periodically by hosts while a long-running stage executes so
    * `releaseStaleJobs` doesn't duplicate work still in-flight.
    */
-  touchJob(jobId: string): Promise<void>;
+  touchJob(jobId: string, leaseMs?: number, fence?: JobAckFence): Promise<void>;
 
   /**
    * Optional. Jobs in each active status and the creation time of the oldest

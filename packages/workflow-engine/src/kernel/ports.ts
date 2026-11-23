@@ -462,7 +462,7 @@ export interface JobTransport {
   ): Promise<JobRecord[]>;
 
   /** Refresh a running job's lease without changing status. */
-  touchJob(jobId: string): Promise<void>;
+  touchJob(jobId: string, leaseMs?: number, fence?: JobAckFence): Promise<void>;
 
   /**
    * Optional. Jobs in each active status and the creation time of the oldest

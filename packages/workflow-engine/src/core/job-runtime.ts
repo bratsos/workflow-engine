@@ -19,11 +19,14 @@ export type JobRetry = z.infer<typeof jobRetrySchema>;
 
 export const jobRuntimeSchema = z.object({
   jobRetry: jobRetrySchema.optional(),
+  leaseTimeoutMs: positiveInt32.optional(),
 });
 
 export interface JobRuntimeOptions {
   /** Job delivery and suspended-poll retry policy. */
   jobRetry?: JobRetry;
+  /** Duration of one job lease in milliseconds. */
+  leaseTimeoutMs?: number;
 }
 
 /** Delay after a failed attempt, starting at attempt one. */

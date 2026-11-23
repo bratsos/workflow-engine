@@ -181,6 +181,10 @@ export class Workflow<
     return this.options?.jobRetry;
   }
 
+  get leaseTimeoutMs() {
+    return this.options?.leaseTimeoutMs;
+  }
+
   private cachedSnapshot?: DefinitionSnapshot;
   private cachedVersion?: string;
 

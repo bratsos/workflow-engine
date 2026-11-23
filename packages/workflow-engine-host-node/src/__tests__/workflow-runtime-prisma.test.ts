@@ -178,5 +178,52 @@ describe.skipIf(!realDatabase)(
         .toBe("FAILED");
       expect(polls).toBe(2);
     });
+
+    it("recovers a crashed claim on its stage lease and heartbeats the new claim", async () => {
+      const gate = Promise.withResolvers<void>();
+      const workflow = defineWorkflow("lease", {
+        input: schemas.input,
+        leaseTimeoutMs: 60_000,
+      })
+        .stage("work", {
+          schemas,
+          leaseTimeoutMs: 900,
+          async execute() {
+            await gate.promise;
+            return { output: {} };
+          },
+        })
+        .build();
+      const { host, kernel, jobTransport } = makeHost([workflow], db.client, {
+        jobHeartbeatIntervalMs: 60_000,
+      });
+      const id = await createRun(kernel, workflow.id);
+      await kernel.dispatch({ type: "run.claimPending", workerId: "crashed" });
+      const crashed = await jobTransport.dequeue();
+      expect(crashed).toMatchObject({ workflowRunId: id, leaseMs: 900 });
+      const original = await jobOf(id);
+      expect(
+        original.leaseExpiresAt.getTime() - original.lockedAt.getTime(),
+      ).toBe(900);
+      try {
+        await host.start();
+        await expect
+          .poll(() => jobOf(id), poll)
+          .toMatchObject({ attempt: 2, status: "RUNNING" });
+        const newClaim = await jobOf(id);
+        await expect
+          .poll(async () => (await jobOf(id)).leaseExpiresAt.getTime(), poll)
+          .toBeGreaterThan(newClaim.leaseExpiresAt.getTime());
+        const renewed = await jobOf(id);
+        expect(
+          renewed.leaseExpiresAt.getTime() - renewed.lockedAt.getTime(),
+        ).toBe(900);
+      } finally {
+        gate.resolve();
+      }
+      await expect
+        .poll(async () => (await db.persistence.getRun(id))?.status, poll)
+        .toBe("COMPLETED");
+    });
   },
 );

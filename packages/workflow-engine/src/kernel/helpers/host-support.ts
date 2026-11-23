@@ -14,6 +14,7 @@ import { z } from "zod";
 import {
   type JobRetryBackoff,
   jobRetryBackoffSchema,
+  positiveInt32,
   retryBackoffMs,
 } from "../../core/job-runtime.js";
 import { parseStepDuration, StageAbortedError } from "../../core/steps.js";
@@ -150,6 +151,8 @@ export interface HostJobMessage {
   attempt: number;
   maxAttempts?: number;
   retryPolicy?: JobRetryBackoff;
+  leaseMs?: number;
+  usesHostLease?: true;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp from `DequeueResult`, forwarded as the acknowledgement
@@ -224,6 +227,8 @@ const JobMessageSchema = z.object({
   attempt: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().optional(),
   retryPolicy: jobRetryBackoffSchema.optional(),
+  leaseMs: positiveInt32.optional(),
+  usesHostLease: z.literal(true).optional(),
   payload: z.record(z.string(), z.unknown()),
   startedAt: z.date().optional(),
 });
@@ -306,6 +311,7 @@ export async function executeJobWithHeartbeat(
   // or a lease it no longer holds, aborts `ctx.abortSignal` with the
   // reason — otherwise a long body runs to completion and only its outcome
   // write is rejected.
+  const leaseMs = job.usesHostLease ? undefined : job.leaseMs;
   const abort = new AbortController();
   const beat = async (): Promise<void> => {
     const status = await kernel.dispatch({
@@ -313,6 +319,8 @@ export async function executeJobWithHeartbeat(
       jobId: job.jobId,
       workflowRunId: job.workflowRunId,
       attempt: job.attempt,
+      startedAt: job.startedAt,
+      leaseMs,
     });
     if (abort.signal.aborted) return;
     if (status.runStatus === "CANCELLED") {
@@ -323,7 +331,7 @@ export async function executeJobWithHeartbeat(
   };
   const heartbeat = setInterval(
     () => void beat().catch(() => {}),
-    jobHeartbeatIntervalMs,
+    Math.min(jobHeartbeatIntervalMs, (leaseMs ?? Infinity) / 3),
   );
 
   let result;

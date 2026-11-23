@@ -752,7 +752,8 @@ export function createSpillingJobTransport(
       transport.releaseStaleJobs(staleThresholdMs),
     cancelByRun: (workflowRunId: string) =>
       transport.cancelByRun(workflowRunId),
-    touchJob: (jobId: string) => transport.touchJob(jobId),
+    touchJob: (jobId, leaseMs, fence) =>
+      transport.touchJob(jobId, leaseMs, fence),
     // Both optional methods are forwarded only when the wrapped transport
     // has them, so wrapping never claims a capability the inner transport
     // lacks — and never hides one it has.

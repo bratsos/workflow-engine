@@ -198,6 +198,7 @@ export class InMemoryJobQueue implements JobQueue {
       startedAt: null,
       completedAt: null,
       attempt: 0,
+      leaseTimeoutMs: options.leaseTimeoutMs,
       maxAttempts: options.maxAttempts ?? this.defaultMaxAttempts,
       ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {}),
       lastError: null,
@@ -325,6 +326,7 @@ export class InMemoryJobQueue implements JobQueue {
     const job = candidates[0]!;
 
     // Lock the job and increment attempt (matches Prisma dequeue semantics)
+    const leaseMs = job.leaseTimeoutMs ?? options?.leaseTimeoutMs;
     const newAttempt = job.attempt + 1;
     const updated: JobRecord = {
       ...job,
@@ -334,6 +336,10 @@ export class InMemoryJobQueue implements JobQueue {
       startedAt: now,
       updatedAt: now,
       attempt: newAttempt,
+      leaseExpiresAt:
+        job.leaseTimeoutMs == null
+          ? null
+          : new Date(now.getTime() + job.leaseTimeoutMs),
     };
     this.jobs.set(job.id, updated);
 
@@ -348,6 +354,14 @@ export class InMemoryJobQueue implements JobQueue {
       maxAttempts: job.maxAttempts,
       ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
       payload,
+      ...(leaseMs !== undefined
+        ? {
+            leaseMs,
+            ...(job.leaseTimeoutMs == null
+              ? { usesHostLease: true as const }
+              : {}),
+          }
+        : {}),
       startedAt: now,
     };
   }
@@ -538,8 +552,9 @@ export class InMemoryJobQueue implements JobQueue {
     for (const job of this.jobs.values()) {
       if (
         job.status === "RUNNING" &&
-        job.lockedAt &&
-        job.lockedAt < threshold
+        (job.leaseExpiresAt
+          ? job.leaseExpiresAt < now
+          : job.lockedAt && job.lockedAt < threshold)
       ) {
         // Release the stale lock
         const updated: JobRecord = {
@@ -548,6 +563,7 @@ export class InMemoryJobQueue implements JobQueue {
           lastError: reason,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
           updatedAt: now,
         };
         this.jobs.set(job.id, updated);
@@ -616,13 +632,27 @@ export class InMemoryJobQueue implements JobQueue {
       });
   }
 
-  async touchJob(jobId: string): Promise<void> {
+  async touchJob(
+    jobId: string,
+    leaseMs?: number,
+    fence?: JobAckFence,
+  ): Promise<void> {
     const job = this.jobs.get(jobId);
-    if (!job || job.status !== "RUNNING") return;
+    if (
+      !job ||
+      job.status !== "RUNNING" ||
+      (fence &&
+        (job.attempt !== fence.attempt ||
+          job.startedAt?.getTime() !== fence.startedAt.getTime()))
+    )
+      return;
     const now = this.now();
     this.jobs.set(jobId, {
       ...job,
       lockedAt: now,
+      ...(leaseMs !== undefined
+        ? { leaseExpiresAt: new Date(now.getTime() + leaseMs) }
+        : {}),
       updatedAt: now,
     });
   }

@@ -141,6 +141,9 @@ export interface JobMessage {
   attempt: number;
   maxAttempts?: number;
   retryPolicy?: JobRetryBackoff;
+  leaseMs?: number;
+  usesHostLease?: true;
+  startedAt?: Date;
   payload: Record<string, unknown>;
 }
 
@@ -390,9 +393,10 @@ class ServerlessHostImpl implements ServerlessHost {
 
     while (processed < maxJobs) {
       const serves = this.dequeueServes();
-      const job = await this.jobTransport.dequeue(
-        serves !== undefined ? { serves } : undefined,
-      );
+      const job = await this.jobTransport.dequeue({
+        serves,
+        leaseTimeoutMs: this.staleLeaseThresholdMs,
+      });
       if (!job) break;
 
       // Storage was checked above. A second check here could throw after the

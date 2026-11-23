@@ -378,6 +378,8 @@ export interface JobHeartbeatCommand {
    * RUNNING: another worker re-claimed it after a stale-lease release.
    */
   readonly attempt?: number;
+  readonly startedAt?: Date;
+  readonly leaseMs?: number;
 }
 
 /** Result of a `job.heartbeat` command. */
