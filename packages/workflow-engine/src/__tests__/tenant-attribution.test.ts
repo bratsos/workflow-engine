@@ -567,6 +567,54 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ).toMatchObject({ status: "COMPLETED" });
   });
 
+  it("stamps the stage's run on rows written through ctx.aiLogger that name another run, so purging the run erases them", async () => {
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await ctx.aiLogger.logCall({
+          ...manual,
+          modelId: manual.modelKey,
+          topic: "direct",
+          workflowRunId: "other-run",
+        });
+        const library = createAIHelper(
+          "library",
+          ctx.aiLogger,
+          undefined,
+          undefined,
+          { attribution: { workflowRunId: "other-run" } },
+        );
+        library.recordCall(manual);
+        await library.flush();
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: { aiLogger: db.aiLogger, ai: createAIHelper },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(
+      (await db.client.aICall.findMany()).map(
+        (row: CreateAICallInput) => row.workflowRunId,
+      ),
+    ).toEqual([workflowRunId, workflowRunId]);
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
+    expect(
+      await kernel.dispatch({
+        type: "run.purge",
+        workflowRunIds: [workflowRunId],
+      }),
+    ).toMatchObject({ removed: { runs: 1, aiCalls: 2 } });
+    expect(await db.client.aICall.count()).toBe(0);
+  });
+
   it("erases every row a run's stage helpers wrote when the run is purged", async () => {
     const model = everyPathModel();
     const stage = defineStage({

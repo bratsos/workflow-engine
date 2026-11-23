@@ -181,10 +181,10 @@ inherits the parent's TTL when omitted. The default stores full text without
 expiry. `store: "none"` leaves the prompt and response empty and drops stream
 instructions from the accounting row. Each helper applies its own attribution
 and text policy to the rows it builds, including a helper given
-`ctx.aiLogger`. The stage logger fills only what a row lacks: the run ID, the
-run's tenant, and the run's labels under the row's own. Direct
+`ctx.aiLogger`. The stage logger sets the run ID on every row and fills only
+the run's tenant and labels a row lacks, under the row's own. Direct
 `ctx.aiLogger.logCall` and `logBatchResults` writes are stored as given, with
-those run fields filled, as in earlier releases.
+those run fields, as in earlier releases.
 A full-text TTL sets `textExpiresAt` on the row so
 `engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
 requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to

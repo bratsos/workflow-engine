@@ -48,13 +48,13 @@ export function defineLazyAIContext<T extends object>(
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
-  // Rows keep the text policy and attribution of whatever built them. The
-  // stage fills only what they lack: its run, so erasing the run finds them,
-  // the run's tenant, and the run's labels under the row's own. Every other
-  // member is the configured logger's own, bound to it.
+  // Rows keep the text policy and attribution of whatever built them. Every
+  // row names this run, so erasing the run finds it; the stage fills only the
+  // tenant and labels a row lacks, under the row's own. Every other member is
+  // the configured logger's own, bound to it.
   const stamp = (call: CreateAICallInput): CreateAICallInput => ({
     ...call,
-    workflowRunId: call.workflowRunId ?? params.workflowRunId,
+    workflowRunId: params.workflowRunId,
     tenantId: call.tenantId ?? params.tenantId,
     labels:
       params.labels || call.labels
