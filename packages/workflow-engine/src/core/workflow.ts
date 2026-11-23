@@ -185,6 +185,10 @@ export class Workflow<
     return this.options?.leaseTimeoutMs;
   }
 
+  get absoluteTimeoutMs() {
+    return this.options?.absoluteTimeoutMs;
+  }
+
   private cachedSnapshot?: DefinitionSnapshot;
   private cachedVersion?: string;
 

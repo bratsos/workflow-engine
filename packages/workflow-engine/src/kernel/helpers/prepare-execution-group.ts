@@ -70,13 +70,17 @@ export interface PrepareExecutionGroupOptions {
 export function stageJobOptions(
   workflow?: JobRuntimeOptions,
   stage?: JobRuntimeOptions,
-): Pick<EnqueueJobInput, "maxAttempts" | "retryPolicy" | "leaseTimeoutMs"> {
+): Pick<
+  EnqueueJobInput,
+  "maxAttempts" | "retryPolicy" | "leaseTimeoutMs" | "absoluteTimeoutMs"
+> {
   const retry = stage?.jobRetry ?? workflow?.jobRetry;
   return {
     ...(retry
       ? { maxAttempts: retry.maxAttempts, retryPolicy: retry.backoff }
       : {}),
     leaseTimeoutMs: stage?.leaseTimeoutMs ?? workflow?.leaseTimeoutMs,
+    absoluteTimeoutMs: stage?.absoluteTimeoutMs ?? workflow?.absoluteTimeoutMs,
   };
 }
 

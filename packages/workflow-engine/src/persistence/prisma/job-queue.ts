@@ -232,6 +232,9 @@ export class PrismaJobQueue implements JobQueue {
       ...(job.leaseTimeoutMs !== undefined
         ? { leaseTimeoutMs: job.leaseTimeoutMs }
         : {}),
+      ...(job.absoluteTimeoutMs !== undefined
+        ? { absoluteTimeoutMs: job.absoluteTimeoutMs }
+        : {}),
     };
   }
 
@@ -495,6 +498,8 @@ export class PrismaJobQueue implements JobQueue {
           "startedAt" = (now() AT TIME ZONE 'UTC'),
           "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
             + "leaseTimeoutMs" * interval '1 millisecond',
+          "absoluteExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "absoluteTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT j.id
@@ -545,6 +550,8 @@ export class PrismaJobQueue implements JobQueue {
           "startedAt" = (now() AT TIME ZONE 'UTC'),
           "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
             + "leaseTimeoutMs" * interval '1 millisecond',
+          "absoluteExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "absoluteTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
@@ -613,6 +620,7 @@ export class PrismaJobQueue implements JobQueue {
             workerId: null,
             lockedAt: null,
             leaseExpiresAt: null,
+            absoluteExpiresAt: null,
           },
         });
         return "dead";
@@ -732,6 +740,10 @@ export class PrismaJobQueue implements JobQueue {
             job.leaseTimeoutMs == null
               ? null
               : new Date(now.getTime() + job.leaseTimeoutMs),
+          absoluteExpiresAt:
+            job.absoluteTimeoutMs == null
+              ? null
+              : new Date(now.getTime() + job.absoluteTimeoutMs),
           attempt: { increment: 1 },
         },
       });
@@ -871,6 +883,7 @@ export class PrismaJobQueue implements JobQueue {
           workerId: null,
           lockedAt: null,
           leaseExpiresAt: null,
+          absoluteExpiresAt: null,
         },
       });
       return this.ackOutcome(jobId, result.count, "suspend");
@@ -883,6 +896,7 @@ export class PrismaJobQueue implements JobQueue {
         workerId: null,
         lockedAt: null,
         leaseExpiresAt: null,
+        absoluteExpiresAt: null,
       },
     });
     logger.debug("Job suspended", { jobId, nextPollAt }, () => [
@@ -909,6 +923,7 @@ export class PrismaJobQueue implements JobQueue {
       workerId: null,
       lockedAt: null,
       leaseExpiresAt: null,
+      absoluteExpiresAt: null,
       lastError: reason,
       attempt: { decrement: 1 },
     };
@@ -954,6 +969,7 @@ export class PrismaJobQueue implements JobQueue {
             workerId: null,
             lockedAt: null,
             leaseExpiresAt: null,
+            absoluteExpiresAt: null,
             nextPollAt: nextPollAt,
           },
         });
@@ -968,6 +984,7 @@ export class PrismaJobQueue implements JobQueue {
           workerId: null,
           lockedAt: null,
           leaseExpiresAt: null,
+          absoluteExpiresAt: null,
           nextPollAt: nextPollAt,
         },
       });
@@ -1093,6 +1110,12 @@ export class PrismaJobQueue implements JobQueue {
         ...(job.leaseExpiresAt != null
           ? { leaseExpiresAt: job.leaseExpiresAt }
           : {}),
+        ...(job.absoluteTimeoutMs != null
+          ? { absoluteTimeoutMs: job.absoluteTimeoutMs }
+          : {}),
+        ...(job.absoluteExpiresAt != null
+          ? { absoluteExpiresAt: job.absoluteExpiresAt }
+          : {}),
         startedAt: job.startedAt,
         completedAt: job.completedAt,
         attempt: job.attempt,
@@ -1193,6 +1216,7 @@ export class PrismaJobQueue implements JobQueue {
           "workerId" = NULL,
           "lockedAt" = NULL,
           "leaseExpiresAt" = NULL,
+          "absoluteExpiresAt" = NULL,
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
           "lastError" = ${reason}
         WHERE status = 'RUNNING'
@@ -1226,6 +1250,7 @@ export class PrismaJobQueue implements JobQueue {
         workerId: null,
         lockedAt: null,
         leaseExpiresAt: null,
+        absoluteExpiresAt: null,
         lastError: reason,
       },
     });
@@ -1258,7 +1283,7 @@ export class PrismaJobQueue implements JobQueue {
    * `run.reapStuck` on its next pass.
    */
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
-    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+    const reason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
 
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
@@ -1274,25 +1299,29 @@ export class PrismaJobQueue implements JobQueue {
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
           "lastError" = ${reason}
         WHERE status = 'RUNNING'
-          AND "startedAt" IS NOT NULL
-          AND "startedAt" <
+          AND ("absoluteExpiresAt" < (now() AT TIME ZONE 'UTC')
+            OR ("absoluteExpiresAt" IS NULL AND "startedAt" <
               (now() AT TIME ZONE 'UTC')
-              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'
+              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'))
         RETURNING id
       `;
       if (expired.length > 0) {
         logger.warn(
-          `Expired ${expired.length} runaway job(s) past the ${absoluteTimeoutMs}ms absolute lease cap`,
+          `Expired ${expired.length} runaway job(s) past their absolute lease deadlines`,
         );
       }
       return expired.length;
     }
 
-    const cutoff = new Date(this.now().getTime() - absoluteTimeoutMs);
+    const now = this.now();
+    const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
     const result = await this.prisma.jobQueue.updateMany({
       where: {
         status: this.enums.status("RUNNING"),
-        startedAt: { not: null, lt: cutoff },
+        OR: [
+          { absoluteExpiresAt: { lt: now } },
+          { absoluteExpiresAt: null, startedAt: { lt: cutoff } },
+        ],
       },
       data: {
         status: this.enums.status("FAILED"),

@@ -20,6 +20,7 @@ export type JobRetry = z.infer<typeof jobRetrySchema>;
 export const jobRuntimeSchema = z.object({
   jobRetry: jobRetrySchema.optional(),
   leaseTimeoutMs: positiveInt32.optional(),
+  absoluteTimeoutMs: positiveInt32.optional(),
 });
 
 export interface JobRuntimeOptions {
@@ -27,6 +28,8 @@ export interface JobRuntimeOptions {
   jobRetry?: JobRetry;
   /** Duration of one job lease in milliseconds. */
   leaseTimeoutMs?: number;
+  /** Absolute duration cap of one claimed job attempt in milliseconds. */
+  absoluteTimeoutMs?: number;
 }
 
 /** Delay after a failed attempt, starting at attempt one. */

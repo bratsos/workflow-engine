@@ -399,6 +399,8 @@ export interface JobRecord {
   retryPolicy?: JobRetryBackoff | null;
   leaseTimeoutMs?: number | null;
   leaseExpiresAt?: Date | null;
+  absoluteTimeoutMs?: number | null;
+  absoluteExpiresAt?: Date | null;
   lastError: string | null;
   nextPollAt: Date | null;
   payload: Record<string, unknown>;
@@ -644,6 +646,7 @@ export interface EnqueueJobInput {
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
   leaseTimeoutMs?: number;
+  absoluteTimeoutMs?: number;
   maxAttempts?: number;
   retryPolicy?: JobRetryBackoff;
   /**
@@ -1438,7 +1441,8 @@ export interface JobQueue {
 
   /**
    * Fail every RUNNING job whose claim (`startedAt`, stamped once and never
-   * refreshed) is older than `absoluteTimeoutMs`, stamping `lastError` with
+   * refreshed) is past its recorded deadline or, without one, older than
+   * `absoluteTimeoutMs`, stamping `lastError` with
    * the `LEASE_ABSOLUTE_CAP` prefix; returns how many. The coarse tier of a
    * two-tier expiry: `releaseStaleJobs` is the fine-grained heartbeat
    * signal and is defeated by a worker that is alive but wedged, because

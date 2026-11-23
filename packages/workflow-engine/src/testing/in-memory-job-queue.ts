@@ -199,6 +199,7 @@ export class InMemoryJobQueue implements JobQueue {
       completedAt: null,
       attempt: 0,
       leaseTimeoutMs: options.leaseTimeoutMs,
+      absoluteTimeoutMs: options.absoluteTimeoutMs,
       maxAttempts: options.maxAttempts ?? this.defaultMaxAttempts,
       ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {}),
       lastError: null,
@@ -340,6 +341,10 @@ export class InMemoryJobQueue implements JobQueue {
         job.leaseTimeoutMs == null
           ? null
           : new Date(now.getTime() + job.leaseTimeoutMs),
+      absoluteExpiresAt:
+        job.absoluteTimeoutMs == null
+          ? null
+          : new Date(now.getTime() + job.absoluteTimeoutMs),
     };
     this.jobs.set(job.id, updated);
 
@@ -564,6 +569,7 @@ export class InMemoryJobQueue implements JobQueue {
           workerId: null,
           lockedAt: null,
           leaseExpiresAt: null,
+          absoluteExpiresAt: null,
           updatedAt: now,
         };
         this.jobs.set(job.id, updated);
@@ -582,14 +588,15 @@ export class InMemoryJobQueue implements JobQueue {
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
     const now = this.now();
     const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
-    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+    const reason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
     let expired = 0;
 
     for (const job of this.jobs.values()) {
       if (
         job.status === "RUNNING" &&
-        job.startedAt !== null &&
-        job.startedAt < cutoff
+        (job.absoluteExpiresAt
+          ? job.absoluteExpiresAt < now
+          : job.startedAt !== null && job.startedAt < cutoff)
       ) {
         const updated: JobRecord = {
           ...job,

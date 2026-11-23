@@ -231,6 +231,7 @@ describe.skipIf(!realDatabase)(
       const workflow = defineWorkflow("stuck", {
         input: schemas.input,
         leaseTimeoutMs: 120_000,
+        absoluteTimeoutMs: 90_000,
         jobRetry: { maxAttempts: 7, backoff: { initialDelayMs: 42 } },
       })
         .stage("work", {
@@ -273,6 +274,7 @@ describe.skipIf(!realDatabase)(
           maxAttempts: 7,
           retryPolicy: { initialDelayMs: 42 },
           leaseTimeoutMs: 120_000,
+          absoluteTimeoutMs: 90_000,
         });
         await host.start();
         await expect
@@ -287,6 +289,41 @@ describe.skipIf(!realDatabase)(
         expect(
           await db.client.workflowRun.count({ where: { status: "RUNNING" } }),
         ).toBe(3);
+      } finally {
+        gate.resolve();
+      }
+    });
+
+    it("expires a heartbeating claim at its absolute deadline", async () => {
+      const gate = Promise.withResolvers<void>();
+      const workflow = defineWorkflow("absolute", {
+        input: schemas.input,
+        absoluteTimeoutMs: 550,
+        leaseTimeoutMs: 60_000,
+      })
+        .stage("work", {
+          schemas,
+          async execute() {
+            await gate.promise;
+            return { output: {} };
+          },
+        })
+        .build();
+      const { host, kernel } = makeHost([workflow], db.client, {
+        jobHeartbeatIntervalMs: 50,
+      });
+      const id = await createRun(kernel, workflow.id);
+      try {
+        await host.start();
+        await expect
+          .poll(() => jobOf(id), poll)
+          .toMatchObject({ status: "FAILED", attempt: 1 });
+        const job = await jobOf(id);
+        expect(job.lastError).toMatch(/^LEASE_ABSOLUTE_CAP/);
+        expect(job.absoluteExpiresAt.getTime() - job.startedAt.getTime()).toBe(
+          550,
+        );
+        expect(job.lockedAt.getTime()).toBeGreaterThan(job.startedAt.getTime());
       } finally {
         gate.resolve();
       }

@@ -140,7 +140,7 @@ describe("PrismaJobQueue lease statements", () => {
     // (see utc-timestamps.ts).
     expect(sql).not.toMatch(/now\(\)(?! AT TIME ZONE 'UTC')/i);
     // Both claim stamps, both deadlines and the nextPollAt comparison.
-    expect(sql.match(/now\(\) AT TIME ZONE 'UTC'/g)).toHaveLength(4);
+    expect(sql.match(/now\(\) AT TIME ZONE 'UTC'/g)).toHaveLength(5);
     // Nothing time-shaped is bound any more: the lease has one clock, and
     // it is the database's, so two hosts cannot disagree about when a
     // lease expires. The attempt stamp comes back out through RETURNING.
