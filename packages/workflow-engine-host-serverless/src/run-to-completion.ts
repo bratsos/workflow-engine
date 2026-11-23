@@ -217,6 +217,7 @@ export async function runToCompletion(
   while (claimed && jobsProcessed < maxJobs) {
     const job = await jobTransport.dequeue({
       leaseTimeoutMs: HOST_DEFAULTS.staleLeaseThresholdMs,
+      workflowLimits: kernel.workflowJobLimits?.(),
     });
     if (!job) {
       reason = `no runnable job remained (${jobsProcessed} executed)`;

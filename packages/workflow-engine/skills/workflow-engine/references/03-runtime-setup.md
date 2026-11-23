@@ -476,6 +476,10 @@ The job loop now pauses for a uniform draw over `[0, postJobYieldMs)` after a **
 - **`postJobYieldMs: 0`** disables it: lowest latency for a single-worker deployment, and multi-worker deployments go back to pinning each run to one worker.
 - Suspended/async-batch stages are unaffected — they resume through `stage.pollSuspended` on the orchestration tick, which any worker may run.
 
+## Job slots and timeouts
+
+Node hosts accept `concurrency` (default 1) for independent execution slots. The Prisma queue honors workflow `maxConcurrent` across Node and serverless hosts that claim from the same queue. The hosts obtain limits from their enumerable workflow registry and pass them to dequeue. A workflow or stage lease override caps the heartbeat interval at one third of the lease. A stuck-run sweep preserves runs with pending jobs or live leases. See [job runtime options](02-workflow-builder.md#job-runtime-options).
+
 ## Process diagnostics
 
 Import `setLogger` from `@bratsos/workflow-engine/kernel` and call `setLogger({ debug, info, warn, error })` during startup. Each method receives `(message: string, fields?: Record<string, unknown>)`. Fields can include `workflowRunId`, `stageId`, and `jobId`. The kernel, hosts, standalone AI helpers and Prisma adapters in the process use that sink. Configure a sink in each worker or process.

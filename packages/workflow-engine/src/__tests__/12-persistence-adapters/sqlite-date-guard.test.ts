@@ -408,6 +408,8 @@ const SYNC_QUEUE = [
   "getWorkerId",
   "servesParams",
   "servesPayload",
+  "sqliteClaimResult",
+  "sqliteClaimTimestamps",
   "transactionReads",
 ];
 

@@ -292,12 +292,28 @@ export class InMemoryJobQueue implements JobQueue {
       return seqA - seqB;
     };
 
+    const limits = new Map(
+      options?.workflowLimits?.map((limit) => [
+        limit.workflowId,
+        limit.maxConcurrent,
+      ]),
+    );
+    if (limits.size) {
+      for (const job of this.jobs.values()) {
+        const remaining = limits.get(job.workflowId);
+        if (remaining !== undefined && job.status === "RUNNING") {
+          limits.set(job.workflowId, remaining - 1);
+        }
+      }
+    }
+
     const pendingJobs = Array.from(this.jobs.values())
       .filter(
         (j) =>
           j.status === "PENDING" &&
           (j.nextPollAt === null || j.nextPollAt <= now) &&
-          canServe(j),
+          canServe(j) &&
+          (limits.get(j.workflowId) ?? Infinity) > 0,
       )
       .sort(comparator);
 

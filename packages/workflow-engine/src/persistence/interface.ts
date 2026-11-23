@@ -677,7 +677,7 @@ export interface DequeueResult {
   retryPolicy?: JobRetryBackoff;
   /** Effective lease duration for the claim. */
   leaseMs?: number;
-  /** This claim uses the host’s existing lease and heartbeat settings. */
+  /** This claim uses the host's existing lease and heartbeat settings. */
   usesHostLease?: true;
   payload: Record<string, unknown>;
   /**
@@ -686,6 +686,11 @@ export interface DequeueResult {
    * only lands if this attempt is still the current one.
    */
   startedAt: Date;
+}
+
+export interface WorkflowJobLimit {
+  readonly workflowId: string;
+  readonly maxConcurrent: number;
 }
 
 export interface DequeueOptions {
@@ -698,6 +703,8 @@ export interface DequeueOptions {
    * version-ghost deferral is the backstop.
    */
   serves?: readonly ServedDefinition[];
+  /** Caps on RUNNING jobs across hosts serving these workflows. */
+  workflowLimits?: readonly WorkflowJobLimit[];
   /** Host fallback when the job has no lease override. */
   leaseTimeoutMs?: number;
 }

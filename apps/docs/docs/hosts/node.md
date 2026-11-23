@@ -57,9 +57,10 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`orchestrationIntervalMs`**| `number` | `10000` (10s) | How often to run orchestration tasks (claim pending, poll suspended, reap leases, flush outbox). |
 | **`jobPollIntervalMs`** | `number` | `1000` (1s) | How often to poll the job queue for new execution jobs. |
 | **`postJobYieldMs`** | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause this worker takes after *completing* a job before asking for the next one, so a multi-stage run is not pinned to the worker that advanced it. Skipped while draining a backlog; `0` disables it. |
-| **`staleLeaseThresholdMs`** | `number` | `300000` (5m) | How long a job lease may go without a heartbeat before `lease.reapStale` releases it for retry (measured on the database clock on PostgreSQL). |
-| **`jobAbsoluteTimeoutMs`** | `number` | `3600000` (1h) | Absolute cap on one job claim, measured from `startedAt`, which no heartbeat refreshes. A job past it is failed terminally (`LEASE_ABSOLUTE_CAP`); a stage that legitimately runs longer must raise it. `0` disables the tier. |
-| **`jobHeartbeatIntervalMs`**| `number` | `60000` (60s) | How often to dispatch `job.heartbeat` while executing a job: renews the lease and aborts `ctx.abortSignal` when the run was cancelled or the lease lost. |
+| **`concurrency`** | `number` | `1` | Number of independent job execution slots in this host. |
+| **`staleLeaseThresholdMs`** | `number` | `300000` (5m) | Default time a job lease may go without a heartbeat before `lease.reapStale` releases it for retry (measured on the database clock on PostgreSQL). |
+| **`jobAbsoluteTimeoutMs`** | `number` | `3600000` (1h) | Default absolute cap on one job claim, measured from `startedAt`, which no heartbeat refreshes. A job past it is failed terminally (`LEASE_ABSOLUTE_CAP`); a stage that legitimately runs longer must raise it. `0` disables the tier. |
+| **`jobHeartbeatIntervalMs`**| `number` | `60000` (60s) | Maximum interval between heartbeats. A workflow or stage lease override caps this interval at one third of the override. Each beat renews the lease and checks for cancellation or lease loss. |
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
@@ -79,6 +80,8 @@ If a timer option or `onTick` value cannot be formatted, the constructor still t
 `workerId` also reaches `job_queue.workerId`: a `createPrismaJobQueue(prisma)` built without a `workerId` of its own adopts the host's on `start()`, so the job row says which worker ran the stage.
 
 ---
+
+Each execution slot claims work independently. A workflow's [`maxConcurrent`](../core-concepts/workflows-and-stages.md#job-runtime-options) applies across all slots and hosts on the queue. The host wakes idle slots when work arrives and stops claiming as soon as shutdown begins. The stuck-run sweep keeps runs with pending or leased jobs active, including jobs that the same maintenance tick returned to the queue.
 
 ## Process Management & Signal Handling
 

@@ -57,6 +57,8 @@ const host = createServerlessHost({
 
 ---
 
+The Prisma queue applies [workflow runtime options](../core-concepts/workflows-and-stages.md#job-runtime-options) when claiming jobs through `processAvailableJobs` or `runToCompletion`. A workflow or stage lease override caps the heartbeat interval at one third of that duration. If you supply your own push transport, forward the claimed job's `leaseMs`, `retryPolicy`, and `maxAttempts` with its delivery, along with `usesHostLease` when the claim uses the host settings, and enforce the workflow cap in that transport's claim operation.
+
 ## Entry Points
 
 ### 1. `handleJob(message)`
@@ -120,7 +122,7 @@ Because serverless functions are ephemeral, they cannot run continuous backgroun
 The maintenance tick performs one cycle of:
 1. **Claiming**: Finds runs in `PENDING` status this build serves and enqueues their first stages.
 2. **Polling**: Replays `SUSPENDED` durable stages whose `nextPollAt` has passed — a `ctx.step.waitFor` poll, a batch status check, a sleep or signal keepalive.
-3. **Lease Reaping**: Releases job locks from crashed worker nodes and fails jobs past `jobAbsoluteTimeoutMs`.
+3. **Lease Reaping**: Releases job locks from crashed worker nodes and fails jobs past their absolute deadline or the default `jobAbsoluteTimeoutMs`.
 4. **Outbox Flushing**: Dispatches pending transactional outbox events to the `EventSink`.
 5. **Stuck Run Detection**: Automatically fails runs that have ceased updates.
 6. **Retention** (only with `retention` configured): `run.purge` deletes terminal runs past their age. See [Run Retention](../troubleshooting/overview.md#run-retention).

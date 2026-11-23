@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { defineWorkflow, type Workflow } from "@bratsos/workflow-engine";
 import {
   createWorkflowRegistry,
@@ -22,6 +23,7 @@ import {
 import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
+  fromPrisma8,
 } from "../../../workflow-engine/src/persistence/prisma/index.js";
 import { createNodeHost, type NodeHost, type NodeHostConfig } from "../host.js";
 
@@ -326,6 +328,139 @@ describe.skipIf(!realDatabase)(
         expect(job.lockedAt.getTime()).toBeGreaterThan(job.startedAt.getTime());
       } finally {
         gate.resolve();
+      }
+    });
+
+    it("keeps a workflow at its cap across two workers with two slots each", async () => {
+      const gate = Promise.withResolvers<void>();
+      let executing = 0;
+      let peak = 0;
+      const makeWorkflow = (id: string, maxConcurrent?: number) =>
+        defineWorkflow(id, {
+          input: schemas.input,
+          maxConcurrent,
+          leaseTimeoutMs: 120_000,
+          absoluteTimeoutMs: 240_000,
+        })
+          .stage("work", {
+            schemas,
+            async execute() {
+              if (maxConcurrent !== undefined) {
+                executing++;
+                peak = Math.max(peak, executing);
+                await gate.promise;
+                executing--;
+              } else {
+                await gate.promise;
+              }
+              return { output: {} };
+            },
+          })
+          .build();
+      const capped = makeWorkflow("capped", 1);
+      const free = makeWorkflow("free");
+      const workflows = [capped, free];
+      const first = makeHost(workflows, db.client, { concurrency: 2 });
+      const fixtures = createRequire(import.meta.url)(
+        "../../../prisma-fixtures/index.cjs",
+      );
+      const secondClient =
+        process.env.PRISMA_MAJOR === "8"
+          ? (() => {
+              const native = sqlite
+                ? fixtures.openSqliteDb(db.file)
+                : fixtures.createPostgresDb(process.env.DATABASE_URL);
+              return Object.assign(fromPrisma8(native), {
+                $disconnect: () => native.close(),
+              });
+            })()
+          : sqlite
+            ? fixtures.openSqliteClient(db.file)
+            : fixtures.createPostgresClient(process.env.DATABASE_URL);
+      const competitor = createPrismaJobQueue(secondClient, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+        workerId: "runtime-2",
+      });
+      // Share one root for the SQLite kernel's writes in this process.
+      // The claim race below uses two separate database connections.
+      const second = makeHost(workflows, sqlite ? db.client : secondClient, {
+        workerId: "runtime-2",
+        concurrency: 2,
+      });
+      try {
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++)
+          ids.push(await createRun(first.kernel, capped.id, 10));
+        for (let i = 0; i < 2; i++) await createRun(first.kernel, free.id, 1);
+        await first.kernel.dispatch({
+          type: "run.claimPending",
+          workerId: "runtime-1",
+          maxClaims: 5,
+        });
+        // Legacy rows participate in both candidate filtering and the RUNNING count.
+        await db.client.jobQueue.updateMany({
+          where: { workflowId: capped.id },
+          data: { workflowId: null },
+        });
+        const options = {
+          serves: first.kernel.servedDefinitions(),
+          workflowLimits: first.kernel.workflowJobLimits?.(),
+        };
+        const claimsByWorker = await Promise.all([
+          first.jobTransport.dequeue(options),
+          competitor.dequeue(options),
+        ]);
+        expect(
+          claimsByWorker.filter(
+            (job) => job && ids.includes(job.workflowRunId),
+          ),
+        ).toHaveLength(1);
+        for (const [index, job] of claimsByWorker.entries()) {
+          expect(job).toMatchObject({ leaseMs: 120_000, attempt: 1 });
+          const row = await jobOf(job!.workflowRunId);
+          expect(row.leaseExpiresAt.getTime() - row.lockedAt.getTime()).toBe(
+            120_000,
+          );
+          expect(
+            row.absoluteExpiresAt.getTime() - row.startedAt.getTime(),
+          ).toBe(240_000);
+          const queue = index === 0 ? first.jobTransport : competitor;
+          await queue.defer(
+            job!.jobId,
+            new Date(0),
+            "return claim before starting the hosts",
+            {
+              attempt: job!.attempt,
+              startedAt: job!.startedAt,
+            },
+          );
+        }
+        await Promise.all([first.host.start(), second.host.start()]);
+        const claims = () =>
+          db.client.jobQueue.findMany({ where: { status: "RUNNING" } });
+        await expect.poll(async () => (await claims()).length, poll).toBe(3);
+        const running = await claims();
+        expect(
+          running.filter((job: { workflowRunId: string }) =>
+            ids.includes(job.workflowRunId),
+          ),
+        ).toHaveLength(1);
+        expect(
+          new Set(running.map((job: { workerId: string }) => job.workerId)),
+        ).toEqual(new Set(["runtime-1", "runtime-2"]));
+        gate.resolve();
+        await expect
+          .poll(
+            () =>
+              db.client.workflowRun.count({ where: { status: "COMPLETED" } }),
+            poll,
+          )
+          .toBe(5);
+        expect(peak).toBe(1);
+      } finally {
+        gate.resolve();
+        await Promise.all([first.host.stop(), second.host.stop()]);
+        await secondClient.$disconnect();
       }
     });
   },

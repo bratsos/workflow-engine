@@ -118,6 +118,30 @@ export const repository = defineWorkflow("repository", { input: In })
 
 `.stage(prebuilt)` and `.pipe(prebuilt)` accept a `defineStage()` result and check its declared context against what earlier stages produce: a stage that requires a key no earlier stage produces does not compile (the parameter resolves to `{ __error: "stage requires context keys not produced by earlier stages: ..." }`). A stage built without an explicit context is accepted anywhere. `.parallel([...])` and `.parallel((group) => group.stage("a", {...}).stage("b", {...}))` carry the same inference, and `InferWorkflowContext`, `InferWorkflowInput`, `InferWorkflowOutput`, `InferWorkflowStageIds` and `InferStageOutputById` expose the inferred types to code outside the stages.
 
+### Job runtime options
+
+```typescript
+const workflow = defineWorkflow("invoice", {
+  input: InvoiceSchema,
+  jobRetry: {
+    maxAttempts: 4,
+    backoff: { initialDelayMs: 1_000, factor: 2, maxDelayMs: 30_000 },
+  },
+  leaseTimeoutMs: 90_000,
+  absoluteTimeoutMs: 600_000,
+  maxConcurrent: 8,
+}).pipe(processInvoice).build();
+```
+
+| Option | Behaviour |
+|---|---|
+| `jobRetry` | Retry budget and delay for failed jobs and suspended-stage polls. `maxAttempts` includes the first attempt. The first retry uses `initialDelayMs`, then delays grow by `factor` (default 2) up to `maxDelayMs`. Use `factor: 1` for a fixed delay. By default the budget is three attempts and the first retry waits two seconds. |
+| `leaseTimeoutMs` | How long the worker has to renew its claim. When set, the worker heartbeats at most one third of this interval apart. An expired lease can be reclaimed. The default comes from the host. |
+| `absoluteTimeoutMs` | Wall-clock cap on one claimed job attempt, even while it heartbeats. A new claim starts a new deadline. The host's runaway sweep fails an overdue job. The default comes from the host. |
+| `maxConcurrent` | Maximum RUNNING jobs for this workflow across workers using the same Prisma queue. The default is unlimited. Use `createWorkflowRegistry` and configure the same limit on all workers claiming this workflow. Jobs waiting in the queue or suspended do not count. |
+
+`defineStage` and inline `.stage()` accept the retry and timeout options. Each stage option overrides its corresponding workflow option. The resolved options are stored on newly enqueued jobs. These options do not change the derived workflow version. Apply the [job queue schema upgrade](../migrations/job-runtime-controls.md) before deployment.
+
 ### Declaring a version
 
 `defineWorkflow(...).version("2026-09-04.1")` declares the definition version yourself; otherwise the engine derives one from the pipeline's structure. See [Definition Versioning](./definition-versioning.md).

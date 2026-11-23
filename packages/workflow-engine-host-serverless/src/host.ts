@@ -396,6 +396,7 @@ class ServerlessHostImpl implements ServerlessHost {
       const job = await this.jobTransport.dequeue({
         serves,
         leaseTimeoutMs: this.staleLeaseThresholdMs,
+        workflowLimits: this.kernel.workflowJobLimits?.(),
       });
       if (!job) break;
 

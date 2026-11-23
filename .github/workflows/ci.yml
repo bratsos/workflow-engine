@@ -160,7 +160,7 @@ jobs:
 
       - name: Run host outbox recovery tests on Postgres
         run: |
-          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --no-file-parallelism --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts src/__tests__/workflow-runtime-prisma.test.ts
           pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
         env:
           NODE_ENV: test
@@ -292,7 +292,7 @@ jobs:
 
       - name: Run host outbox recovery tests on SQLite
         run: |
-          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --no-file-parallelism --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts src/__tests__/workflow-runtime-prisma.test.ts
           pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
 
       - name: Run console SQLite conformance tests
@@ -382,7 +382,7 @@ jobs:
       - name: Run host outbox recovery tests on Postgres
         if: matrix.database == 'postgres'
         run: |
-          bun --bun run --cwd packages/workflow-engine-host-node vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          bun --bun run --cwd packages/workflow-engine-host-node vitest run --no-file-parallelism --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts src/__tests__/workflow-runtime-prisma.test.ts
           bun --bun run --cwd packages/workflow-engine-host-serverless vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
@@ -404,7 +404,7 @@ jobs:
       - name: Run host outbox recovery tests on SQLite
         if: matrix.database == 'sqlite'
         run: |
-          bun --bun run --cwd packages/workflow-engine-host-node vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          bun --bun run --cwd packages/workflow-engine-host-node vitest run --no-file-parallelism --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts src/__tests__/workflow-runtime-prisma.test.ts
           bun --bun run --cwd packages/workflow-engine-host-serverless vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
         env:
           SQLITE8_KERNEL_SQLITE: "1"
