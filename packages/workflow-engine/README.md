@@ -1179,7 +1179,7 @@ With a registry built by `createWorkflowRegistry`, a host claims and polls only 
 
 ### Enqueue from SQL
 
-`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)` and a nine-argument form that adds `tenant_id` and `labels` and takes all nine. Install it after creating the engine tables; the same file upgrades the released function in place and keeps its grants. Existing callers need no new privilege; grant `EXECUTE` on the nine-argument form to the roles that pass a tenant or labels. A trigger or a non-TypeScript service can then create a run in its own transaction.
+`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)` and a nine-argument form that adds `tenant_id` and `labels` and takes all nine. Install it after creating the engine tables; the same file upgrades the released function in place and keeps its grants. Existing callers need no new `EXECUTE` grant; grant it on the nine-argument form to the roles that pass a tenant or labels. A role limited to column-level table grants also needs the two column grants in the migration guide. A trigger or a non-TypeScript service can then create a run in its own transaction.
 
 ```sql
 PERFORM workflow_engine_enqueue(

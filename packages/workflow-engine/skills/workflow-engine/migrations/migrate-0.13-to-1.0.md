@@ -461,7 +461,7 @@ seven-argument function still works, released or replaced, and with
 
 The new overload gets the database's default function ACL, which lets
 `PUBLIC` execute it. Existing callers of the seven-argument function keep
-their access; only roles that pass a tenant or labels need `EXECUTE` on the
+their `EXECUTE` access; only roles that pass a tenant or labels need it on the
 new overload. If you restricted the released function, restrict the new one
 in the same transaction:
 
@@ -472,6 +472,22 @@ psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
   -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
   -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
+
+A role that writes the engine tables through column-level grants, rather
+than table-wide `INSERT` and `UPDATE`, also needs two column grants after the
+column and index script and before `sql/enqueue.sql` or the new engine is
+deployed.
+Both SQL signatures write these columns, even with NULL tenant and labels.
+The engine writes `workflowRunId` whenever it completes an idempotency key,
+and `tenantId` and `labels` when `run.create` receives them:
+
+```sql
+GRANT INSERT ("tenantId", labels) ON workflow_runs TO app_role;
+GRANT UPDATE ("workflowRunId") ON idempotency_keys TO app_role;
+```
+
+Without them, replays still succeed but a new key fails with SQLSTATE
+`42501`. Table-wide grants need nothing.
 
 Without `ON_ERROR_STOP`, psql prints an error but exits 0, so automation
 cannot see the failure. `sql/enqueue.sql` requires PostgreSQL 13 or newer.

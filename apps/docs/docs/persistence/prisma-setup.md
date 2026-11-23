@@ -720,7 +720,7 @@ and select a non-public engine schema with
 
 A new function gets the database's default function ACL, which lets
 `PUBLIC` execute it. Existing callers of the seven-argument function keep
-their access; only roles that pass a tenant or labels need `EXECUTE` on the
+their `EXECUTE` access; only roles that pass a tenant or labels need it on the
 new overload. To restrict it to an application role, commit the `REVOKE` and
 `GRANT` with the install:
 
@@ -731,6 +731,21 @@ psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
   -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
   -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
+
+A role that writes the engine tables through column-level grants, rather
+than table-wide `INSERT` and `UPDATE`, also needs two column grants before
+this file is installed or this engine version is deployed.
+Both SQL signatures write these columns, even with NULL tenant and labels.
+The engine writes `workflowRunId` whenever it completes an idempotency key,
+and `tenantId` and `labels` when `run.create` receives them:
+
+```sql
+GRANT INSERT ("tenantId", labels) ON workflow_runs TO app_role;
+GRANT UPDATE ("workflowRunId") ON idempotency_keys TO app_role;
+```
+
+Without them, replays still succeed but a new key fails with SQLSTATE
+`42501`. Table-wide grants need nothing.
 
 On a fresh install, run the same two statements for the seven-argument
 signature `workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text)`

@@ -27,7 +27,7 @@
 --   * The released seven-argument signature, with its defaults, replaced in
 --     place. It keeps its owner, ACL and the views or functions that depend
 --     on it. Its body is its own copy of the nine-argument body with NULL
---     tenant and labels, so its callers need no new privilege and it works
+--     tenant and labels, so its callers need no new EXECUTE grant and it works
 --     whether or not the nine-argument statement succeeded.
 --
 -- Table names resolve through the caller's search path, as before.
