@@ -958,10 +958,21 @@ describe.skipIf(!realDatabase)(
       expect(seen).toEqual([timeoutResult, timeoutResult]);
     });
 
+    const refusal = {
+      ok: true,
+      signalled: false,
+      alreadyCompleted: true,
+      timedOut: true,
+    };
+
     it.each([
-      undefined,
-      "throw",
-    ] as const)("preserves the failing timeout with onTimeout %s", async (onTimeout) => {
+      { onTimeout: undefined, status: "FAILED" },
+      { onTimeout: "throw", status: "FAILED" },
+      { onTimeout: "return", status: "COMPLETED" },
+    ] as const)("answers a late signal the same before and after the poller settles the timeout (onTimeout $onTimeout)", async ({
+      onTimeout,
+      status,
+    }) => {
       let continued = false;
       const t = await start(async (step) => {
         await step.waitForSignal("answer", { onTimeout, timeout: 100 });
@@ -973,14 +984,64 @@ describe.skipIf(!realDatabase)(
         outcome: "suspended",
       });
       clock.advance(100);
+      // Without onTimeout a signal before the poller's tick is still accepted.
+      if (onTimeout) {
+        await expect(t.signal(t.worker(), "late")).resolves.toMatchObject(
+          refusal,
+        );
+      }
       await t.tick();
-      expect(await t.status()).toBe("FAILED");
-      expect(await t.record()).toMatchObject({
-        status: "failed",
-        error: 'Durable wait step "answer" exceeded its timeout',
+      expect(await t.status()).toBe(status);
+      expect(await t.record()).toMatchObject(
+        onTimeout === "return"
+          ? { status: "completed", waitState: { timedOut: true } }
+          : {
+              status: "failed",
+              error: 'Durable wait step "answer" exceeded its timeout',
+            },
+      );
+      expect(continued).toBe(onTimeout === "return");
+      const late = t.signal(t.worker(), "late");
+      if (onTimeout) await expect(late).resolves.toMatchObject(refusal);
+      else await expect(late).rejects.toThrow("has failed");
+      expect(events.getByType("step:signalled")).toEqual([]);
+      expect(
+        (await db.persistence.getUnpublishedOutboxEvents(100)).filter(
+          (event) => event.eventType === "step:signalled",
+        ),
+      ).toEqual([]);
+    });
+
+    it.each([
+      undefined,
+      "throw",
+    ] as const)("answers a signal that loses to the poller's timeout (onTimeout %s)", async (onTimeout) => {
+      const t = await start(async (step) => {
+        await step.waitForSignal("answer", { onTimeout, timeout: 100 });
+        return "answered";
       });
-      expect(continued).toBe(false);
-      await expect(t.signal(t.worker(), "late")).rejects.toThrow("has failed");
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      const writing = barrier();
+      const signaller = t.worker({
+        stepLedger: override(db.stepLedger, {
+          async compareAndSet(...args) {
+            if (args[3].status === "completed") await writing.pause();
+            return db.stepLedger.compareAndSet(...args);
+          },
+        }),
+      });
+      clock.advance(99);
+      const late = t.signal(signaller, "late");
+      await writing.reached;
+      clock.advance(1);
+      await t.tick(t.worker(), "second");
+      expect(await t.record()).toMatchObject({ status: "failed" });
+      writing.release();
+      if (onTimeout) await expect(late).resolves.toMatchObject(refusal);
+      else await expect(late).rejects.toThrow("has failed");
+      expect(await t.status()).toBe("FAILED");
     });
 
     it.each([

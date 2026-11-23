@@ -142,6 +142,19 @@ async function deliverSignal(
     if (record.waitState?.timedOut) return timedOut();
     return wake(record, alreadyCompleted);
   };
+  // Only a deadline fails a wait row. With an explicit `onTimeout` the
+  // sender gets the same refusal as before the poller recorded it.
+  const failed = (record: StepRecord): HandlerResult<StepSignalResult> => {
+    if (
+      record.waitState?.onTimeout !== undefined &&
+      record.error === new StepTimeoutError(record.stepId).message
+    ) {
+      return timedOut();
+    }
+    throw new Error(
+      `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
+    );
+  };
 
   const completeExisting = async (
     record: StepRecord,
@@ -152,11 +165,7 @@ async function deliverSignal(
         `Durable step "${command.stepId}" was previously used as ${record.kind} and cannot receive a signal`,
       );
     }
-    if (record.status === "failed") {
-      throw new Error(
-        `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
-      );
-    }
+    if (record.status === "failed") return failed(record);
     if (record.status === "completed") return finish(record, true);
 
     // From its deadline on, a wait with an explicit `onTimeout` can only
@@ -186,11 +195,7 @@ async function deliverSignal(
       if (winner?.status === "completed") {
         return finish(winner, true);
       }
-      if (winner?.status === "failed") {
-        throw new Error(
-          `Durable signal step "${command.stepId}" has failed and cannot receive a signal`,
-        );
-      }
+      if (winner?.status === "failed") return failed(winner);
       throw new Error(`Durable signal step "${command.stepId}" changed state`);
     }
     return finish(completed.record!, false);
