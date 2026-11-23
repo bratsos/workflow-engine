@@ -134,12 +134,12 @@ const worker = ai.createChild("worker", "1", {
 Child helpers inherit the tenant and merge labels by key. A child text policy
 inherits the parent's TTL when omitted. The default stores full text without
 expiry. `store: "none"` leaves the prompt and response empty and drops stream
-instructions from the accounting row. Direct `ctx.aiLogger` writes share the
-stage helper's attribution and text policy, including with custom loggers.
-A factory that returns a wrapper should spread the helper into it or wrap it
-in a `Proxy` or `Object.create`, so these writes keep the helper's labels. A
-wrapper that hides the helper it delegates to gets the strictest text policy
-among the helpers the factory made, with the run's attribution.
+instructions from the accounting row. Each helper applies its own attribution
+and text policy to the rows it builds, including a helper given
+`ctx.aiLogger`. The stage logger fills only what a row lacks: the run ID, the
+run's tenant, and the run's labels under the row's own. Direct
+`ctx.aiLogger.logCall` and `logBatchResults` writes are stored as given, with
+those run fields filled, as in earlier releases.
 A full-text TTL sets `textExpiresAt` on the row so
 `engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
 requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
@@ -157,8 +157,7 @@ uses the supplied `modelKey` as the recorded model ID. It defaults to
 
 Text capture controls the AI call row and trace output only. Under
 `store: "none"` or a TTL, a row's `metadata.error` is stored as
-`AI call failed`, whichever helper or direct `ctx.aiLogger` write produced
-it; a TTL row never stores the message, because text expiry does not clear
+`AI call failed` on every row a helper with that policy builds; a TTL row never stores the message, because text expiry does not clear
 metadata. A provider error message can contain text the provider echoed from
 the request. Outside the row, provider errors are stored and passed on as in
 earlier releases: values thrown to callers and the SDK, stage and step error
@@ -185,7 +184,9 @@ progress, each stream request until its row is written or the AI SDK ends
 it without one, each `getUsage()`, `getText()`, `getReasoning()` or chunk
 read, batch `getResults()` and `recordResults()`, and writes in progress.
 An error part or a consumer that stops reading does not end a stream
-request. A write the database refuses reaches `onLogError`. A
+request. A helper write the database refuses reaches `onLogError`.
+`ctx.aiLogger.flush()` returns the same counts for direct writes made through
+`ctx.aiLogger`; `ctx.ai.flush()` covers the stage helper's own. A
 caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
 message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
 rejects if that write fails; `recordResults` retries it.
