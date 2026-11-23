@@ -1922,6 +1922,8 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
             configured.logBatchResults(batchId, calls),
           getStats: (topic) => configured.getStats(topic),
           isRecorded: (batchId) => configured.isRecorded(batchId),
+          transactionReads: (persistence) =>
+            configured.transactionReads(persistence),
         },
         ai: createAIHelper,
       },
@@ -2048,28 +2050,48 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     });
   });
 
-  it("sends a buffered logger's direct write when the stage flushes ctx.aiLogger, so the run total and completion event count it", async () => {
-    // Rows wait in the logger until its flush inserts them; a write settles
-    // once its row is inserted.
-    const configured = freshLogger();
-    const queue: [CreateAICallInput, PromiseWithResolvers<void>][] = [];
-    const buffered = override(configured, {
-      logCall(call: CreateAICallInput) {
-        const written = Promise.withResolvers<void>();
-        queue.push([call, written]);
-        return written.promise;
-      },
-      async flush() {
-        for (const [call, written] of queue.splice(0)) {
-          await configured.logCall(call).then(written.resolve, written.reject);
-        }
-        return { failed: 0, pending: 0 };
-      },
-    });
+  // Rows wait in the logger until its flush inserts them; a write settles
+  // once its row is inserted. Its methods rely on `this`.
+  class BufferedLogger implements AICallLogger {
+    readonly queue: [CreateAICallInput, PromiseWithResolvers<void>][] = [];
+    constructor(readonly inner: ReturnType<typeof createPrismaAICallLogger>) {}
+    logCall(call: CreateAICallInput) {
+      const written = Promise.withResolvers<void>();
+      this.queue.push([call, written]);
+      return written.promise;
+    }
+    logBatchResults(batchId: string, calls: CreateAICallInput[]) {
+      return this.inner.logBatchResults(batchId, calls);
+    }
+    getStats(topic: string) {
+      return this.inner.getStats(topic);
+    }
+    isRecorded(batchId: string) {
+      return this.inner.isRecorded(batchId);
+    }
+    transactionReads(
+      persistence: Parameters<typeof this.inner.transactionReads>[0],
+    ) {
+      return this.inner.transactionReads(persistence);
+    }
+    async flush() {
+      for (const [call, written] of this.queue.splice(0)) {
+        await this.inner.logCall(call).then(written.resolve, written.reject);
+      }
+      return { failed: 0, pending: this.queue.length };
+    }
+  }
+
+  it.each([
+    "with",
+    "without",
+  ] as const)("sends a class-based buffered logger's direct write when the stage flushes ctx.aiLogger %s the run's write fence, so the run total and completion event count it", async (fence) => {
+    const buffered = new BufferedLogger(freshLogger());
     const observed: Record<string, unknown> = {};
     const stage = defineStage({
       ...diagnosticsStage,
       async execute(ctx) {
+        observed.idle = await ctx.aiLogger.flush?.();
         void ctx.aiLogger.logCall({
           ...manual,
           modelId: manual.modelKey,
@@ -2084,6 +2106,10 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       },
     });
     const { kernel, job, workflowRunId } = await queueJob(stage, {
+      // Persistence without run write registration has no write fence.
+      ...(fence === "without" && {
+        persistence: override(db.persistence, { beginRunWrite: undefined }),
+      }),
       services: { aiLogger: buffered, ai: createAIHelper },
     });
     try {
@@ -2097,9 +2123,10 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       ).toBe("completed");
       await kernel.dispatch({ type: "run.transition", workflowRunId });
     } finally {
-      await buffered.flush?.();
+      await buffered.flush();
     }
     expect(observed).toEqual({
+      idle: { failed: 0, pending: 0 },
       flushed: { failed: 0, pending: 0 },
       rows: 1,
     });
@@ -2113,6 +2140,100 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       totalCost: 1.25,
       totalTokens: 5,
     });
+  });
+
+  it.each([
+    ["the run's write fence", 1],
+    ["the run's write fence", 2],
+    ["the configured logger", 1],
+    ["the configured logger", 2],
+  ] as const)("counts each direct write held by %s once in ctx.aiLogger.flush (%i writes)", async (holder, count) => {
+    const configured = freshLogger();
+    const held = Promise.withResolvers<void>();
+    // The job's own registration is refused, so each write registers alone
+    // and waits while registration is held.
+    let registration: "allow" | "refuse job" | "hold" = "allow";
+    const persistence = override(db.persistence, {
+      async beginRunWrite(workflowRunId: string, id: string) {
+        if (registration === "refuse job") return false;
+        if (registration === "hold") await held.promise;
+        return db.persistence.beginRunWrite!(workflowRunId, id);
+      },
+    });
+    // Restores the logger's own client, which its transaction reads match.
+    let restore = () => {};
+    if (holder === "the configured logger") {
+      // The stock logger's inserts wait; it counts them as pending.
+      const port = configured as unknown as { prisma: any };
+      const client = port.prisma;
+      restore = () => {
+        port.prisma = client;
+      };
+      const bind = (target: any, key: PropertyKey) => {
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      };
+      const aICall = new Proxy(port.prisma.aICall, {
+        get: (delegate, key) =>
+          key === "create" || key === "createMany"
+            ? async (...args: unknown[]) => {
+                await held.promise;
+                return delegate[key](...args);
+              }
+            : bind(delegate, key),
+      });
+      port.prisma = new Proxy(port.prisma, {
+        get: (client, key) => (key === "aICall" ? aICall : bind(client, key)),
+      });
+    }
+    const row = { ...manual, modelId: manual.modelKey, topic: "direct" };
+    const observed: Record<string, unknown> = {};
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        if (holder === "the run's write fence") registration = "hold";
+        const writes = [ctx.aiLogger.logCall(row)];
+        if (count === 2) {
+          writes.push(
+            ctx.aiLogger.logBatchResults("batch-1", [
+              { ...row, requestId: "item-1" },
+            ]),
+          );
+        }
+        observed.stage = await ctx.aiLogger.flush?.({ timeoutMs: 50 });
+        observed.configured = await configured.flush({ timeoutMs: 0 });
+        observed.again = await ctx.aiLogger.flush?.({ timeoutMs: 0 });
+        registration = "allow";
+        held.resolve();
+        await Promise.all(writes);
+        restore();
+        observed.settled = await ctx.aiLogger.flush?.();
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      persistence,
+      services: { aiLogger: configured, ai: createAIHelper },
+    });
+    if (holder === "the run's write fence") registration = "refuse job";
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    const inLogger = holder === "the configured logger" ? count : 0;
+    expect(observed).toEqual({
+      stage: { failed: 0, pending: count },
+      configured: { failed: 0, pending: inLogger },
+      again: { failed: 0, pending: count },
+      settled: { failed: 0, pending: 0 },
+    });
+    expect(await db.client.aICall.count({ where: { topic: "direct" } })).toBe(
+      count,
+    );
   });
 
   it.each([
@@ -2130,6 +2251,8 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
             getStats: (topic) => configured.getStats(topic),
             listCalls: (options) => configured.listCalls(options),
             isRecorded: (batchId) => configured.isRecorded(batchId),
+            transactionReads: (persistence) =>
+              configured.transactionReads(persistence),
           };
     let metered = 0;
     const observed: Record<string, unknown> = {};

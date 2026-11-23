@@ -56,6 +56,11 @@ export class AICallWriteTracker {
         this.drained.delete(resolve);
       }
     }
+    return this.counts();
+  }
+
+  /** Failed writes so far and writes pending now. */
+  counts(): AICallFlushResult {
     return { failed: this.failed, pending: this.pending };
   }
 }

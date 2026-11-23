@@ -15,6 +15,7 @@ import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
+  AICallFlushResult,
   AICallLogger,
   CreateAICallInput,
   CreateAnnotationInput,
@@ -126,8 +127,8 @@ export function defineLazyAIContext<T extends object>(
   // ctx.aiLogger stores direct writes as given. Each write is counted once:
   // by this layer until the configured logger takes it (past the run's write
   // fence), and from then on by that logger when it has a flush. Its flush
-  // waits for the writes it counts, then flushes the configured logger, and
-  // repeats while it counts a write still on its way to a buffered logger.
+  // waits for the writes this layer counts, then flushes the configured
+  // logger, and repeats while writes arrive and time remains.
   let stageLogger: AICallLogger | undefined;
   const directLogger = (logger: AICallLogger): AICallLogger => {
     const writes = new AICallWriteTracker();
@@ -155,20 +156,26 @@ export function defineLazyAIContext<T extends object>(
           options.timeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
           { allowZero: true },
         );
-        const flush = logger.flush;
-        if (!flush) return writes.flush({ timeoutMs });
+        if (!logger.flush) return writes.flush({ timeoutMs });
         const deadline = Date.now() + timeoutMs;
         const left = () => Math.max(0, deadline - Date.now());
-        let own = await writes.flush({ timeoutMs: 0 });
         for (;;) {
-          const configured = await boundedAIFlush(flush, left());
+          await writes.flush({ timeoutMs: left() });
+          let own: AICallFlushResult | undefined;
+          const configured = await boundedAIFlush(async (bound) => {
+            const result = await logger.flush?.(bound);
+            // Read as the logger's result arrives: a write it took while it
+            // flushed is in its result and no longer in this layer's.
+            own = writes.counts();
+            return result;
+          }, left());
+          own ??= writes.counts();
           if (own.pending === 0 || left() === 0) {
             return {
               failed: own.failed + configured.failed,
               pending: own.pending + configured.pending,
             };
           }
-          own = await writes.flush({ timeoutMs: left() });
         }
       },
     });
