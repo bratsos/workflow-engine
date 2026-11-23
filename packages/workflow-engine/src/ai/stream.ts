@@ -69,7 +69,8 @@ export function streamText(
   const steps: ProviderResultLike[] = [];
   const onStepEnd: StreamOptions["onStepEnd"] = async (step) => {
     steps.push(step);
-    await options.onStepEnd?.(step);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || ctx.adapter?.streamText) await options.onStepEnd?.(step);
   };
 
   // Error handler that logs the error to DB

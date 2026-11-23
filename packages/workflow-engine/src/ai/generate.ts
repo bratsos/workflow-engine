@@ -329,6 +329,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
   const steps: ProviderResultLike[] = [];
   let accounting: CallAccounting | undefined;
+  const isAdapter = ctx.adapter?.generateText !== undefined;
   // Capture provider history before tool logging or the caller's callback can fail.
   const wrappedOnStepEnd: TextOptions<TTools>["onStepEnd"] = async (
     stepResult,
@@ -367,7 +368,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
         }
       }
     }
-    await options.onStepEnd?.(stepResult);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || isAdapter) await options.onStepEnd?.(stepResult);
   };
 
   // Build request based on input type
@@ -423,7 +425,6 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     // Cast to the SDK's own param type (not `any`) to bypass NoInfer<TTools>
     // while still catching a future SDK shape change at compile time.
     // Our TextOptions<TTools> provides proper typing at the interface level.
-    const isAdapter = ctx.adapter?.generateText !== undefined;
     const result = isAdapter
       ? await runWithCallTimeout(timeout, (signal) =>
           ctx.adapter!.generateText!({
@@ -620,9 +621,11 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
   const steps: ProviderResultLike[] = [];
   let accounting: CallAccounting | undefined;
+  const isAdapter = ctx.adapter?.generateObject !== undefined;
   const onStepEnd: ObjectOptions["onStepEnd"] = async (step) => {
     steps.push(step);
-    await options.onStepEnd?.(step);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || isAdapter) await options.onStepEnd?.(step);
   };
 
   // Build request using AI SDK v6 pattern: generateText with Output.object()
@@ -670,7 +673,6 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   });
 
   try {
-    const isAdapter = ctx.adapter?.generateObject !== undefined;
     const result = isAdapter
       ? await runWithCallTimeout(timeout, (signal) =>
           ctx.adapter!.generateObject!({

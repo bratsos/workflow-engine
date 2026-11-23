@@ -1712,6 +1712,90 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(seen).toEqual([ignored, ignored]);
   });
 
+  it.each([
+    [false, [], "completed", "COMPLETED"],
+    [true, ["text", "object", "stream"], "suspended", "SUSPENDED"],
+  ] as const)("calls the caller's onStepEnd with tools=%s only when tools are set", async (withTools, calls, outcome, status) => {
+    const seen: string[] = [];
+    const tools = {
+      inspect: { inputSchema: z.object({}), execute: async () => "unused" },
+    };
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const options = (call: string) => ({
+          ...(withTools && { tools }),
+          onStepEnd: () => {
+            seen.push(call);
+          },
+        });
+        await ctx.ai.generateText(modelKey, "request marker", options("text"));
+        await ctx.ai.generateObject(
+          modelKey,
+          "request marker",
+          z.object({}),
+          options("object"),
+        );
+        const { rawResult } = ctx.ai.streamText(
+          modelKey,
+          { prompt: "request marker" },
+          options("stream"),
+        );
+        for await (const _ of rawResult!.fullStream) {
+          // Consume the stream.
+        }
+        // A step callback decides whether the stage waits for review.
+        if (seen.length > 0) await ctx.step.sleep("review-delay", "30s");
+        return { output: {} };
+      },
+    });
+    const model = new MockLanguageModelV4({
+      async doGenerate() {
+        return {
+          content: [{ type: "text", text: "{}" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: v4Usage(1, 1),
+          warnings: [],
+        };
+      },
+      async doStream() {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: "stream-start", warnings: [] });
+              controller.enqueue({
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: v4Usage(1, 1),
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe(outcome);
+    await kernel.flush();
+    expect(seen).toEqual(calls);
+    expect(
+      await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+    ).toMatchObject({ status });
+  });
+
   it("keeps a child's stream pending until the charge after an error part is written", async () => {
     const finish = Promise.withResolvers<void>();
     const observed: {
