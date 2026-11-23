@@ -8,7 +8,6 @@ import {
   registerEvaluationProvider,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
-import { toErrorMessage } from "../../kernel/helpers/error-message.js";
 import { isRetryableStageError } from "../../kernel/helpers/stage-retry.js";
 import type {
   AICallLogger,
@@ -264,7 +263,7 @@ it.each([
   "rejected call",
   "error part",
   "broken stream",
-] as const)("passes a %s through the SDK unchanged and keeps it out of engine outputs", async (failure) => {
+] as const)("passes a %s through the SDK unchanged and keeps it out of the row and trace", async (failure) => {
   vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
   vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
   const trace = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -340,8 +339,6 @@ it.each([
       const last = (seen[0] as { lastError?: unknown }).lastError;
       expect(APICallError.isInstance(last)).toBe(true);
     }
-    for (const error of seen)
-      expect(toErrorMessage(error)).not.toContain(marker);
     expect(
       JSON.stringify(logger.getAllCalls()) + JSON.stringify(trace.mock.calls),
     ).not.toContain(marker);
@@ -374,32 +371,95 @@ it.each([
   }
 });
 
-it("keeps an adapter's Zod error unchanged and terminal, with its text withheld from engine outputs", async () => {
-  const ai = createAIHelper(
-    "accounting",
-    new InMemoryAICallLogger(),
-    undefined,
-    undefined,
-    {
-      text: { store: "none" },
-      adapter: {
-        async generateText() {
-          z.strictObject({}).parse({ [marker]: 1 });
-          return { text: "", inputTokens: 0, outputTokens: 0 };
-        },
+it("keeps an adapter's Zod error unchanged and terminal, and its text out of the row", async () => {
+  const logger = new InMemoryAICallLogger();
+  const ai = createAIHelper("accounting", logger, undefined, undefined, {
+    text: { store: "none" },
+    adapter: {
+      async generateText() {
+        z.strictObject({}).parse({ [marker]: 1 });
+        return { text: "", inputTokens: 0, outputTokens: 0 };
       },
     },
-  );
+  });
   const error = await ai
     .generateText(modelKey, "request marker")
     .catch((e: unknown) => e);
   expect(error).toBeInstanceOf(z.ZodError);
   expect((error as Error).message).toContain(marker);
   expect(isRetryableStageError(error)).toBe(false);
-  expect(toErrorMessage(error)).not.toContain(marker);
-  expect(toErrorMessage(new Error("wrapped", { cause: error }))).not.toContain(
-    marker,
+  expect(logger.getAllCalls()).toHaveLength(1);
+  expect(JSON.stringify(logger.getAllCalls())).not.toContain(marker);
+});
+
+it("prints provider error text to the console only with text tracing on", async () => {
+  const output = (["log", "warn", "error"] as const).map((level) =>
+    vi.spyOn(console, level).mockImplementation(() => {}),
   );
+  const printed = () => JSON.stringify(output.map((spy) => spy.mock.calls));
+  const logger = new InMemoryAICallLogger();
+  const workflowLogs: string[] = [];
+  const model = new MockLanguageModelV4({
+    async doGenerate() {
+      throw new APICallError({
+        message: marker,
+        url: "https://provider.invalid/v1",
+        requestBodyValues: {},
+        statusCode: 400,
+        responseBody: marker,
+        isRetryable: false,
+      });
+    },
+  });
+  // A completed batch whose one item the provider failed.
+  const fetch = async () =>
+    Response.json({
+      id: "batch-1",
+      status: "completed",
+      results: [{ custom_id: "item-1", error: { message: marker } }],
+    });
+  const run = async () => {
+    for (const logContext of [
+      undefined,
+      {
+        workflowRunId: "run-1",
+        stageRecordId: "stage-1",
+        createLog: async ({ message }: { message: string }) => {
+          workflowLogs.push(message);
+        },
+      },
+    ]) {
+      // The default policy: full capture, no expiry.
+      const ai = createAIHelper("accounting", logger, logContext, () => model);
+      await ai
+        .batch(modelKey, "openrouter", { apiKey: "fixture-key", fetch })
+        .getResults("batch-1");
+      await ai
+        .generateText(modelKey, "request marker", { maxRetries: 0 })
+        .catch(() => {});
+    }
+  };
+  try {
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", "");
+    await run();
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
+    await run();
+    expect(output[0]!.mock.calls.length).toBeGreaterThan(0);
+    expect(printed()).not.toContain(marker);
+    // Workflow logs and full-capture rows keep the text, as in earlier releases.
+    expect(workflowLogs.join(" ")).toContain(marker);
+    expect(
+      logger
+        .getAllCalls()
+        .map((call) => (call.metadata as { error?: string }).error),
+    ).toContain(marker);
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
+    await run();
+    expect(printed()).toContain(marker);
+  } finally {
+    for (const spy of output) spy.mockRestore();
+    vi.unstubAllEnvs();
+  }
 });
 
 it("works with frozen loggers and providers", async () => {

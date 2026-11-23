@@ -1,4 +1,3 @@
-import { withholdErrorText } from "../kernel/helpers/error-message.js";
 import { createLogger, isTraceTextEnabled } from "../utils/logger.js";
 import { AICallTimeoutError } from "./errors.js";
 import { UnportableSchemaError } from "./schema-portability.js";
@@ -6,21 +5,35 @@ import { UnportableSchemaError } from "./schema-portability.js";
 const logger = createLogger("AIHelper");
 
 /**
- * Leave an AI call failure unchanged for the caller and the SDK. Under a
- * policy that withholds text, mark it so the engine's own outputs describe it
- * instead of repeating its message. Engine-made errors carry no call text.
+ * An AI call failure without its message, which can quote the request or a
+ * provider's response: the error's name and HTTP status. Engine-made errors
+ * carry no call text and keep their message.
  */
-export function markAICallError<T>(
-  ctx: { readonly withholdsText?: boolean },
-  error: T,
-): T {
+export function describeAICallError(error: unknown): string {
   if (
-    ctx.withholdsText &&
-    !(error instanceof AICallTimeoutError) &&
-    !(error instanceof UnportableSchemaError)
+    error instanceof AICallTimeoutError ||
+    error instanceof UnportableSchemaError
   )
-    withholdErrorText(error);
-  return error;
+    return error.message;
+  let name: unknown;
+  let status: unknown;
+  try {
+    ({ name, statusCode: status } = error as {
+      name?: unknown;
+      statusCode?: unknown;
+    });
+  } catch {
+    // A hostile getter leaves the generic description.
+  }
+  const label =
+    typeof name === "string" && /^[A-Za-z_$][\w$]{0,63}$/.test(name)
+      ? `${name}: `
+      : "";
+  const http =
+    typeof status === "number" && Number.isInteger(status)
+      ? ` (HTTP ${status})`
+      : "";
+  return `${label}AI call failed${http}`;
 }
 
 export function traceProviderDiagnostic(
@@ -85,12 +98,12 @@ function observeStream<T extends { type: string }>(
 /**
  * The SDK emits provider warnings via a process-wide logger. Remove warning
  * text at the provider boundary to leave unrelated SDK callers' settings alone.
- * `onStreamError` sees a stream that ends in a read rejection, which the SDK
- * reports to no callback; the error still reaches the SDK unchanged.
+ * `onStreamReadError` sees a stream that ends in a read rejection, which the
+ * SDK reports to no callback; the error still reaches the SDK unchanged.
  */
 export function protectProviderWarnings<T extends object>(
   model: T,
-  onStreamError?: { call?(error: unknown): void; read?(error: unknown): void },
+  onStreamReadError?: (error: unknown) => void,
 ): T {
   return forwardingProxy(model, (key, method) => {
     if (
@@ -102,21 +115,13 @@ export function protectProviderWarnings<T extends object>(
     )
       return method;
     return async (...args: unknown[]) => {
-      if (key !== "doStream") {
-        const result = await method.apply(model, args);
+      const result = await method.apply(model, args);
+      if (key !== "doStream")
         return isTraceTextEnabled() ? result : { ...result, warnings: [] };
-      }
-      let result: { stream: ReadableStream<{ type: string }> };
-      try {
-        result = await method.apply(model, args);
-      } catch (error) {
-        onStreamError?.call?.(error);
-        throw error;
-      }
       return {
         ...result,
         stream: observeStream(result.stream, isTraceTextEnabled(), (error) =>
-          onStreamError?.read?.(error),
+          onStreamReadError?.(error),
         ),
       };
     };

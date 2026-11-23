@@ -7,14 +7,11 @@
  */
 
 import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
-import type { GenerateTextEndEvent, TextStreamPart, ToolSet } from "ai";
+import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import {
-  markAICallError,
-  protectProviderWarnings,
-} from "./provider-diagnostics.js";
+import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   logger,
@@ -47,14 +44,11 @@ export function streamText(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.streamText
     ? undefined
-    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig), {
-        call: (error) => markAICallError(ctx, error),
+    : protectProviderWarnings(
+        resolveLanguageModel(ctx, modelConfig),
         // The stream has ended; the SDK reports this to no callback.
-        read: (error) => {
-          markAICallError(ctx, error);
-          closeStream?.();
-        },
-      });
+        () => closeStream?.(),
+      );
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -300,17 +294,6 @@ export function streamText(
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
     onAbort: () => closeStream?.(),
-    // Tool errors are made by the SDK after the provider returns.
-    ...(ctx.withholdsText && {
-      experimental_transform: () =>
-        new TransformStream<TextStreamPart<ToolSet>, TextStreamPart<ToolSet>>({
-          transform(part, controller) {
-            if (part.type === "error" || part.type === "tool-error")
-              markAICallError(ctx, part.error);
-            controller.enqueue(part);
-          },
-        }),
-    }),
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.
@@ -358,7 +341,7 @@ export function streamText(
     }
   } catch (error) {
     logError(error);
-    throw markAICallError(ctx, timeoutErrorIfExpired(timeout, error));
+    throw timeoutErrorIfExpired(timeout, error);
   }
 
   // Create async iterable that collects text and calls onChunk. This is a
@@ -373,7 +356,7 @@ export function streamText(
           : result!.textStream[Symbol.asyncIterator]();
       } catch (error) {
         logError(error);
-        throw markAICallError(ctx, error);
+        throw error;
       }
       return {
         async next() {
@@ -391,7 +374,7 @@ export function streamText(
             return { done: false, value };
           } catch (error) {
             recordStreamError(error);
-            throw markAICallError(ctx, timeoutErrorIfExpired(timeout, error));
+            throw timeoutErrorIfExpired(timeout, error);
           }
         },
       };
@@ -424,7 +407,7 @@ export function streamText(
       );
     } catch (error) {
       logError(streamError ? streamError.error : error);
-      throw markAICallError(ctx, timeoutErrorIfExpired(timeout, error));
+      throw timeoutErrorIfExpired(timeout, error);
     }
   };
 
@@ -438,7 +421,7 @@ export function streamText(
         : (await runWithCallTimeout(timeout, () => result!.text)) || fullText;
     } catch (error) {
       recordStreamError(error);
-      throw markAICallError(ctx, timeoutErrorIfExpired(timeout, error));
+      throw timeoutErrorIfExpired(timeout, error);
     }
   };
 
@@ -460,7 +443,7 @@ export function streamText(
       );
     } catch (error) {
       recordStreamError(error);
-      throw markAICallError(ctx, timeoutErrorIfExpired(timeout, error));
+      throw timeoutErrorIfExpired(timeout, error);
     }
   };
 

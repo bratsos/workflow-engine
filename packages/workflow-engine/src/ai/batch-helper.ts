@@ -7,13 +7,10 @@
 import { z } from "zod";
 import { stepExternalKeyPart } from "../core/step-external-key";
 import {
-  toErrorMessage,
-  withholdErrorText,
-} from "../kernel/helpers/error-message.js";
-import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
+import { isTraceTextEnabled } from "../utils/logger.js";
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
@@ -30,7 +27,6 @@ import {
   openRouterBatchProvider,
 } from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
-import { markAICallError } from "./provider-diagnostics.js";
 import { restorePortableValue } from "./schema-portability";
 import {
   assertAdapterProviderPolicy,
@@ -637,8 +633,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         if (err instanceof Error && err.stack) {
           batchError.stack = `${batchError.stack}\nCaused by: ${err.stack}`;
         }
-        markAICallError(this.ctx, err);
-        throw markAICallError(this.ctx, batchError);
+        throw batchError;
       }
     }
 
@@ -727,18 +722,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const { batchModel, provider } = await this.transport(this.provider);
     const refs = this.resolveRefs(batchId, metadata, batchModel);
 
-    let statuses: Awaited<ReturnType<typeof batchModel.status>>[];
-    try {
-      statuses = await Promise.all(
-        refs.map((ref) =>
-          batchModel.status(ref, {
-            abortSignal: this.options?.abortSignal,
-          }),
-        ),
-      );
-    } catch (error) {
-      throw markAICallError(this.ctx, error);
-    }
+    const statuses = await Promise.all(
+      refs.map((ref) =>
+        batchModel.status(ref, {
+          abortSignal: this.options?.abortSignal,
+        }),
+      ),
+    );
 
     // Aggregate status across refs: failed if any failed; completed only if all completed; else processing/pending
     let aggregatedStatus: "pending" | "processing" | "completed" | "failed";
@@ -775,7 +765,6 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       .map((s) => s.error)
       .filter((e): e is string => typeof e === "string" && e.length > 0);
     const aggregatedError = errors.length > 0 ? errors.join("; ") : undefined;
-    if (this.ctx.withholdsText) withholdErrorText(aggregatedError);
 
     // Per-item provider failures are visible in the counts as soon as the
     // batch settles; say so at the poll, not only after collect.
@@ -845,21 +834,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const failed = settled.find(
       (s): s is PromiseRejectedResult => s.status === "rejected",
     );
-    if (failed) throw markAICallError(this.ctx, failed.reason);
+    if (failed) throw failed.reason;
     return refs.map((ref, i) => ({
       ref,
       outcome: (
         settled[i] as PromiseFulfilledResult<Awaited<ReturnType<typeof cancel>>>
       ).value.outcome,
     }));
-  }
-
-  private async *providerResults(model: EngineBatchModel, ref: EngineBatchRef) {
-    try {
-      yield* model.results(ref, { abortSignal: this.options?.abortSignal });
-    } catch (error) {
-      throw markAICallError(this.ctx, error);
-    }
   }
 
   async getResults(
@@ -940,7 +921,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const results: AIBatchResult<T>[] = [];
 
     for (const ref of targetRefs) {
-      for await (const item of this.providerResults(batchModel, ref)) {
+      for await (const item of batchModel.results(ref, {
+        abortSignal: this.options?.abortSignal,
+      })) {
         totalReceivedItems++;
         const customId = resolveCustomId(item);
         if (!customId) {
@@ -1122,24 +1105,25 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
-    // Item errors quote provider responses and model output.
-    const withhold = this.ctx.withholdsText;
-    if (withhold) for (const r of results) withholdErrorText(r.error);
     const failures = schemaFailures + providerFailures;
     if (results.length > 0 && failures * 2 > results.length) {
       // Every failed item is re-run realtime by the map's repair pass, so
       // the batch discount is lost twice over. Schema failures are usually
       // a schema the provider's structured-output mode cannot express;
       // provider failures are the endpoint rejecting the request itself.
-      const classes = [
-        schemaFailures > 0
-          ? `${schemaFailures} failed schema validation${withhold ? "" : ` (first issue: ${firstSchemaIssue ?? "unknown"})`}`
-          : undefined,
-        providerFailures > 0
-          ? `${providerFailures} failed at the provider${withhold ? "" : ` (first error: ${firstProviderError ?? "unknown"})`}`
-          : undefined,
-      ].filter((c): c is string => c !== undefined);
-      const warnMsg = `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${classes.join("; ")}.`;
+      // The first issue and error quote model output and provider responses.
+      const describe = (detail: boolean) =>
+        `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${[
+          schemaFailures > 0
+            ? `${schemaFailures} failed schema validation${detail ? ` (first issue: ${firstSchemaIssue ?? "unknown"})` : ""}`
+            : undefined,
+          providerFailures > 0
+            ? `${providerFailures} failed at the provider${detail ? ` (first error: ${firstProviderError ?? "unknown"})` : ""}`
+            : undefined,
+        ]
+          .filter((c): c is string => c !== undefined)
+          .join("; ")}.`;
+      const warnMsg = describe(true);
       const meta = {
         batchId,
         schemaFailures,
@@ -1149,7 +1133,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       if (this.batchLogFn) {
         this.batchLogFn("WARN", warnMsg, meta);
       } else {
-        logger.warn(warnMsg, meta);
+        logger.warn(describe(isTraceTextEnabled()), meta);
       }
     }
 
@@ -1202,8 +1186,6 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         const modelConfig = getModel(this.modelKey);
         const provider = extra.provider ?? this.provider;
 
-        if (this.ctx.withholdsText)
-          for (const r of results) withholdErrorText(r.error);
         const write = this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
@@ -1262,9 +1244,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 ...(r.status === "failed"
                   ? {
                       status: "failed",
+                      // Item errors quote provider responses and model output.
                       error:
                         this.ctx.withholdsText && r.error !== undefined
-                          ? toErrorMessage(r.error)
+                          ? "Batch request failed"
                           : r.error,
                     }
                   : {}),

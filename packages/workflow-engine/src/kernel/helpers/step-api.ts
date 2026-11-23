@@ -38,7 +38,7 @@ import {
   rebaseMarkers,
   settleOwedOnRow,
 } from "./batch-submit-record.js";
-import { toErrorMessage, withheldErrorSummary } from "./error-message.js";
+import { toErrorMessage } from "./error-message.js";
 import { assertTimerMs, timerDurationMs } from "./host-support.js";
 import { createStepAi } from "./step-ai.js";
 
@@ -766,7 +766,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           "running",
           {
             status: "failed",
-            error: withheldErrorSummary(error) ?? message,
+            error: message,
             leaseExpiresAt: null,
           },
           pinnedAttempt(id, attempt),
@@ -883,8 +883,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         options.onLog?.(
           pollFailures <= POLL_FAILURES_BEFORE_WARN ? "DEBUG" : "WARN",
           `Durable wait step "${id}" poll failed (${pollFailures} consecutive); retrying: ${
-            withheldErrorSummary(error) ??
-            (error instanceof Error ? error.message : String(error))
+            error instanceof Error ? error.message : String(error)
           }`,
         );
         await update(id, {
@@ -1106,7 +1105,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             status: "failed",
             error:
               typeof (verdict as { error?: unknown })?.error === "string"
-                ? toErrorMessage((verdict as { error: string }).error)
+                ? (verdict as { error: string }).error
                 : "map item failed",
             result: verdict,
             leaseExpiresAt: null,

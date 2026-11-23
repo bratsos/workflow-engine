@@ -786,7 +786,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ["stream abort", "none"],
     ["stream tool", "full"],
     ["zod adapter", "none"],
-  ] as const)("keeps %s provider diagnostics out of host, console, events and traces with %s capture", async (path, store) => {
+  ] as const)("keeps %s provider diagnostics out of AI call rows, console and trace output with %s capture", async (path, store) => {
     vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
     vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
     const output = (["log", "warn", "error"] as const).map((level) =>
@@ -902,45 +902,26 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         path === "validation" ? "completed" : "failed",
       );
       await kernel.dispatch({ type: "outbox.flush", maxEvents: 100 });
-      const { createPrismaConsoleReadPort } = await import(integration.console);
-      const reader = createPrismaConsoleReadPort(db.client, {
-        databaseType: sqlite ? "sqlite" : "postgresql",
+      const rows = await db.client.aICall.findMany({
+        where: { workflowRunId },
       });
-      const reads = await Promise.all([
-        reader.getRunDetail(workflowRunId),
-        reader.listRunEvents(workflowRunId, 0),
-        db.client.workflowStage.findMany({ where: { workflowRunId } }),
-        db.client.workflowLog.findMany({ where: { workflowRunId } }),
-        db.client.workflowStep.findMany({
-          where: { stage: { workflowRunId } },
-        }),
-        db.client.jobQueue.findMany({ where: { workflowRunId } }),
-        db.client.outboxEvent.findMany({ where: { workflowRunId } }),
-        db.client.idempotencyKey.findMany({ where: { workflowRunId } }),
-        db.client.aICall.findMany({ where: { workflowRunId } }),
-      ]);
-      expect(reads[0]).toBeTruthy();
-      expect(reads[1]?.length).toBeGreaterThan(0);
       expect(eventSink.getByType("workflow:failed").length).toBe(
         path === "validation" ? 0 : 1,
       );
       expect(
         JSON.stringify([
-          result,
-          // A map's item verdicts are repair data with their own lifecycle;
-          // the step's error column is the engine's.
-          ...(path === "validation"
-            ? reads.map((read, i) =>
-                i === 4
-                  ? (read as { error: string | null }[]).map((s) => s.error)
-                  : read,
-              )
-            : reads),
-          eventSink.events,
+          rows,
           ...output.map((spy) => spy.mock.calls),
           warnings.mock.calls,
         ]),
       ).not.toContain(sensitive);
+      if (path === "realtime" || path === "durable") {
+        // Workflow history keeps the provider's message, as earlier releases did.
+        const stages = await db.client.workflowStage.findMany({
+          where: { workflowRunId },
+        });
+        expect(JSON.stringify(stages)).toContain(sensitive);
+      }
     } finally {
       for (const spy of [...output, warnings]) spy.mockRestore();
       vi.unstubAllEnvs();
@@ -1398,10 +1379,9 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(
       await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
     ).toMatchObject({ status: "SUSPENDED" });
-    const steps = await db.client.workflowStep.findMany({
-      where: { stage: { workflowRunId } },
-    });
-    expect(JSON.stringify(steps)).not.toContain(sensitive);
+    const rows = await db.client.aICall.findMany({ where: { workflowRunId } });
+    expect(rows).toHaveLength(1);
+    expect(JSON.stringify(rows)).not.toContain(sensitive);
   });
 
   it.each([

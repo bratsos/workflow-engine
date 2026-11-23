@@ -11,9 +11,10 @@ import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
 import { toErrorMessage } from "../kernel/helpers/error-message.js";
+import { isTraceTextEnabled } from "../utils/logger.js";
 import { getModel, type ModelKey } from "./model-helper";
 import {
-  markAICallError,
+  describeAICallError,
   protectProviderWarnings,
   traceProviderDiagnostic,
 } from "./provider-diagnostics.js";
@@ -234,7 +235,9 @@ export function logFailure(
   },
 ): { errorMessage: string; durationMs: number } {
   const durationMs = Date.now() - params.startTime;
-  const errorMessage = toErrorMessage(markAICallError(ctx, params.error));
+  // A provider can quote the request in its message.
+  const message = toErrorMessage(params.error);
+  const described = describeAICallError(params.error);
   traceProviderDiagnostic(`${params.callType} call failed`, params.error);
   const steps = params.steps ?? [];
   // A call that reached the model and failed afterwards still consumed tokens.
@@ -280,11 +283,15 @@ export function logFailure(
       ...(servedBySteps !== undefined ? { servedBySteps } : {}),
       durationMs,
       status: "error",
-      error: errorMessage,
+      error: ctx.withholdsText ? described : message,
     },
   });
 
-  return { errorMessage, durationMs };
+  // For console lines, which print call text only with text tracing on.
+  return {
+    errorMessage: isTraceTextEnabled() ? message : described,
+    durationMs,
+  };
 }
 
 export async function generateText<TTools extends ToolSet = ToolSet>(
@@ -579,10 +586,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       error: errorMessage,
       durationMs,
     });
-    throw markAICallError(
-      ctx,
-      explainRoutingError(error, ctx.routing, modelKey),
-    );
+    throw explainRoutingError(error, ctx.routing, modelKey);
   } finally {
     timeout.cleanup();
   }
@@ -815,10 +819,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       error: errorMessage,
       durationMs,
     });
-    throw markAICallError(
-      ctx,
-      explainRoutingError(error, ctx.routing, modelKey),
-    );
+    throw explainRoutingError(error, ctx.routing, modelKey);
   } finally {
     timeout.cleanup();
   }

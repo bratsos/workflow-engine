@@ -83,12 +83,6 @@ import { AICallWriteTracker } from "./write-tracker";
 // ============================================================================
 
 const callLoggers = new WeakMap<AIHelper, AICallLogger>();
-const withholding = new WeakSet<AIHelper>();
-
-/** Whether a helper made here keeps call text out of engine outputs. */
-export function helperWithholdsText(helper: AIHelper): boolean {
-  return withholding.has(helper);
-}
 
 /** The policy-applying logger of a helper made here, including children. */
 export function callLoggerOf(helper: AIHelper): AICallLogger | undefined {
@@ -145,8 +139,6 @@ class AIHelperImpl implements AIHelper {
       Object.hasOwn(writes, key) ? writes[key as keyof AICallLogger] : value,
     );
     callLoggers.set(this, this.trackedLogger);
-    if (options?.text?.store === "none" || options?.text?.ttlMs !== undefined)
-      withholding.add(this);
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -166,8 +158,12 @@ class AIHelperImpl implements AIHelper {
               ...(isTraceTextEnabled() ? [err] : []),
             ),
           );
-        // Also log to console for immediate visibility
-        logger.debug(`[${level}] ${message}`, meta ? JSON.stringify(meta) : "");
+        // Also log to console for immediate visibility. Workflow log messages
+        // can quote provider responses.
+        logger.debug(
+          `[${level}] ${isTraceTextEnabled() ? message : "workflow log written"}`,
+          meta ? JSON.stringify(meta) : "",
+        );
       };
     }
   }
@@ -252,7 +248,9 @@ class AIHelperImpl implements AIHelper {
       aiCallLogger: this.trackedLogger,
       beginOperation: () => this.writes.begin(),
       onAccountingError: () => this.writes.fail(),
-      withholdsText: withholding.has(this),
+      withholdsText:
+        this.options?.text?.store === "none" ||
+        this.options?.text?.ttlMs !== undefined,
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
       adapter: this.options?.adapter,
