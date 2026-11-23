@@ -70,11 +70,7 @@ import {
   willRetryStage,
   withClaimedRun,
 } from "../helpers/index.js";
-import {
-  beginRunWrite,
-  runStepLedger,
-  writeForRun,
-} from "../helpers/run-writes.js";
+import { fenceRunWrites } from "../helpers/run-writes.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type {
   ActivityRunInput,
@@ -486,6 +482,9 @@ async function replayStage(
   postCommits: Array<() => Promise<void>>,
 ): Promise<ReplayOutcome> {
   let built: ReturnType<typeof buildStageExecutionContext> | undefined;
+  // What the body and its output write for the run is skipped once the run
+  // has ended.
+  const writes = fenceRunWrites(deps, run.id);
 
   try {
     const workflow = deps.registry.getWorkflow(run.workflowId);
@@ -517,7 +516,7 @@ async function replayStage(
       resumeState: stageRecord.suspendedState,
       workflowContext,
     };
-    built = buildStageExecutionContext(input, deps);
+    built = buildStageExecutionContext(input, writes);
     const result = await stageDef.execute(built.context);
     const moved = await superseded(stageRecord, deps);
     if (moved) {
@@ -629,7 +628,7 @@ async function replayStage(
       run.workflowType,
       stageRecord.stageId,
       validatedOutput,
-      deps,
+      writes,
       attemptKey,
     );
     const artifactKeys =
@@ -639,7 +638,7 @@ async function replayStage(
             run.workflowType,
             stageRecord.stageId,
             stageResult.artifacts,
-            deps,
+            writes,
             attemptKey,
           )
         : undefined;
@@ -702,7 +701,7 @@ async function replayStage(
       stageRecord.stageId,
       validatedOutput,
       stageResult.artifacts,
-      deps,
+      writes,
       stageRecord.id,
       outputKey,
     );
@@ -928,8 +927,12 @@ export async function handleStagePollSuspended(
     }
 
     if (isDurableReplay) {
-      const outcome = await writeForRun(deps.persistence, run.id, () =>
-        replayStage(stageRecord, run, stageDef, deps, postCommits),
+      const outcome = await replayStage(
+        stageRecord,
+        run,
+        stageDef,
+        deps,
+        postCommits,
       );
       if (outcome === "resumed") {
         resumed++;
@@ -942,11 +945,13 @@ export async function handleStagePollSuspended(
       continue;
     }
 
-    // 3d. Create storage shim and log function (uses non-transactional deps)
+    // 3d. Create storage shim and log function (uses non-transactional deps).
+    // What checkCompletion writes for the run is skipped once it has ended.
+    const writes = fenceRunWrites(deps, run.id);
     const storage = createStorageShim(
       stageRecord.workflowRunId,
       run.workflowType,
-      deps,
+      writes,
     );
 
     const logFn = (
@@ -954,15 +959,15 @@ export async function handleStagePollSuspended(
       message: string,
       meta?: Record<string, unknown>,
     ): void => {
-      void writeForRun(deps.persistence, run.id, () =>
-        deps.persistence.createLog({
+      void deps.persistence
+        .createLog({
           workflowRunId: stageRecord.workflowRunId,
           workflowStageId: stageRecord.id,
           level,
           message,
           metadata: meta,
-        }),
-      ).catch(() => {});
+        })
+        .catch(() => {});
     };
 
     // Buffer annotations made during checkCompletion. Flushed inside
@@ -1010,20 +1015,22 @@ export async function handleStagePollSuspended(
         stageId: stageRecord.stageId,
         stageRecordId: stageRecord.id,
       },
-      deps,
+      writes,
     );
     const checkContext = Object.assign(checkContextBase, {
       step: createStepApi({
         stageRecordId: stageRecord.id,
-        stepLedger: runStepLedger(deps.persistence, run.id, deps.stepLedger),
+        stepLedger: writes.stepLedger,
         clock: deps.clock,
         onLog: (level, message) => void logFn(level, message),
         // A WARN naming a provider batch goes on the run: a redrive from
         // start deletes the stage record, and its logs with it.
         onBatchWarn: (message) =>
-          void writeForRun(deps.persistence, run.id, () =>
-            writeBatchWarn(deps.persistence, run.id, message),
-          ).catch(() => {}),
+          void writeBatchWarn(
+            deps.persistence,
+            stageRecord.workflowRunId,
+            message,
+          ),
         onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
         ai: () => checkContextBase.ai,
       }),
@@ -1059,8 +1066,6 @@ export async function handleStagePollSuspended(
     // is checkCompletion's own verdict and fails the stage and the run on
     // this poll. Only this call is covered: what persists its answer is the
     // engine's, and is handled below.
-    const done = await beginRunWrite(deps.persistence, run.id);
-    if (!done) continue;
     let checkResult: CompletionCheckResult<unknown>;
     try {
       checkResult = await stageDef.checkCompletion!(
@@ -1076,8 +1081,6 @@ export async function handleStagePollSuspended(
       // outcome.
       await failPolledStage(toErrorMessage(error));
       continue;
-    } finally {
-      await done();
     }
 
     try {
@@ -1136,7 +1139,7 @@ export async function handleStagePollSuspended(
             run.workflowType,
             stageRecord.stageId,
             validatedOutput,
-            deps,
+            writes,
           );
           outputRef = { _artifactKey: outputKey };
           committedOutput = validatedOutput;
@@ -1201,7 +1204,7 @@ export async function handleStagePollSuspended(
             stageRecord.stageId,
             committedOutput,
             undefined,
-            deps,
+            writes,
             stageRecord.id,
             outputRef._artifactKey,
           );

@@ -1,4 +1,3 @@
-import { RunWritersActiveError } from "../../persistence/interface.js";
 /**
  * Handler: run.purge
  *
@@ -40,6 +39,7 @@ import { RunWritersActiveError } from "../../persistence/interface.js";
 import type {
   PurgeableRun,
   PurgeableRunStatus,
+  RunPurgeFence,
 } from "../../persistence/interface.js";
 import type {
   RunPurgeByAgeCommand,
@@ -119,7 +119,8 @@ export async function handleRunPurge(
               return (
                 run !== null &&
                 statuses.some((status) => status === run.status) &&
-                !(await postDeps.persistence.isRunPurgeReserved?.(id)) &&
+                // A stage execution or cancel sweep still writing for it.
+                !(await postDeps.persistence.hasRunWriters?.(id)) &&
                 (run.completedAt ?? run.updatedAt) <= command.olderThan
               );
             };
@@ -219,15 +220,19 @@ export class AICallDeletionUnavailableError extends Error {
   }
 }
 
-export class RunPurgeInProgressError extends Error {
-  readonly code = "RUN_PURGE_IN_PROGRESS";
-
-  constructor(public readonly workflowRunId: string) {
-    super(`Run ${workflowRunId} is reserved for erasure`);
-    this.name = "RunPurgeInProgressError";
-  }
-}
-
+/**
+ * Erasure by run id or tenant, run by run, outside any transaction.
+ *
+ * A terminal run with no registered writer (see `run-writes.ts`) has its
+ * external data deleted first (blobs, AI calls, jobs, a pluggable ledger's
+ * steps), while its rows still name them; then one transaction deletes its
+ * rows and, last, the run row on the status and version read at the start.
+ * A redrive since then makes that delete match nothing and the transaction
+ * roll back: the run is reported `persistence` and stays discoverable. No
+ * writer is admitted once a run has ended, so none can start after the
+ * check; one admitted before is waited for (`writers`). A run already gone
+ * still has what is recorded under its id removed.
+ */
 export async function handleTargetedRunPurge(
   command: RunPurgeByTargetCommand,
   deps: KernelDeps,
@@ -236,18 +241,21 @@ export async function handleTargetedRunPurge(
   const aiLogger = deps.services?.aiLogger;
   if (!aiLogger?.deleteForRuns)
     throw new AICallDeletionUnavailableError("deleteForRuns");
+  // Writer registration is what keeps a run from being erased under a
+  // write, so an adapter without it cannot erase by name.
   if (
-    !persistence.reserveRunPurge ||
     !persistence.purgeRun ||
-    !persistence.isRunPurgeReserved ||
+    !persistence.purgeJobKeys ||
+    !persistence.listArchivedStageRecordIds ||
     !persistence.beginRunWrite ||
-    !persistence.endRunWrite
+    !persistence.refreshRunWrite ||
+    !persistence.endRunWrite ||
+    !persistence.hasRunWriters
   ) {
     throw new Error(
       "Targeted run erasure requires a persistence adapter with purge support",
     );
   }
-
   if (!blobStore.deleteForPurge || (stepLedger && !stepLedger.deleteForPurge)) {
     throw new Error(
       "Targeted run erasure requires atomic blob and ledger delete counts",
@@ -288,45 +296,42 @@ export async function handleTargetedRunPurge(
       "persistence";
     try {
       const run = await persistence.getRun(id);
-      if (!run || ("tenantId" in command && command.tenantId !== run.tenantId))
+      if (!run && "tenantId" in command) continue;
+      if (run && "tenantId" in command && command.tenantId !== run.tenantId)
         continue;
-      const terminal = DEFAULT_PURGE_STATUSES.find(
-        (status) => status === run.status,
-      );
-      if (!terminal) {
-        skipped.push({ workflowRunId: id, status: run.status });
-        continue;
+      let fence: RunPurgeFence | null = null;
+      let prefixes = [jobSpillPrefix(id)];
+      let stageRecordIds: string[] = [];
+      if (run) {
+        const terminal = DEFAULT_PURGE_STATUSES.find(
+          (status) => status === run.status,
+        );
+        if (!terminal) {
+          skipped.push({ workflowRunId: id, status: run.status });
+          continue;
+        }
+        // A writer admitted before the run ended can still write. No new one
+        // is admitted now, so a later request finds it gone.
+        if (await persistence.hasRunWriters(id)) {
+          incomplete.push({ workflowRunId: id, failed: ["writers"] });
+          continue;
+        }
+        fence = { id, status: terminal, version: run.version };
+        stageRecordIds = [
+          ...new Set([
+            ...(await persistence.getStagesByRun(id)).map((stage) => stage.id),
+            ...(await persistence.listArchivedStageRecordIds(id)),
+          ]),
+        ];
+        prefixes = runBlobPrefixes({ ...run, stageRecordIds });
       }
-      // Older redrives archived caller-writable annotation payloads. A
-      // verified owner list is required before erasing those spill prefixes.
-      if (run.redriveCount > 0 && run.archivedStageRecordIds === undefined) {
-        incomplete.push({ workflowRunId: id, failed: ["archive"] });
-        continue;
-      }
-      const fence = { id, status: terminal, version: run.version };
-      const stages = await persistence.getStagesByRun(id);
-      const stageRecordIds = [
-        ...new Set([
-          ...stages.map((stage) => stage.id),
-          ...(run.archivedStageRecordIds ?? []),
-        ]),
-      ];
-      phase = "jobs";
-      const jobs = await (jobTransport.getJobsForPurge?.(id) ??
-        jobTransport.getJobsByWorkflowRun(id));
-      phase = "persistence";
-      await persistence.reserveRunPurge(
-        fence,
-        jobs.map((job) => job.id),
-      );
+      // Without a run (an earlier request or an age sweep deleted it), what
+      // is found by its id alone still goes: AI calls, jobs, keys, outbox.
 
-      // Blobs go first so a storage failure leaves all attributed rows and
-      // the stage ids needed to recompute prefixes for the next request.
+      // External stores first, while the run and its stage records still
+      // exist: a failure here leaves everything needed to repeat the request.
       phase = "blobs";
-      for (const prefix of runBlobPrefixes({
-        ...run,
-        stageRecordIds,
-      })) {
+      for (const prefix of prefixes) {
         for (const key of await blobStore.list(prefix)) {
           if (!key.startsWith(prefix)) continue;
           if (await blobStore.deleteForPurge(key)) removed.blobs++;
@@ -335,6 +340,15 @@ export async function handleTargetedRunPurge(
       phase = "aiCalls";
       removed.aiCalls += await aiLogger.deleteForRuns([id]);
 
+      phase = "jobs";
+      const jobs = await (jobTransport.getJobsForPurge?.(id) ??
+        jobTransport.getJobsByWorkflowRun(id));
+      // A key from a release that did not stamp run ids names only the job:
+      // it goes before the jobs, or a retry could no longer find it.
+      phase = "persistence";
+      removed.idempotencyKeys += await persistence.purgeJobKeys(
+        jobs.map((job) => job.id),
+      );
       phase = "jobs";
       removed.jobs += await (jobTransport.deleteForRun?.(id) ??
         jobTransport.deleteByRunAndStages(id, [
@@ -349,19 +363,17 @@ export async function handleTargetedRunPurge(
         ) ?? 0);
       }
 
+      // Rolls back when a redrive or rerun changed the run since it was read.
       phase = "persistence";
       const counts = await persistence.withTransaction((tx) =>
-        tx.purgeRun!(fence, stageRecordIds),
+        tx.purgeRun!(id, fence, stageRecordIds),
       );
-      removed.runs++;
+      if (fence) removed.runs++;
       for (const key of Object.keys(counts) as (keyof typeof counts)[]) {
         removed[key] += counts[key];
       }
-    } catch (error) {
-      incomplete.push({
-        workflowRunId: id,
-        failed: [error instanceof RunWritersActiveError ? "writers" : phase],
-      });
+    } catch {
+      incomplete.push({ workflowRunId: id, failed: [phase] });
     }
   }
   return { removed, skipped, incomplete };

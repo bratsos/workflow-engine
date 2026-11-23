@@ -545,6 +545,11 @@ export interface RunPurgeCounts {
 export interface RunPurgeByTargetResult {
   readonly removed: RunPurgeCounts;
   readonly skipped: { workflowRunId: string; status: Status }[];
+  /**
+   * Runs to request again. `writers`: a stage execution or cancel sweep was
+   * still writing for the run. `persistence`: a redrive changed the run since
+   * it was read, or its rows could not be deleted.
+   */
   readonly incomplete: {
     workflowRunId: string;
     failed: (
@@ -554,7 +559,6 @@ export interface RunPurgeByTargetResult {
       | "steps"
       | "persistence"
       | "writers"
-      | "archive"
     )[];
   }[];
 }

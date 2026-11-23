@@ -540,15 +540,6 @@ export async function handleRunRedrive(
     totalCost: 0,
     totalTokens: 0,
     redriveCount: run.redriveCount + 1,
-    ...((run.redriveCount === 0 ||
-      run.archivedStageRecordIds !== undefined) && {
-      archivedStageRecordIds: [
-        ...new Set([
-          ...(run.archivedStageRecordIds ?? []),
-          ...stagesToDelete.map((stage) => stage.id),
-        ]),
-      ],
-    }),
     ...(definitionVersion !== run.definitionVersion
       ? { definitionVersion }
       : {}),

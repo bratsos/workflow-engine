@@ -117,14 +117,13 @@ export interface RunPurgePersistenceCounts {
   idempotencyKeys: number;
 }
 
-export class RunWritersActiveError extends Error {
-  constructor() {
-    super("Run still has active writers");
-    this.name = "RunWritersActiveError";
-  }
-}
-
-export const RUN_PURGE_RESERVATION = "run.purge.reserve";
+/**
+ * How long a run writer registration (`beginRunWrite`) counts as live after
+ * its last refresh. A process refreshes its registrations at a third of this
+ * while it holds them, so a registration whose process died stops blocking
+ * erasure after this long.
+ */
+export const RUN_WRITE_LEASE_MS = 60_000;
 
 export interface WorkflowRunRecord {
   id: string;
@@ -156,7 +155,6 @@ export interface WorkflowRunRecord {
   definitionVersion: string | null;
   /** How many times `run.redrive` has re-driven this run. */
   redriveCount: number;
-  archivedStageRecordIds?: readonly string[];
 }
 
 export interface WorkflowStageRecord {
@@ -437,7 +435,6 @@ export interface UpdateRunInput {
   definitionVersion?: string | null;
   /** Absolute redrive count to store. `run.redrive` sets `current + 1`. */
   redriveCount?: number;
-  archivedStageRecordIds?: readonly string[];
 }
 
 /** A stored workflow definition snapshot, keyed by (workflowId, version). */
@@ -824,20 +821,41 @@ export interface PersistenceCore {
 
   /** Terminal runs are listed first, then live runs, up to the batch limit. */
   listTenantRunsForPurge?(tenantId: string, limit: number): Promise<string[]>;
-  /** Reserve the generation for erasure and remember the legacy job ids across retries. */
-  reserveRunPurge?(
-    fence: RunPurgeFence,
-    jobIds: readonly string[],
-  ): Promise<void>;
-  /** Reference steps on this client are deleted in the persistence transaction. */
+  /**
+   * Stage record ids the run's `run.supersededAttempt` annotations name
+   * (`run.redrive` writes one per record it deletes), without the ids that
+   * another run names as a current record or in its own archive: callers can
+   * write annotations too.
+   */
+  listArchivedStageRecordIds?(workflowRunId: string): Promise<string[]>;
+  /** Delete idempotency keys of these jobs (`job:<id>:attempt:<n>`). */
+  purgeJobKeys?(jobIds: readonly string[]): Promise<number>;
+  /**
+   * In a transaction: count and delete the run's rows, then the run row
+   * under `fence`, throwing when that matches no row so the transaction
+   * rolls back. With no fence (the run is already gone), only the rows
+   * that outlive a run (idempotency keys, outbox events) are deleted.
+   */
   purgeRun?(
-    fence: RunPurgeFence,
+    workflowRunId: string,
+    fence: RunPurgeFence | null,
     stageRecordIds: readonly string[],
   ): Promise<RunPurgePersistenceCounts>;
-  isRunPurgeReserved?(id: string): Promise<boolean>;
-  /** Register a writer or refuse it if the run is gone or reserved for erasure. */
-  beginRunWrite?(workflowRunId: string, token: string): Promise<boolean>;
+  /**
+   * Register a writer of the run's data, or refuse when the run is gone or
+   * has ended. `unchecked` registers whatever the status, for a caller whose
+   * own transaction is ending the run.
+   */
+  beginRunWrite?(
+    workflowRunId: string,
+    token: string,
+    options?: { unchecked?: boolean },
+  ): Promise<boolean>;
+  /** Renew the registration's lease; `false` when it no longer exists. */
+  refreshRunWrite?(token: string): Promise<boolean>;
   endRunWrite?(token: string): Promise<void>;
+  /** Whether a registration refreshed within `RUN_WRITE_LEASE_MS` exists. */
+  hasRunWriters?(workflowRunId: string): Promise<boolean>;
   pruneOutbox?(publishedOlderThan: Date, limit: number): Promise<number>;
   pruneIdempotencyKeys?(olderThan: Date, limit: number): Promise<number>;
 
@@ -1162,23 +1180,32 @@ export interface PersistenceCore {
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
-    | { status: "unavailable" }
   >;
 
-  /** Cache the completed result and stamp the run id when known. */
+  /**
+   * Cache the completed result and stamp the run id when known. A key that
+   * no longer exists is not recreated; with `acquiredAt`, only that
+   * acquisition is completed.
+   */
   completeIdempotencyKey(
     key: string,
     commandType: string,
     result: unknown,
     workflowRunId: string | null,
-    options?: { requireExistingRun?: boolean },
+    acquiredAt?: Date,
   ): Promise<void>;
 
   /**
    * Delete an idempotency key whatever its state: an in-progress key after a
-   * command failed, or a completed one nothing will replay any more.
+   * command failed, or a completed one nothing will replay any more. With
+   * `acquiredAt` (the `now` it was acquired with), only that acquisition is
+   * deleted: an erasure can remove the key and another command acquire it.
    */
-  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
+  releaseIdempotencyKey(
+    key: string,
+    commandType: string,
+    acquiredAt?: Date,
+  ): Promise<void>;
 }
 
 // ============================================================================
@@ -1281,6 +1308,11 @@ export interface JobQueue {
    */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
 
+  /** Read job identifiers without resolving job payloads for erasure. */
+  getJobsForPurge?(
+    workflowRunId: string,
+  ): Promise<{ id: string; stageId: string }[]>;
+  deleteForRun?(workflowRunId: string): Promise<number>;
   /**
    * Remove every job row for the given stages of a run, whatever their
    * status. Returns the number of rows removed.
@@ -1290,11 +1322,6 @@ export interface JobQueue {
    * the downstream stages it deletes without recreating, which nothing
    * would ever re-enqueue). An empty `stageIds` is a no-op.
    */
-  /** Read job identifiers without resolving job payloads for erasure. */
-  getJobsForPurge?(
-    workflowRunId: string,
-  ): Promise<{ id: string; stageId: string }[]>;
-  deleteForRun?(workflowRunId: string): Promise<number>;
   deleteByRunAndStages(
     workflowRunId: string,
     stageIds: string[],

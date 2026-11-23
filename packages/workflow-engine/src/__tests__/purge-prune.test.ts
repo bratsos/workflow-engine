@@ -3,13 +3,22 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { z } from "zod";
-import { defineStage } from "../core/stage-factory.js";
+import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { WorkflowBuilder } from "../core/workflow.js";
 import { runBlobPrefixes } from "../kernel/handlers/run-purge.js";
 import { SUPERSEDED_ATTEMPT_KEY } from "../kernel/handlers/run-redrive.js";
 import { runMaintenanceTick } from "../kernel/helpers/host-support.js";
+import { RUN_WRITE_LEASE_MS } from "../persistence/interface.js";
 import {
   createPrismaBlobStore,
   createPrismaJobQueue,
@@ -115,6 +124,76 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
         ...data,
       },
     });
+  }
+
+  /**
+   * A worker whose stage pauses on `gate`, then records an AI call and saves
+   * a blob. `late` writes again through the context the stage kept.
+   */
+  function pausingWorker(gate: ReturnType<typeof hold>) {
+    const writes: { late?: () => Promise<void> } = {};
+    const shape = z.object({ value: z.string() });
+    const workflow = new WorkflowBuilder(
+      db.workflow.id,
+      "Example",
+      "kernel",
+      shape,
+      shape,
+    )
+      .pipe(
+        defineStage({
+          id: "first",
+          name: "First",
+          schemas: { input: shape, output: shape, config: z.object({}) },
+          async execute(ctx) {
+            writes.late = async () => {
+              await ctx.aiLogger.logCall({
+                topic: "alternate-topic",
+                modelKey: "model",
+                modelId: "model",
+                callType: "text",
+                prompt: "",
+                response: "",
+                inputTokens: 1,
+                outputTokens: 1,
+                cost: 0,
+              });
+              await ctx.storage.save(ctx.storage.getStageKey("first", "late"), {
+                saved: true,
+              });
+            };
+            await gate.pause();
+            ctx.ai.recordCall({
+              modelKey: "gemini-2.5-flash",
+              callType: "text",
+              prompt: "",
+              response: "",
+              inputTokens: 1,
+              outputTokens: 1,
+            });
+            await ctx.storage.save(ctx.storage.getStageKey("first", "extra"), {
+              saved: true,
+            });
+            return { output: ctx.input };
+          },
+        }),
+      )
+      .build();
+    const worker = db.makeKernel({
+      registry: { getWorkflow: () => workflow },
+      services: { aiLogger: db.aiLogger },
+    });
+    return {
+      writes,
+      execute: (workflowRunId: string) =>
+        worker.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: workflow.id,
+          stageId: "first",
+          config: {},
+        }),
+    };
   }
 
   it("fails closed without an AI deletion port", async () => {
@@ -307,11 +386,14 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       services: { aiLogger: db.aiLogger },
       ...(winner === "purge"
         ? {
-            blobStore: override(db.blobStore, {
-              async deleteForPurge(key) {
-                await gate.pause();
-                return db.blobStore.deleteForPurge!(key);
-              },
+            // Holds the erasing transaction open after the run row went.
+            persistence: override(db.persistence, {
+              withTransaction: (fn) =>
+                db.persistence.withTransaction(async (tx) => {
+                  const result = await fn(tx);
+                  await gate.pause();
+                  return result;
+                }),
             }),
           }
         : {
@@ -329,67 +411,74 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       workflowRunIds: [id],
     });
     await gate.reached;
+    let reopening: Promise<unknown> | undefined;
     try {
-      const reopening = redriver.dispatch({
+      reopening = redriver.dispatch({
         type: "run.redrive",
         workflowRunId: id,
         from: { kind: "start" },
       });
-      if (winner === "purge") {
-        await expect(reopening).rejects.toMatchObject({
-          name: "RunPurgeInProgressError",
-        });
-        expect(await db.persistence.getStage(id, stage.stageId)).not.toBeNull();
-      } else {
-        await reopening;
-      }
+      if (winner === "redrive") await reopening;
     } finally {
       gate.release();
       await erasing;
     }
     if (winner === "purge") {
+      await expect(reopening).rejects.toThrow();
       expect(await erasing).toMatchObject({
         removed: { runs: 1, aiCalls: 1, blobs: 1 },
         incomplete: [],
       });
       expect(await db.persistence.getRun(id)).toBeNull();
+      expect(await db.client.workflowStage.count()).toBe(0);
       expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
-    } else {
-      expect(await erasing).toMatchObject({
-        removed: { runs: 0, aiCalls: 0, blobs: 0 },
-        incomplete: [{ workflowRunId: id, failed: ["persistence"] }],
-      });
-      expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
-      expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ status: "PENDING", stageId: "first" }),
-        ]),
-      );
+      return;
     }
-    expect(await db.blobStore.has(blob)).toBe(winner === "redrive");
-    expect(await db.client.aICall.count()).toBe(winner === "redrive" ? 1 : 0);
+    // The redrive committed first: the fenced delete rolled back and the
+    // reopened run keeps its rows; external data already went.
+    expect(await erasing).toMatchObject({
+      removed: { runs: 0, stages: 0, aiCalls: 1, blobs: 1 },
+      incomplete: [{ workflowRunId: id, failed: ["persistence"] }],
+    });
+    expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
+    expect(await db.persistence.getStage(id, stage.stageId)).not.toBeNull();
+    await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+    expect(
+      await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
+    ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
+    expect(await db.client.workflowStage.count()).toBe(0);
+    expect(await db.client.jobQueue.count()).toBe(0);
   });
 
   it("erases a genuine archived spill and ignores caller-submitted ownership claims", async () => {
     const archived = await db.seed("COMPLETED", "COMPLETED");
     const other = await db.seed();
+    const redriven = await db.seed("COMPLETED", "COMPLETED");
     const worker = kernel();
-    await worker.dispatch({
-      type: "run.redrive",
-      workflowRunId: archived.id,
-      from: { kind: "start" },
-    });
+    for (const run of [archived, redriven]) {
+      await worker.dispatch({
+        type: "run.redrive",
+        workflowRunId: run.id,
+        from: { kind: "start" },
+      });
+    }
     await worker.dispatch({ type: "run.cancel", workflowRunId: archived.id });
-    await worker.annotations.attach(archived.id, {
-      scope: "stage",
-      actor: { kind: "engine", id: "run.redrive" },
-      attributes: { [SUPERSEDED_ATTEMPT_KEY]: "FAILED" },
-      payload: { stageRecordId: other.stage.id },
-    });
+    // Claims on another run's current record and on another run's archive.
+    for (const claimed of [other.stage.id, redriven.stage.id]) {
+      await worker.annotations.attach(archived.id, {
+        scope: "stage",
+        actor: { kind: "engine", id: "run.redrive" },
+        attributes: { [SUPERSEDED_ATTEMPT_KEY]: "FAILED" },
+        payload: { stageRecordId: claimed },
+      });
+    }
     const stale = `workflow-v2/spill/step-writes/${archived.stage.id}/step/value.json`;
-    const foreign = `workflow-v2/spill/steps/${other.stage.id}/step.json`;
-    await db.blobStore.put(stale, { saved: true });
-    await db.blobStore.put(foreign, { saved: true });
+    const foreign = [
+      `workflow-v2/spill/steps/${other.stage.id}/step.json`,
+      `workflow-v2/spill/step-writes/${redriven.stage.id}/step/value.json`,
+    ];
+    for (const key of [stale, ...foreign])
+      await db.blobStore.put(key, { saved: true });
     expect(
       await worker.dispatch({
         type: "run.purge",
@@ -397,11 +486,11 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       }),
     ).toMatchObject({ removed: { runs: 1, blobs: 1 }, incomplete: [] });
     expect(await db.blobStore.has(stale)).toBe(false);
-    expect(await db.blobStore.has(foreign)).toBe(true);
+    for (const key of foreign) expect(await db.blobStore.has(key)).toBe(true);
   });
 
-  it("keeps a legacy redrive discoverable when archived ownership is unavailable", async () => {
-    const { id } = await db.seed("COMPLETED", "COMPLETED");
+  it("erases the archived attempts of a run redriven before this release", async () => {
+    const { id, stage } = await db.seed("COMPLETED", "COMPLETED");
     const worker = kernel();
     await worker.dispatch({
       type: "run.redrive",
@@ -409,83 +498,28 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       from: { kind: "start" },
     });
     await worker.dispatch({ type: "run.cancel", workflowRunId: id });
-    await writeRetentionSql(
-      db.client,
-      sqlite ? "sqlite" : "postgresql",
-      `UPDATE "workflow_runs" SET "archivedStageRecordIds" = NULL WHERE "id" = $1`,
-      [id],
-    );
+    // What an earlier release left: unstamped keys and an archived record's
+    // spilled step, found only through the redrive's archive annotation.
+    await db.client.idempotencyKey.updateMany({
+      data: { workflowRunId: null },
+    });
+    const archived = `workflow-v2/spill/step-writes/${stage.id}/step/value.json`;
+    await db.blobStore.put(archived, { saved: true });
+    expect(await db.persistence.getStage(id, stage.stageId)).not.toMatchObject({
+      id: stage.id,
+    });
     expect(
       await worker.dispatch({ type: "run.purge", workflowRunIds: [id] }),
-    ).toMatchObject({
-      removed: { runs: 0 },
-      incomplete: [{ workflowRunId: id, failed: ["archive"] }],
-    });
-    expect(await db.persistence.getRun(id)).not.toBeNull();
+    ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
+    expect(await db.blobStore.has(archived)).toBe(false);
+    expect(await db.client.workflowAnnotation.count()).toBe(0);
   });
 
   it("keeps cancelled stage writes discoverable until they drain", async () => {
     const { id } = await db.seed();
     const gate = hold();
-    let lateWrite!: () => Promise<void>;
-    const shape = z.object({ value: z.string() });
-    const workflow = new WorkflowBuilder(
-      db.workflow.id,
-      "Example",
-      "kernel",
-      shape,
-      shape,
-    )
-      .pipe(
-        defineStage({
-          id: "first",
-          name: "First",
-          schemas: { input: shape, output: shape, config: z.object({}) },
-          async execute(ctx) {
-            lateWrite = async () => {
-              await ctx.aiLogger.logCall({
-                topic: "alternate-topic",
-                modelKey: "model",
-                modelId: "model",
-                callType: "text",
-                prompt: "",
-                response: "",
-                inputTokens: 1,
-                outputTokens: 1,
-                cost: 0,
-              });
-              await ctx.storage.save(ctx.storage.getStageKey("first", "late"), {
-                saved: true,
-              });
-            };
-            await gate.pause();
-            ctx.ai.recordCall({
-              modelKey: "gemini-2.5-flash",
-              callType: "text",
-              prompt: "",
-              response: "",
-              inputTokens: 1,
-              outputTokens: 1,
-            });
-            await ctx.storage.save(ctx.storage.getStageKey("first", "extra"), {
-              saved: true,
-            });
-            return { output: ctx.input };
-          },
-        }),
-      )
-      .build();
-    const worker = db.makeKernel({
-      registry: { getWorkflow: () => workflow },
-      services: { aiLogger: db.aiLogger },
-    });
-    const executing = worker.dispatch({
-      type: "job.execute",
-      workflowRunId: id,
-      workflowId: workflow.id,
-      stageId: "first",
-      config: {},
-    });
+    const worker = pausingWorker(gate);
+    const executing = worker.execute(id);
     await gate.reached;
     const erase = { type: "run.purge", workflowRunIds: [id] } as const;
     try {
@@ -501,9 +535,11 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     }
     const result = await kernel().dispatch(erase);
     expect(result).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
-    await lateWrite();
+    // A context the stage kept writes nothing for the erased run.
+    await worker.writes.late!();
     expect(await db.client.aICall.count()).toBe(0);
     expect(await db.client.workflowBlob.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
   });
 
   it.each([
@@ -575,69 +611,277 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
         { timeout: 25_000 },
       ),
     ).rejects.toMatchObject({ code: 77 });
+    // The key named only the job, so it went before the job did.
     expect(await db.client.jobQueue.count()).toBe(0);
-    expect(await db.client.idempotencyKey.count()).toBe(2);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
     expect(
       await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
-    ).toMatchObject({
-      removed: { runs: 1, idempotencyKeys: 1 },
-      incomplete: [],
-    });
-    expect(await db.client.idempotencyKey.count()).toBe(0);
+    ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
+    expect(await db.client.workflowRun.count()).toBe(0);
   }, 30_000);
 
-  it("keeps targeted cleanup discoverable when an age sweep tries a late delete", async () => {
-    const { id } = await db.seed("COMPLETED", "COMPLETED");
-    await seedCall("attributed", { workflowRunId: id });
-    const ageDelete = hold();
-    const targetedList = hold();
+  it("keeps a written run from the age sweep and erases what the sweep leaves", async () => {
+    const { id } = await db.seed();
+    const gate = hold();
+    const worker = pausingWorker(gate);
+    const executing = worker.execute(id);
+    await gate.reached;
+    const sweep = {
+      type: "run.purge",
+      olderThan: new Date("2090-01-01T00:00:00Z"),
+    } as const;
+    const erase = { type: "run.purge", workflowRunIds: [id] } as const;
+    try {
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(await kernel().dispatch(sweep)).toMatchObject({ purged: 0 });
+      expect(await kernel().dispatch(erase)).toMatchObject({
+        incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+      });
+    } finally {
+      gate.release();
+      await executing;
+    }
+    await db.client.idempotencyKey.create({
+      data: {
+        key: "k",
+        commandType: "run.create",
+        workflowRunId: id,
+        result: {},
+      },
+    });
+    expect(await kernel().dispatch(sweep)).toMatchObject({ purged: 1 });
+    // Age retention keeps AI calls, events and keys; erasure by id finds them.
+    expect(await db.client.aICall.count()).toBe(1);
+    const outboxEvents = await db.client.outboxEvent.count();
+    expect(outboxEvents).toBeGreaterThan(0);
+    expect(await kernel().dispatch(erase)).toEqual({
+      removed: expect.objectContaining({
+        runs: 0,
+        aiCalls: 1,
+        outboxEvents,
+        idempotencyKeys: 1,
+      }),
+      skipped: [],
+      incomplete: [],
+    });
+    expect(await db.client.aICall.count()).toBe(0);
+    expect(await db.client.outboxEvent.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it("stops counting a writer that stopped refreshing, and fences its late writes", async () => {
+    const { id } = await db.seed();
+    const gate = hold();
+    const worker = pausingWorker(gate);
+    const executing = worker.execute(id).catch(() => {});
+    await gate.reached;
+    const erase = { type: "run.purge", workflowRunIds: [id] } as const;
+    try {
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(await kernel().dispatch(erase)).toMatchObject({
+        incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+      });
+      // The worker's refreshes stop (a crash, or a stall): once the lease
+      // lapses, its registration no longer holds erasure back.
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      vi.setSystemTime(Date.now() + RUN_WRITE_LEASE_MS + 1000);
+      expect(await kernel().dispatch(erase)).toMatchObject({
+        removed: { runs: 1 },
+        incomplete: [],
+      });
+      // A stalled worker that resumes checks its registration first.
+      gate.release();
+      await executing;
+    } finally {
+      gate.release();
+      await executing;
+      vi.useRealTimers();
+    }
+    expect(await db.client.aICall.count()).toBe(0);
+    expect(await db.client.workflowBlob.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it.each([
+    "fails",
+    "completes",
+  ] as const)("leaves a key acquired after an erasure to its command when a delayed one %s", async (outcome) => {
+    const first = await db.seed("COMPLETED", "COMPLETED");
+    const second = await db.seed("COMPLETED", "COMPLETED");
+    const gate = hold();
     const other = createPrismaWorkflowPersistence(sibling, {
       databaseType: sqlite ? "sqlite" : "postgresql",
     });
-    const age = db.makeKernel({
+    const delayed = db.makeKernel({
       persistence: override(other, {
-        async deleteRun(...args) {
-          await ageDelete.pause();
-          return other.deleteRun(...args);
+        async completeIdempotencyKey(...args) {
+          await gate.pause();
+          if (outcome === "fails") throw new Error("store unavailable");
+          await other.completeIdempotencyKey(...args);
         },
       }),
     });
-    const aging = age.dispatch({ type: "run.purge", olderThan: cutoff });
-    await ageDelete.reached;
-    const erasing = db
-      .makeKernel({
-        services: { aiLogger: db.aiLogger },
-        blobStore: override(db.blobStore, {
-          async list() {
-            await targetedList.pause();
-            throw new Error("storage unavailable");
+    const redrive = (workflowRunId: string) =>
+      ({
+        type: "run.redrive",
+        workflowRunId,
+        from: { kind: "start" },
+        idempotencyKey: "reopen",
+      }) as const;
+    const reopening = delayed.dispatch(redrive(first.id));
+    await gate.reached;
+    try {
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: first.id });
+      expect(
+        await kernel().dispatch({
+          type: "run.purge",
+          workflowRunIds: [first.id],
+        }),
+      ).toMatchObject({ removed: { runs: 1, idempotencyKeys: 1 } });
+      await kernel().dispatch(redrive(second.id));
+    } finally {
+      gate.release();
+      await reopening.catch(() => {});
+    }
+    // The key now answers for the second run's command only.
+    expect(await db.client.idempotencyKey.findMany()).toEqual([
+      expect.objectContaining({
+        key: "reopen",
+        workflowRunId: second.id,
+        result: expect.objectContaining({ workflowRunId: second.id }),
+      }),
+    ]);
+  });
+
+  it("keeps a cancelled run from erasure until its batch sweep ends", async () => {
+    const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
+    const ref = {
+      version: 1,
+      type: "text",
+      id: "batch-1",
+      provider: "fake",
+      modelId: "model",
+    } as const;
+    await db.persistence.updateStage(stage.id, {
+      suspendedState: { batchId: id, metadata: { batchRefs: [ref] } },
+    });
+    const cancelled: string[] = [];
+    const model = {
+      provider: "fake",
+      modelId: "model",
+      start: async () => {
+        throw new Error("not used");
+      },
+      status: async () => ({ status: "processing" as const }),
+      cancel: async (batch: { id: string }) => {
+        cancelled.push(batch.id);
+        return { outcome: "cancelled" as const, rawStatus: "cancelling" };
+      },
+      results: async function* () {},
+    };
+    const gate = hold();
+    let paused = false;
+    const canceller = db.makeKernel({
+      services: { batchModels: () => model as any },
+      persistence: override(db.persistence, {
+        async getStagesByRun(...args) {
+          // The sweep's first read, after the cancel committed.
+          if (!paused) {
+            paused = true;
+            await gate.pause();
+          }
+          return db.persistence.getStagesByRun(...args);
+        },
+      }),
+    });
+    const cancelling = canceller.dispatch({
+      type: "run.cancel",
+      workflowRunId: id,
+    });
+    await gate.reached;
+    const erase = { type: "run.purge", workflowRunIds: [id] } as const;
+    try {
+      expect((await db.persistence.getRun(id))?.status).toBe("CANCELLED");
+      expect(await kernel().dispatch(erase)).toMatchObject({
+        removed: { runs: 0, blobs: 0 },
+        incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+      });
+    } finally {
+      gate.release();
+      await cancelling;
+    }
+    expect(cancelled).toEqual(["batch-1"]);
+    expect(await kernel().dispatch(erase)).toMatchObject({
+      removed: { runs: 1 },
+      incomplete: [],
+    });
+  });
+
+  it("answers commands for an erased run as before erasure existed", async () => {
+    const { id } = await db.seed("COMPLETED", "COMPLETED");
+    const worker = kernel();
+    await worker.dispatch({ type: "run.purge", workflowRunIds: [id] });
+    await expect(
+      worker.dispatch({
+        type: "step.signal",
+        workflowRunId: id,
+        stageId: "first",
+        stepId: "approval",
+        payload: {},
+      }),
+    ).rejects.toThrow("not found");
+    await expect(
+      worker.annotations.attach(id, { attributes: { "test.key": "late" } }),
+    ).rejects.toThrow();
+    expect(await db.client.workflowAnnotation.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it("keeps a poll from writing for a run erased while it checked", async () => {
+    const { id } = await db.seed("RUNNING", "SUSPENDED");
+    const gate = hold();
+    const shape = z.object({ value: z.string() });
+    const workflow = new WorkflowBuilder(
+      db.workflow.id,
+      "Example",
+      "kernel",
+      shape,
+      shape,
+    )
+      .pipe(
+        defineAsyncBatchStage({
+          id: "first",
+          name: "First",
+          mode: "async-batch",
+          schemas: { input: shape, output: shape, config: z.object({}) },
+          async execute(ctx) {
+            return { output: ctx.input };
+          },
+          async checkCompletion(_state, ctx) {
+            await gate.pause();
+            await ctx.storage.save(ctx.storage.getStageKey("first", "late"), {
+              saved: true,
+            });
+            return { ready: true, output: { value: "polled" } };
           },
         }),
-      })
-      .dispatch({ type: "run.purge", workflowRunIds: [id] });
-    await targetedList.reached;
-    const redrive = {
-      type: "run.redrive",
-      workflowRunId: id,
-      from: { kind: "start" },
-      idempotencyKey: "reopen-reserved",
-    } as const;
+      )
+      .build();
+    const polling = db
+      .makeKernel({ registry: { getWorkflow: () => workflow } })
+      .dispatch({ type: "stage.pollSuspended" });
+    await gate.reached;
     try {
-      await expect(kernel().dispatch(redrive)).rejects.toMatchObject({
-        code: "RUN_PURGE_IN_PROGRESS",
-      });
-      ageDelete.release();
-      expect(await aging).toMatchObject({ purged: 0 });
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(
+        await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
+      ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
     } finally {
-      ageDelete.release();
-      targetedList.release();
-      await Promise.all([aging, erasing]);
+      gate.release();
+      await polling;
     }
-    expect(
-      await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
-    ).toMatchObject({ removed: { runs: 1, aiCalls: 1 }, incomplete: [] });
-    await expect(kernel().dispatch(redrive)).rejects.toThrow("not found");
-    expect(await db.client.idempotencyKey.count()).toBe(0);
+    expect(await db.client.workflowBlob.count()).toBe(0);
+    expect(await db.client.workflowRun.count()).toBe(0);
   });
 
   it("counts a shared blob once when two kernels listed it before deleting", async () => {

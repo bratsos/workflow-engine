@@ -68,11 +68,7 @@ import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
 import { handleRunListVersions } from "./handlers/run-list-versions";
-import {
-  handleRunPurge,
-  handleTargetedRunPurge,
-  RunPurgeInProgressError,
-} from "./handlers/run-purge";
+import { handleRunPurge, handleTargetedRunPurge } from "./handlers/run-purge";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRedrive } from "./handlers/run-redrive";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
@@ -85,7 +81,7 @@ import {
   filterCouldMatchLegacy,
   synthesizeLegacyMetadata,
 } from "./helpers/index.js";
-import { beginRunWrite, writeForRun } from "./helpers/run-writes.js";
+import { fenceRunWrites, openRunWriter } from "./helpers/run-writes.js";
 import { withTransactionReads } from "./helpers/transaction-reads.js";
 import type {
   ActivityExecutor,
@@ -392,19 +388,20 @@ export function createKernel(config: KernelConfig): Kernel {
     key: string | undefined,
     commandType: string,
     getWorkflowRunId: (result: R) => string | null,
-    fn: (acquiredKey?: string) => Promise<R>,
+    fn: (acquiredAt?: Date) => Promise<R>,
     completedInTransaction: () => boolean = () => false,
     workflowRunId?: string,
   ): Promise<R> {
     if (!key) return fn();
 
+    const acquiredAt = clock.now();
     const acquired = await persistence.acquireIdempotencyKey(key, commandType, {
-      now: clock.now(),
+      now: acquiredAt,
       staleInProgressAfterMs: idempotencyStaleInProgressMs,
+      // Stamped now, so erasing the run erases the key while in progress.
       ...(workflowRunId !== undefined ? { workflowRunId } : {}),
     });
 
-    if (acquired.status === "unavailable") return fn();
     if (acquired.status === "replay") {
       return acquired.result as R;
     }
@@ -413,23 +410,25 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     try {
-      const result = await fn(key);
+      const result = await fn(acquiredAt);
       if (!completedInTransaction()) {
         await persistence.completeIdempotencyKey(
           key,
           commandType,
           result,
           getWorkflowRunId(result),
-          { requireExistingRun: true },
+          acquiredAt,
         );
       }
       return result;
     } catch (error) {
       // A key completed in the command's transaction stays: releasing it
       // after that commit would let a retry run the command a second time.
+      // Only this acquisition: an erasure may have removed the key and
+      // another command acquired it since.
       if (!completedInTransaction()) {
         await persistence
-          .releaseIdempotencyKey(key, commandType)
+          .releaseIdempotencyKey(key, commandType, acquiredAt)
           .catch(() => {});
       }
       throw error;
@@ -493,13 +492,7 @@ export function createKernel(config: KernelConfig): Kernel {
       return stripEvents(await handleLeaseReapStale(command, deps));
     }
     if (command.type === "step.signal") {
-      const done = await beginRunWrite(persistence, command.workflowRunId);
-      if (!done) throw new RunPurgeInProgressError(command.workflowRunId);
-      try {
-        return stripEvents(await handleStepSignal(command, deps));
-      } finally {
-        await done();
-      }
+      return stripEvents(await handleStepSignal(command, deps));
     }
 
     // -----------------------------------------------------------------
@@ -546,13 +539,21 @@ export function createKernel(config: KernelConfig): Kernel {
         command.type,
         () => command.workflowRunId,
         async () => {
-          const done = await beginRunWrite(persistence, command.workflowRunId);
-          // With no admission, preflight still returns the existing missing
-          // or terminal-run verdict before an execution can start.
+          // Refused (the run has ended), the execution writes nothing; the
+          // preflight answers as before.
+          const writer = await openRunWriter(
+            persistence,
+            command.workflowRunId,
+          );
           try {
-            return stripEvents(await handleJobExecute(command, deps));
+            return stripEvents(
+              await handleJobExecute(
+                command,
+                fenceRunWrites(deps, command.workflowRunId, writer),
+              ),
+            );
           } finally {
-            await done?.();
+            await writer.close();
           }
         },
         undefined,
@@ -577,10 +578,11 @@ export function createKernel(config: KernelConfig): Kernel {
       idempotencyKey,
       command.type,
       getWorkflowRunId,
-      async (acquiredKey) => {
+      async (acquiredAt) => {
         let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
         let completedHere = false;
+        let writerToken: string | undefined;
         const publicResult = await persistence.withTransaction(async (tx) => {
           // A root-client read can wait on the very connection this transaction
           // holds. Supporting ports bind reads to its snapshot, keeping every
@@ -608,14 +610,6 @@ export function createKernel(config: KernelConfig): Kernel {
                 }
               : services,
           };
-          const reopening =
-            command.type === "run.redrive" || command.type === "run.rerunFrom";
-          if (
-            reopening &&
-            (await tx.isRunPurgeReserved?.(command.workflowRunId))
-          ) {
-            throw new RunPurgeInProgressError(command.workflowRunId);
-          }
           let result: HandlerResult<any>;
 
           switch (command.type) {
@@ -651,14 +645,19 @@ export function createKernel(config: KernelConfig): Kernel {
             }
           }
 
-          // Reopening holds the run's write lock by now. Check the
-          // reservation under that lock so either the reopen commits first
-          // or its entire transaction rolls back before erasure continues.
+          // The cancel's provider batch sweep reads what an erasure deletes.
+          // Registered with the commit that ends the run, before any erasure
+          // can start, and released when the sweep is done.
           if (
-            reopening &&
-            (await tx.isRunPurgeReserved?.(command.workflowRunId))
+            command.type === "run.cancel" &&
+            result._postCommit &&
+            (result as HandlerResult<RunCancelResult>).cancelled &&
+            tx.beginRunWrite
           ) {
-            throw new RunPurgeInProgressError(command.workflowRunId);
+            writerToken = crypto.randomUUID();
+            await tx.beginRunWrite(command.workflowRunId, writerToken, {
+              unchecked: true,
+            });
           }
 
           const events = result._events;
@@ -682,13 +681,13 @@ export function createKernel(config: KernelConfig): Kernel {
           // the same transaction as the command's writes: a crash or a failed
           // completion after the commit can no longer leave a committed run
           // behind a released key, which a retry would create a second time.
-          if (acquiredKey && !postCommit) {
+          if (idempotencyKey && !postCommit) {
             await tx.completeIdempotencyKey(
-              acquiredKey,
+              idempotencyKey,
               command.type,
               stripped,
               getWorkflowRunId(stripped),
-              { requireExistingRun: "workflowRunId" in command },
+              acquiredAt,
             );
             completedHere = true;
           }
@@ -707,16 +706,24 @@ export function createKernel(config: KernelConfig): Kernel {
           // Runs only now that the transaction has committed — the DB
           // state this side effect depends on (e.g. deleted stage rows)
           // can no longer be rolled back out from under it.
-          const outcome =
-            "workflowRunId" in command
-              ? await writeForRun(persistence, command.workflowRunId, () =>
-                  postCommit!(deps),
+          const writer =
+            writerToken && "workflowRunId" in command
+              ? await openRunWriter(
+                  persistence,
+                  command.workflowRunId,
+                  writerToken,
                 )
-              : await postCommit(deps);
+              : undefined;
+          let outcome: unknown;
+          try {
+            outcome = await postCommit(deps);
+          } finally {
+            await writer?.close();
+          }
           // A sweep reports what it deleted, not what selection found.
           if (command.type === "run.purge") return outcome as RunPurgeResult;
           // The provider batches cancelled after the commit are part of the answer.
-          if (command.type === "run.cancel" && outcome !== undefined) {
+          if (command.type === "run.cancel") {
             return {
               ...(publicResult as RunCancelResult),
               batches: outcome as RunCancelResult["batches"],
@@ -724,7 +731,6 @@ export function createKernel(config: KernelConfig): Kernel {
           }
           if (
             command.type === "run.redrive" &&
-            outcome !== undefined &&
             (outcome as RunCancelResult["batches"]).length > 0
           ) {
             return {
@@ -797,23 +803,21 @@ export function createKernel(config: KernelConfig): Kernel {
       // Wrap in a transaction so all attributes commit atomically.
       // Without this, an external-attach batch could partial-commit if
       // the persistence layer fails mid-write.
-      await writeForRun(persistence, workflowRunId, () =>
-        persistence.withTransaction(async (tx) => {
-          await tx.appendAnnotations(inputs);
-          const events = buildAnnotationEvents(inputs, clock.now());
-          if (events.length > 0) {
-            await tx.appendOutboxEvents(
-              events.map((event) => ({
-                workflowRunId: event.workflowRunId,
-                eventType: event.type,
-                payload: event,
-                causationId,
-                occurredAt: event.timestamp,
-              })),
-            );
-          }
-        }),
-      );
+      await persistence.withTransaction(async (tx) => {
+        await tx.appendAnnotations(inputs);
+        const events = buildAnnotationEvents(inputs, clock.now());
+        if (events.length > 0) {
+          await tx.appendOutboxEvents(
+            events.map((event) => ({
+              workflowRunId: event.workflowRunId,
+              eventType: event.type,
+              payload: event,
+              causationId,
+              occurredAt: event.timestamp,
+            })),
+          );
+        }
+      });
     },
     async list(workflowRunId, filters) {
       const persisted = await persistence.listAnnotations(

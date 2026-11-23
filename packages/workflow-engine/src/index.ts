@@ -354,7 +354,6 @@ export type {
 export {
   AICallDeletionUnavailableError,
   type PruneOptions,
-  RunPurgeInProgressError,
 } from "./kernel/index.js";
 export {
   createKernel,
@@ -413,5 +412,6 @@ export {
   DefinitionRegistrationRetryableError,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
+  RUN_WRITE_LEASE_MS,
   StaleVersionError,
 } from "./persistence/interface";

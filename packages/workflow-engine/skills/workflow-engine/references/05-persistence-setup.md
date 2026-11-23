@@ -496,7 +496,6 @@ model WorkflowRun {
   // How many times `run.redrive` has re-driven this run (Step Functions'
   // redrive count). Never reset -- it counts the whole life of the run.
   redriveCount      Int     @default(0)
-  archivedStageRecordIds Json?
 
   stages        WorkflowStage[]
   logs          WorkflowLog[]

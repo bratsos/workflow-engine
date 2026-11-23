@@ -5,3 +5,6 @@ CREATE INDEX IF NOT EXISTS "idempotency_keys_legacy_run_idx"
   ON "idempotency_keys" (("result"->>'workflowRunId')) WHERE "workflowRunId" IS NULL;
 CREATE INDEX IF NOT EXISTS "idempotency_keys_legacy_prefix_idx"
   ON "idempotency_keys" ("commandType", "key" COLLATE "C") WHERE "workflowRunId" IS NULL;
+-- Erasure checks that no other run archived a stage record it is about to erase.
+CREATE INDEX IF NOT EXISTS "workflow_annotations_archived_record_idx"
+  ON "workflow_annotations" (("payload"->>'stageRecordId')) WHERE "key" = 'run.supersededAttempt';

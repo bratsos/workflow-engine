@@ -95,10 +95,7 @@ export {
   createRoutingExecutor,
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
-export {
-  AICallDeletionUnavailableError,
-  RunPurgeInProgressError,
-} from "./handlers/run-purge.js";
+export { AICallDeletionUnavailableError } from "./handlers/run-purge.js";
 // Definition pinning helpers, for hosts that resolve definitions themselves.
 export { SUPERSEDED_ATTEMPT_KEY } from "./handlers/run-redrive.js";
 export {

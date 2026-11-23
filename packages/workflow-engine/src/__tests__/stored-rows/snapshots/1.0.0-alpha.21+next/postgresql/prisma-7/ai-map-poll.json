@@ -18,7 +18,6 @@
   },
   "columns": {
     "WorkflowRun": [
-      "archivedStageRecordIds",
       "completedAt",
       "config",
       "createdAt",
@@ -200,14 +199,7 @@
     "WorkflowBlob": ["createdAt", "data", "key", "updatedAt"]
   },
   "jsonColumns": {
-    "WorkflowRun": [
-      "archivedStageRecordIds",
-      "config",
-      "input",
-      "labels",
-      "metadata",
-      "output"
-    ],
+    "WorkflowRun": ["config", "input", "labels", "metadata", "output"],
     "WorkflowDefinition": ["snapshot"],
     "WorkflowStage": [
       "config",
@@ -265,8 +257,7 @@
         "labels": null,
         "metadata": null,
         "definitionVersion": "sha256-0f35ae84d53e816ba1ae350ae0c70f13",
-        "redriveCount": 0,
-        "archivedStageRecordIds": null
+        "redriveCount": 0
       }
     ],
     "WorkflowDefinition": [

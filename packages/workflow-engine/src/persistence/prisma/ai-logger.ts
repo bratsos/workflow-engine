@@ -423,15 +423,24 @@ export class PrismaAICallLogger implements AICallLogger {
   async deleteForRuns(runIds: readonly string[]): Promise<number> {
     const pg = this.databaseType === "postgresql";
     const topic = pg ? '"topic" COLLATE "C"' : '"topic"';
+    // Calls logged before run attribution, by their topic. SQLite is held to
+    // the partial index: its statistics can prefer `workflowRunId`'s, which
+    // reads every unattributed call.
+    const legacy = pg
+      ? `"ai_calls"`
+      : `"ai_calls" INDEXED BY "ai_calls_legacy_topic_idx"`;
     let removed = 0;
     for (const id of new Set(runIds)) {
-      removed += await writeRetentionSql(
-        this.prisma,
-        this.databaseType,
-        `DELETE FROM "ai_calls" WHERE "workflowRunId" = $1 OR (
-          "workflowRunId" IS NULL AND ${topic} >= $2 AND ${topic} < $3
-        )`,
-        [id, ...prefixRange(`workflow.${id}.`)],
+      const run = (sql: string, args: unknown[]) =>
+        writeRetentionSql(this.prisma, this.databaseType, sql, args);
+      removed += await run(
+        `DELETE FROM "ai_calls" WHERE "workflowRunId" = $1`,
+        [id],
+      );
+      removed += await run(
+        `DELETE FROM ${legacy}
+          WHERE "workflowRunId" IS NULL AND ${topic} >= $1 AND ${topic} < $2`,
+        prefixRange(`workflow.${id}.`),
       );
     }
     return removed;
