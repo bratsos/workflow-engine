@@ -6,6 +6,7 @@ import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
 import { waitTimeoutPatch } from "../helpers/step-api.js";
+import { fenceRunWrites, openRunWriter } from "../helpers/run-writes.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord, WorkflowStageRecord } from "../ports.js";
 
@@ -45,8 +46,18 @@ export async function handleStepSignal(
     );
   }
 
+  // The ledger write can spill the payload to the blob store, outside any
+  // transaction. Registered as a writer of the run (as `job.execute` is), the
+  // sender holds off erasure until it has written; once the run has ended
+  // its ledger writes are refused and it writes nothing.
+  const writer = await openRunWriter(deps.persistence, command.workflowRunId);
   try {
-    return await deliverSignal(command, { ...deps, stepLedger: ledger }, stage);
+    const fenced = fenceRunWrites(deps, command.workflowRunId, writer);
+    return await deliverSignal(
+      command,
+      { ...fenced, stepLedger: fenced.stepLedger ?? ledger },
+      stage,
+    );
   } catch (error) {
     // The record went (purge, restart) after the read above: whatever this
     // delivery wrote under it has no row left to name it, and whoever
@@ -64,6 +75,8 @@ export async function handleStepSignal(
         .catch(() => {});
     }
     throw error;
+  } finally {
+    await writer.close();
   }
 }
 

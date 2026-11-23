@@ -20,6 +20,7 @@ import { SUPERSEDED_ATTEMPT_KEY } from "../kernel/handlers/run-redrive.js";
 import { runMaintenanceTick } from "../kernel/helpers/host-support.js";
 import { RUN_WRITE_LEASE_MS } from "../persistence/interface.js";
 import {
+  createPrismaAICallLogger,
   createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
@@ -29,6 +30,7 @@ import {
 import { rawFor } from "../persistence/prisma/prisma-client-type.js";
 import {
   pruneRows,
+  RetentionIndexes,
   writeRetentionSql,
 } from "../persistence/prisma/retention-sql.js";
 import {
@@ -65,6 +67,10 @@ function hold() {
 describe.skipIf(!realDatabase)("run erasure and retention", () => {
   let db: KernelDatabase;
   let sibling: any;
+  let writerIndexDdl = "";
+  const options = {
+    databaseType: sqlite ? ("sqlite" as const) : ("postgresql" as const),
+  };
   beforeAll(async () => {
     db = await kernelDatabase();
     const fixture = createRequire(import.meta.url)(
@@ -99,6 +105,8 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     );
     for (const statement of eligibility.split("-- statement-breakpoint")) {
       await db.client.$executeRawUnsafe(statement.trim());
+      if (statement.includes("idempotency_keys_writer_prune_idx"))
+        writerIndexDdl = statement.trim();
     }
   });
   beforeEach(() => db.reset());
@@ -1239,7 +1247,7 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
           key: "abandoned",
           commandType: "run.write",
           workflowRunId: live.id,
-          createdAt: new Date(Date.now() - 2 * RUN_WRITE_LEASE_MS),
+          createdAt: new Date(Date.now() - 11 * RUN_WRITE_LEASE_MS),
         },
       ],
     });
@@ -1319,6 +1327,7 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
             clause,
             cutoff,
             1,
+            new RetentionIndexes(db.client, "sqlite"),
           );
           // The bound values are written in, as the plan does not depend on them.
           const statement = sent[0]!.sql.replace(/\$(\d+)/g, (_, n) =>
@@ -1340,4 +1349,234 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     },
     60_000,
   );
+
+  it.skipIf(!sqlite)(
+    "prunes AI calls on a table without the age indexes with plain statements",
+    async () => {
+      const known = await new RetentionIndexes(db.client, "sqlite").of(
+        "ai_calls",
+      );
+      const dropped = [...known.led].filter(([column]) =>
+        ["createdAt", "textExpiresAt"].includes(column),
+      );
+      expect(dropped).toHaveLength(2);
+      for (const [, name] of dropped)
+        await db.client.$executeRawUnsafe(`DROP INDEX "${name}"`);
+      try {
+        await seedCall("old", { createdAt: old });
+        await seedCall("text", {
+          textExpiresAt: cutoff,
+          metadata: { instructions: "instruction" },
+        });
+        const worker = db.makeKernel({
+          services: { aiLogger: createPrismaAICallLogger(db.client, options) },
+        });
+        expect(
+          await worker.dispatch({
+            type: "engine.prune",
+            aiCalls: { olderThan: cutoff },
+            aiCallText: { now: cutoff },
+          }),
+        ).toMatchObject({ aiCalls: 1, aiCallText: 1 });
+      } finally {
+        for (const [column, name] of dropped)
+          await db.client.$executeRawUnsafe(
+            `CREATE INDEX "${name}" ON "ai_calls" ("${column}")`,
+          );
+      }
+    },
+  );
+
+  it.skipIf(!sqlite)(
+    "reads the primary-key and age indexes from the table, not from their names",
+    async () => {
+      const scratch = [
+        `CREATE TABLE "scratch_text" ("a" TEXT UNIQUE, "id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME)`,
+        `CREATE INDEX "scratch_text_by_age" ON "scratch_text" ("createdAt")`,
+        `CREATE TABLE "scratch_rowid" ("id" INTEGER PRIMARY KEY, "createdAt" DATETIME)`,
+        `CREATE TABLE "scratch_keys" ("id" TEXT NOT NULL PRIMARY KEY, "commandType" TEXT, "createdAt" DATETIME)`,
+        `CREATE INDEX "scratch_other" ON "scratch_keys" ("createdAt") WHERE "commandType" = 'job.execute'`,
+        `CREATE INDEX "scratch_writers" ON "scratch_keys" ("createdAt") WHERE "commandType" = 'run.write'`,
+      ];
+      try {
+        for (const statement of scratch)
+          await db.client.$executeRawUnsafe(statement);
+        const indexes = new RetentionIndexes(db.client, "sqlite");
+        // A UNIQUE column before the key numbers the key's index 2.
+        expect(await indexes.of("scratch_text")).toMatchObject({
+          primaryKey: "sqlite_autoindex_scratch_text_2",
+          led: new Map([
+            ["a", "sqlite_autoindex_scratch_text_1"],
+            ["createdAt", "scratch_text_by_age"],
+          ]),
+        });
+        // A rowid alias has no index to name.
+        expect((await indexes.of("scratch_rowid")).primaryKey).toBeUndefined();
+        expect(await indexes.of("scratch_keys")).toMatchObject({
+          primaryKey: "sqlite_autoindex_scratch_keys_1",
+          writers: "scratch_writers",
+        });
+        expect((await indexes.of("no_such_table")).primaryKey).toBeUndefined();
+      } finally {
+        for (const table of ["scratch_text", "scratch_rowid", "scratch_keys"])
+          await db.client.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}"`);
+      }
+    },
+  );
+
+  it("prunes keys without the run writer index as before, and the writers once it exists", async () => {
+    const live = await db.seed();
+    await db.client.idempotencyKey.createMany({
+      data: [
+        {
+          key: "completed",
+          commandType: "job.execute",
+          createdAt: old,
+          result: {},
+        },
+        {
+          key: "abandoned",
+          commandType: "run.write",
+          workflowRunId: live.id,
+          createdAt: new Date(Date.now() - 11 * RUN_WRITE_LEASE_MS),
+          result: { __workflowEngineState: "in_progress" },
+        },
+      ],
+    });
+    await db.client.$executeRawUnsafe(
+      `DROP INDEX "idempotency_keys_writer_prune_idx"`,
+    );
+    try {
+      const bare = createPrismaWorkflowPersistence(db.client, options);
+      expect(await bare.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+      expect(await bare.pruneIdempotencyKeys(cutoff, 10)).toBe(0);
+      expect(await db.client.idempotencyKey.count()).toBe(1);
+    } finally {
+      await db.client.$executeRawUnsafe(writerIndexDdl);
+    }
+    const installed = createPrismaWorkflowPersistence(db.client, options);
+    expect(await installed.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it("leaves a registration that only a host with a fast clock sees as lapsed", async () => {
+    const { id } = await db.seed();
+    let now = Date.now();
+    const host = (at: () => number) =>
+      createPrismaWorkflowPersistence(db.client, {
+        ...options,
+        now: () => new Date(at()),
+      });
+    const writerHost = host(() => now);
+    const fastHost = host(() => now + 40_001);
+    expect(await writerHost.beginRunWrite!(id, "live")).toBe(true);
+    expect(
+      await host(() => Date.now() - 11 * RUN_WRITE_LEASE_MS).beginRunWrite!(
+        id,
+        "abandoned",
+      ),
+    ).toBe(true);
+    // One heartbeat later the writer's own lease holds, and the fast host
+    // sees the registration 60,001 ms old.
+    now += 20_000;
+    expect(await writerHost.hasRunWriters!(id)).toBe(true);
+    expect(await fastHost.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+    expect(await writerHost.refreshRunWrite!("live")).toBe(true);
+    expect(await db.client.idempotencyKey.count()).toBe(1);
+  });
+
+  describe("a signal sender", () => {
+    const payload = { text: "x".repeat(70_000) };
+    const signal = (id: string) =>
+      ({
+        type: "step.signal",
+        workflowRunId: id,
+        stageId: "first",
+        stepId: "answer",
+        payload,
+      }) as const;
+    const erase = (id: string) =>
+      ({ type: "run.purge", workflowRunIds: [id] }) as const;
+    const leftovers = async () => ({
+      blobs: await db.client.workflowBlob.count(),
+      steps: await db.client.workflowStep.count(),
+      keys: await db.client.idempotencyKey.count(),
+      events: await db.client.outboxEvent.count(),
+    });
+
+    it("holds erasure off until its spilled payload is stored", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      const gate = hold();
+      const sender = db.makeKernel({
+        blobStore: override(db.blobStore, {
+          async put(key, data) {
+            await gate.pause();
+            return db.blobStore.put(key, data);
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      let result: unknown;
+      try {
+        await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+        expect(await kernel().dispatch(erase(id))).toMatchObject({
+          removed: { runs: 0 },
+          incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+        });
+      } finally {
+        gate.release();
+        result = await sending.catch((error) => error);
+      }
+      expect(result).toMatchObject({ signalled: true });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual({
+        blobs: 0,
+        steps: 0,
+        keys: 0,
+        events: 0,
+      });
+    });
+
+    it("writes nothing once the run it read has been erased", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      const gate = hold();
+      // Stalled after reading the stage, before it registers. It keeps
+      // seeing that stage, so its cleanup of a stage that went does not run,
+      // as for a sender that stops before it.
+      let stale: Awaited<ReturnType<typeof db.persistence.getStage>>;
+      const sender = db.makeKernel({
+        persistence: override(db.persistence, {
+          async getStage(runId, stageId) {
+            if (stale) return stale;
+            stale = await db.persistence.getStage(runId, stageId);
+            await gate.pause();
+            return stale;
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1 },
+        incomplete: [],
+      });
+      gate.release();
+      await expect(sending).rejects.toThrow();
+      expect(await leftovers()).toEqual({
+        blobs: 0,
+        steps: 0,
+        keys: 0,
+        events: 0,
+      });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 0, blobs: 0 },
+        incomplete: [],
+      });
+    });
+  });
 });

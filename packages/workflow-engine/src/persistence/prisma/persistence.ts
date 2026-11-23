@@ -71,6 +71,7 @@ import {
 import {
   prefixRange,
   pruneRows,
+  RetentionIndexes,
   RUN_WRITER,
   writeRetentionSql,
 } from "./retention-sql.js";
@@ -229,6 +230,9 @@ function truthy(value: unknown): boolean {
   return false;
 }
 
+/** Pruning removes a run writer registration this many leases after its last refresh. */
+const ABANDONED_WRITER_LEASES = 10;
+
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
 };
@@ -357,6 +361,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private readonly rawOutboxQueries: boolean;
   private statusEnumName: string;
   private now: () => Date;
+  private readonly retentionIndexes: RetentionIndexes;
   /**
    * Shared with every transactional clone (see `withTransaction`), so the
    * database probe runs once per client rather than once per transaction.
@@ -397,6 +402,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
+    this.retentionIndexes = new RetentionIndexes(
+      this.prisma,
+      this.databaseType,
+    );
     this.versioning = {
       enabled:
         options.definitionVersioning ?? detectDefinitionVersioning(prisma),
@@ -858,6 +867,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       "outbox",
       publishedOlderThan,
       limit,
+      this.retentionIndexes,
     );
   }
 
@@ -868,19 +878,25 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       "idempotencyKeys",
       olderThan,
       limit,
+      this.retentionIndexes,
     );
     if (completed >= limit) return completed;
     // Registrations of writers that stopped refreshing them, such as a host
-    // that crashed. Live ones are in progress and are never pruned.
-    const lapsed = new Date(this.now().getTime() - RUN_WRITE_LEASE_MS);
+    // that crashed. A live one is in progress and is never pruned, and one
+    // that only looks lapsed to a host whose clock runs ahead is left too:
+    // this only needs to clear what has been abandoned for good.
+    const abandoned = new Date(
+      this.now().getTime() - ABANDONED_WRITER_LEASES * RUN_WRITE_LEASE_MS,
+    );
     return (
       completed +
       (await pruneRows(
         this.prisma,
         this.databaseType,
         "runWriters",
-        lapsed,
+        abandoned,
         limit - completed,
+        this.retentionIndexes,
       ))
     );
   }

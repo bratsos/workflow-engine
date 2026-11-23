@@ -226,7 +226,7 @@ Cancel live runs before erasure and retry incomplete requests.
 `idempotencyKeys: { olderThan }`. Each clause has its own count and applies the
 same `limit` (default 100). Outbox pruning removes only published events of
 terminal runs. The idempotency clause also removes run writer registrations
-that were not refreshed for `RUN_WRITE_LEASE_MS`. Set each host's optional `prune` with age durations and
+that were not refreshed for ten leases (`10 * RUN_WRITE_LEASE_MS`). Set each host's optional `prune` with age durations and
 `aiCallText: true` to run the corresponding clauses on maintenance ticks.
 
 **Host option.** Both hosts run `run.purge` at the end of every maintenance tick once `retention` is set; it is off by default:

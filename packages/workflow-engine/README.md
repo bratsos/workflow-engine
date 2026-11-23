@@ -331,6 +331,7 @@ model WorkflowArtifact {
 
   @@unique([workflowRunId, key])
   @@index([workflowRunId])
+  @@index([workflowStageId])
   @@map("workflow_artifacts")
 }
 
@@ -358,6 +359,7 @@ model AICall {
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([createdAt])
   @@index([tenantId, createdAt])
   @@index([workflowRunId])
   @@index([textExpiresAt])
@@ -393,6 +395,7 @@ model WorkflowAnnotation {
   @@index([workflowRunId, createdAt])
   @@index([workflowRunId, scope])
   @@index([workflowRunId, actorId])
+  @@index([workflowStageRecordId])
   @@map("workflow_annotations")
 }
 
@@ -492,6 +495,7 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@index([workflowRunId])
+  @@index([workflowRunId, commandType])
   @@index([createdAt])
   @@map("idempotency_keys")
 }
