@@ -1,6 +1,7 @@
 // packages/workflow-engine-host-serverless/src/run-to-completion.ts
 import {
   assertTimerMs,
+  createLogger,
   executeJobWithHeartbeat,
   flushOutboxWithin,
   HOST_DEFAULTS,
@@ -8,6 +9,8 @@ import {
   type Kernel,
   type RunCreateCommand,
 } from "@bratsos/workflow-engine/kernel";
+
+const logger = createLogger();
 
 /** The one read `runToCompletion` needs: how did the run end. */
 export interface RunToCompletionPersistence {
@@ -259,10 +262,15 @@ export async function runToCompletion(
         maxOutboxFlush,
         outboxFlushTimeoutMs,
       );
-      if (outcome === undefined)
-        console.error(`${logPrefix} outbox.flush timed out`);
+      if (outcome === undefined) {
+        const message = `${logPrefix} outbox.flush timed out`;
+        logger.error(message, { workflowRunId, workerId }, () => [message]);
+      }
     } catch (error) {
-      console.error(`${logPrefix} outbox.flush failed:`, error);
+      logger.caught(`${logPrefix} outbox.flush failed:`, error, {
+        workflowRunId,
+        workerId,
+      });
     }
   }
 

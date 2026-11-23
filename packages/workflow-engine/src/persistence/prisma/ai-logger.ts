@@ -248,7 +248,11 @@ export class PrismaAICallLogger implements AICallLogger {
       if (requestId === undefined) {
         logger.warn(
           "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
-          { batchId },
+          { batchId, topic: call.topic, workflowRunId: call.workflowRunId },
+          () => [
+            "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
+            { batchId },
+          ],
         );
       }
 

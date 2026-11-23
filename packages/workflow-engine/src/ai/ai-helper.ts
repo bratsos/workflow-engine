@@ -141,17 +141,26 @@ class AIHelperImpl implements AIHelper {
             message,
             metadata: meta,
           })
-          .catch((err) =>
-            logger.error(
-              "Failed to persist log",
-              ...(isTraceTextEnabled() ? [err] : []),
-            ),
-          );
+          .catch((error) => {
+            const message = "Failed to persist log";
+            const fields = {
+              workflowRunId: logContext.workflowRunId,
+              stageRecordId: logContext.stageRecordId,
+            };
+            if (isTraceTextEnabled()) logger.caught(message, error, fields);
+            else logger.error(message, fields, () => [message]);
+          });
         // Also log to console for immediate visibility. Workflow log messages
         // can quote provider responses.
+        const diagnostic = `[${level}] ${isTraceTextEnabled() ? message : "workflow log written"}`;
         logger.debug(
-          `[${level}] ${isTraceTextEnabled() ? message : "workflow log written"}`,
-          meta ? JSON.stringify(meta) : "",
+          diagnostic,
+          {
+            ...meta,
+            workflowRunId: logContext.workflowRunId,
+            stageRecordId: logContext.stageRecordId,
+          },
+          () => [diagnostic, meta ? JSON.stringify(meta) : ""],
         );
       };
     }

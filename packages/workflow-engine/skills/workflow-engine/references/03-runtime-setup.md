@@ -4,7 +4,7 @@ Complete guide for configuring the command kernel and choosing a host.
 
 ## Creating a Kernel
 
-The kernel is the core command dispatcher. It's environment-agnostic -- no timers, no signals, no global state.
+The kernel is the core command dispatcher. It runs independently of host timers and process signals.
 
 ```typescript
 import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
@@ -475,3 +475,9 @@ The job loop now pauses for a uniform draw over `[0, postJobYieldMs)` after a **
 - **The pause is skipped while the loop is draining a backlog** — as soon as `dequeue()` hands it a job from a run other than the one it just completed, it stops pausing until the queue next comes back empty. A worker chewing through unrelated queued work pays at most one pause.
 - **`postJobYieldMs: 0`** disables it: lowest latency for a single-worker deployment, and multi-worker deployments go back to pinning each run to one worker.
 - Suspended/async-batch stages are unaffected — they resume through `stage.pollSuspended` on the orchestration tick, which any worker may run.
+
+## Process diagnostics
+
+Import `setLogger` from `@bratsos/workflow-engine/kernel` and call `setLogger({ debug, info, warn, error })` during startup. Each method receives `(message: string, fields?: Record<string, unknown>)`. Fields can include `workflowRunId`, `stageId`, and `jobId`. The kernel, hosts, standalone AI helpers and Prisma adapters in the process use that sink. Configure a sink in each worker or process.
+
+An application sink receives every emitted level and filters them itself. A method that throws or rejects falls back to the console once for that entry. The default console emits warnings and errors and uses `WORKFLOW_ENGINE_TRACE=1` (or `true`) for debug and info. Restore it with `setLogger(undefined)`. Both sinks require `WORKFLOW_ENGINE_TRACE_TEXT=1` (or `true`) to emit AI text previews and potentially sensitive error details. Persisted workflow logs and AI call records use their existing storage settings.

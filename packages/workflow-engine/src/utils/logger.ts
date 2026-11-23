@@ -1,93 +1,89 @@
-/**
- * Internal logger utility for workflow-engine
- *
- * This logger respects the WORKFLOW_ENGINE_TRACE environment variable.
- * Set WORKFLOW_ENGINE_TRACE=1 or WORKFLOW_ENGINE_TRACE=true to enable trace logging.
- *
- * Add WORKFLOW_ENGINE_TRACE_TEXT=1 to include sensitive request and
- * response data. Use both flags only when debugging with safe data.
- */
-
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
-export interface Logger {
-  debug: (message: string, ...args: unknown[]) => void;
-  info: (message: string, ...args: unknown[]) => void;
-  warn: (message: string, ...args: unknown[]) => void;
-  error: (message: string, ...args: unknown[]) => void;
+export type Logger = Record<
+  LogLevel,
+  (message: string, fields?: Record<string, unknown>) => void
+>;
+
+const loggerKey = Symbol.for("@bratsos/workflow-engine/logger");
+const processScope = globalThis as typeof globalThis & { [loggerKey]?: Logger };
+
+/** Install a logger for this process. Pass undefined to restore the console sink. */
+export function setLogger(logger: Logger | undefined): void {
+  processScope[loggerKey] = logger;
 }
 
-function isTraceEnabled(): boolean {
-  if (typeof process === "undefined") return false;
-  const trace = process.env.WORKFLOW_ENGINE_TRACE;
-  return trace === "1" || trace === "true";
+function envFlag(name: string): boolean {
+  const value = typeof process === "undefined" ? undefined : process.env[name];
+  return value === "1" || value === "true";
 }
 
 export function isTraceTextEnabled(): boolean {
-  return isTraceEnabled() && process.env.WORKFLOW_ENGINE_TRACE_TEXT === "1";
+  return envFlag("WORKFLOW_ENGINE_TRACE_TEXT");
 }
 
-const textFields = new Set([
-  "prompt",
-  "response",
-  "textPreview",
-  "audio",
-  "input",
-  "output",
-  "responseBody",
-]);
+type Fields = Record<string, unknown>;
+type ConsoleOutput = () => [message: string, ...args: unknown[]];
 
-function traceArgs(args: unknown[]): unknown[] {
-  return args.map((arg) => {
-    if (arg === null || typeof arg !== "object" || Array.isArray(arg))
-      return arg;
-    const entries = Object.entries(arg);
-    return entries.some(([key]) => textFields.has(key))
-      ? Object.fromEntries(entries.filter(([key]) => !textFields.has(key)))
-      : arg;
-  });
-}
+/** Create a logger with an optional namespace. Existing instances use the current sink. */
+export function createLogger(
+  prefix?: string,
+  consoleFields: (fields: Fields) => Fields = (fields) => fields,
+) {
+  const format = (message: string) =>
+    prefix ? `[${prefix}] ${message}` : message;
 
-function formatMessage(prefix: string, message: string): string {
-  return `[${prefix}] ${message}`;
-}
+  function write(level: LogLevel) {
+    return (
+      message: string,
+      fields?: Fields,
+      consoleOutput?: ConsoleOutput,
+    ): void => {
+      const fallback = () => {
+        try {
+          const method = level === "debug" || level === "info" ? "log" : level;
+          if (method === "log" && !envFlag("WORKFLOW_ENGINE_TRACE")) return;
+          const [line, ...args] =
+            consoleOutput?.() ??
+            (fields === undefined
+              ? [message]
+              : [message, consoleFields(fields)]);
+          console[method](format(line), ...args);
+        } catch {
+          // Diagnostics cannot interrupt engine work.
+        }
+      };
 
-function trace(prefix: string, message: string, args: unknown[]): void {
-  if (!isTraceEnabled()) return;
-  if (!isTraceTextEnabled()) {
-    // The permanent-failure trace predates structured log arguments and
-    // appends the job's error string directly to the message.
-    if (prefix === "JobQueue") {
-      message = message.replace(/^(Job .+? failed permanently):[\s\S]*$/, "$1");
-    }
-    args = traceArgs(args);
+      const sink = processScope[loggerKey];
+      if (sink) {
+        try {
+          const result: unknown =
+            fields === undefined
+              ? sink[level](format(message))
+              : sink[level](format(message), fields);
+          // A callback typed as void can still be implemented as async.
+          if (result) void Promise.resolve(result).catch(fallback);
+          return;
+        } catch {
+          // Fall back once for this entry and keep the configured sink.
+        }
+      }
+      fallback();
+    };
   }
-  console.log(formatMessage(prefix, message), ...args);
-}
 
-/**
- * Create a namespaced logger
- *
- * @param prefix - The prefix to use for log messages (e.g., "Executor", "Runtime")
- * @returns A logger instance with debug, info, warn, and error methods
- *
- * @example
- * ```typescript
- * const logger = createLogger("Executor");
- * logger.debug("Starting execution"); // Only logs if WORKFLOW_ENGINE_TRACE=1
- * logger.error("Failed to execute"); // Always logs
- * ```
- */
-export function createLogger(prefix: string): Logger {
+  const error = write("error");
   return {
-    debug: (message: string, ...args: unknown[]) =>
-      trace(prefix, message, args),
-    info: (message: string, ...args: unknown[]) => trace(prefix, message, args),
-    warn: (message: string, ...args: unknown[]) => {
-      console.warn(formatMessage(prefix, message), ...args);
-    },
-    error: (message: string, ...args: unknown[]) => {
-      console.error(formatMessage(prefix, message), ...args);
+    debug: write("debug"),
+    info: write("info"),
+    warn: write("warn"),
+    error,
+    /** Log a caught error. Its message, cause and extra properties may contain input. */
+    caught(message: string, cause: unknown, fields?: Fields): void {
+      const includeCause = isTraceTextEnabled();
+      error(message, includeCause ? { ...fields, error: cause } : fields, () =>
+        includeCause ? [message, cause] : [message],
+      );
     },
   };
 }

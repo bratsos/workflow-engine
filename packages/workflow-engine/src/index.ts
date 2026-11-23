@@ -28,7 +28,6 @@ export {
   isValidStageId,
   type WorkflowStageId,
 } from "./core/stage-ids";
-
 export {
   AiMapBatchFailedError,
   AiMapBudgetExceededError,
@@ -86,6 +85,7 @@ export {
   WorkflowBuilder,
   type WorkflowOptions,
 } from "./core/workflow";
+export { type Logger, setLogger } from "./utils/logger";
 
 // =============================================================================
 // Advanced Exports

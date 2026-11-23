@@ -16,6 +16,7 @@ import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
   buildOpenRouterRoutingProvider,
+  isTraceTextEnabled,
   logger,
   type OpenRouterRoutingOptions,
   resolveCost,
@@ -124,11 +125,12 @@ export async function embed(
       ? texts[0].substring(0, 200) + (texts[0].length > 200 ? "..." : "")
       : `[${texts.length} texts]`;
   logger.debug(`embed request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
     textCount: texts.length,
-    textPreview,
+    ...(isTraceTextEnabled() && { textPreview }),
     dimensions,
     taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
   });
@@ -228,6 +230,7 @@ export async function embed(
 
     // Trace log after successful embed call
     logger.debug(`embed response`, {
+      topic: ctx.topic,
       model: modelKey,
       provider: modelConfig.provider,
       embeddingsCount: embeddings.length,
@@ -262,8 +265,9 @@ export async function embed(
       },
     });
     logger.error(`embed error`, {
+      topic: ctx.topic,
       model: modelKey,
-      error: errorMessage,
+      ...(isTraceTextEnabled() && { error: errorMessage }),
       durationMs,
     });
     throw error;

@@ -29,6 +29,7 @@ import {
   definePlugin,
   type PluginDefinition,
   runMaintenanceTick,
+  setLogger,
 } from "../../kernel/index.js";
 import { FakeClock, InMemoryBlobStore } from "../../kernel/testing/index.js";
 import {
@@ -77,8 +78,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
         : fixtures.createPostgresClient(databaseUrl);
     }
 
-    /** One run and its one event, as `run.create` would have left them. */
-    async function seedEvent(id: string) {
+    /** One run and its events, as kernel dispatch would have left them. */
+    async function seedEvent(id: string, count = 1) {
       await persistence.createRun({
         id,
         workflowId: "dlq",
@@ -86,15 +87,15 @@ describe.skipIf(!sqlite && !databaseUrl)(
         workflowType: "dlq",
         input: {},
       });
-      await persistence.appendOutboxEvents([
-        {
+      await persistence.appendOutboxEvents(
+        Array.from({ length: count }, (_, index) => ({
           workflowRunId: id,
           eventType: "workflow:created",
           payload: { type: "workflow:created", workflowRunId: id },
-          causationId: `cause-${id}`,
+          causationId: `cause-${id}-${index}`,
           occurredAt: new Date(),
-        },
-      ]);
+        })),
+      );
     }
 
     const rows = () =>
@@ -1559,6 +1560,31 @@ describe.skipIf(!sqlite && !databaseUrl)(
         expect(delivered).toEqual(["replacement"]);
       } finally {
         warn.mockRestore();
+      }
+    });
+
+    it("logs an expired outbox delivery with its run and event IDs", async () => {
+      await seedEvent("logging", 2);
+      const warn = vi.fn();
+      setLogger({ debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() });
+      try {
+        const kernel = make({
+          async emit() {
+            clock.advance(101);
+          },
+        });
+        expect(
+          await kernel.dispatch({ type: "outbox.flush", claimDurationMs: 100 }),
+        ).toMatchObject({
+          published: 1,
+          eventSinkStatus: "degraded",
+        });
+        expect(warn).toHaveBeenCalledExactlyOnceWith(
+          "outbox.flush claim expired before delivery",
+          { workflowRunId: "logging", eventId: expect.any(String) },
+        );
+      } finally {
+        setLogger(undefined);
       }
     });
 

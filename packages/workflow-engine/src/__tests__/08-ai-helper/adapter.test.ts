@@ -6,6 +6,7 @@ import { createAIHelper } from "../../ai/ai-helper.js";
 import { registerEmbeddingProvider } from "../../ai/embeddings.js";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AdapterTextRequest, AIAdapter } from "../../ai/types.js";
+import { setLogger } from "../../index.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 const MODEL = "local-cli-adapter-model";
@@ -41,6 +42,91 @@ function logger() {
 }
 
 describe("AI adapter seam", () => {
+  it("keeps the default console lines and trace gate", async () => {
+    const ai = createAIHelper("invoice-check", logger(), undefined, undefined, {
+      adapter: new LocalCliLikeAdapter(),
+    });
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", "");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
+    try {
+      await ai.generateText(MODEL, "invoice-input");
+      expect(consoleLog).not.toHaveBeenCalled();
+
+      vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
+      await ai.generateText(MODEL, "invoice-input");
+      expect(
+        consoleLog.mock.calls.map(([line]) => line),
+      ).toMatchInlineSnapshot(`
+        [
+          "[AIHelper] generateText request",
+          "[AIHelper] generateText response",
+        ]
+      `);
+      expect(JSON.stringify(consoleLog.mock.calls)).not.toContain(
+        "invoice-input",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      consoleLog.mockRestore();
+    }
+  });
+
+  it("routes standalone AI diagnostics with fields and gates text independently of trace level", async () => {
+    const ai = createAIHelper("invoice-check", logger(), undefined, undefined, {
+      adapter: new LocalCliLikeAdapter(),
+    });
+    const debug = vi.fn();
+    const error = vi.fn();
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", "");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
+    setLogger({ debug, info: vi.fn(), warn: vi.fn(), error });
+    try {
+      await ai.generateText(MODEL, "invoice-input");
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] generateText request",
+        expect.objectContaining({ topic: "invoice-check", model: MODEL }),
+      );
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] generateText response",
+        expect.objectContaining({ outputTokens: 3 }),
+      );
+      const failing = createAIHelper(
+        "invoice-check",
+        logger(),
+        undefined,
+        undefined,
+        {
+          adapter: {
+            async generateText() {
+              throw new Error("rejected invoice-input");
+            },
+          },
+        },
+      );
+      await expect(
+        failing.generateText(MODEL, "invoice-input"),
+      ).rejects.toThrow();
+      expect(error).toHaveBeenCalledWith(
+        "[AIHelper] generateText error",
+        expect.objectContaining({ topic: "invoice-check", model: MODEL }),
+      );
+      expect(
+        JSON.stringify([debug.mock.calls, error.mock.calls]),
+      ).not.toContain("invoice-input");
+      expect(consoleLog).not.toHaveBeenCalled();
+
+      vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
+      await ai.generateText(MODEL, "invoice-input");
+      expect(JSON.stringify(debug.mock.calls)).toContain("cli:invoice-input");
+    } finally {
+      setLogger(undefined);
+      vi.unstubAllEnvs();
+      consoleLog.mockRestore();
+    }
+  });
+
   it("records an adapter-reported cost as the reported cost", async () => {
     const adapter: AIAdapter = {
       generateText: async () => ({

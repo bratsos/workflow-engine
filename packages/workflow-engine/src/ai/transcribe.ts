@@ -19,6 +19,7 @@ import {
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
   extractReportedCost,
+  isTraceTextEnabled,
   logger,
   type OpenRouterRoutingOptions,
 } from "./shared";
@@ -182,10 +183,11 @@ export async function transcribe(
   );
 
   logger.debug(`transcribe request`, {
+    topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
-    audio: prompt,
+    audio: audio instanceof URL ? "[audio URL]" : prompt,
   });
 
   try {
@@ -256,6 +258,7 @@ export async function transcribe(
     });
 
     logger.debug(`transcribe response`, {
+      topic: ctx.topic,
       model: modelKey,
       durationInSeconds,
       characters: result.text.length,
@@ -287,8 +290,9 @@ export async function transcribe(
       error,
     });
     logger.error(`transcribe error`, {
+      topic: ctx.topic,
       model: modelKey,
-      error: errorMessage,
+      ...(isTraceTextEnabled() && { error: errorMessage }),
       durationMs,
     });
     throw error;

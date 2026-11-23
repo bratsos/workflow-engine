@@ -19,12 +19,15 @@
  * remain recoverable after expiry unless the write already took effect.
  */
 
+import { createLogger } from "../../utils/logger.js";
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { toErrorMessage } from "../helpers/error-message.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { PluginRunner } from "../plugins";
 import type { OutboxRecord } from "../ports";
+
+const logger = createLogger();
 
 export async function handleOutboxFlush(
   command: OutboxFlushCommand,
@@ -61,10 +64,14 @@ export async function handleOutboxFlush(
   let deadLettered = 0;
   let firstError: string | undefined;
 
-  const interrupted = (expiresAt?: number) => {
+  const interrupted = (expiresAt?: number, event?: OutboxRecord) => {
     if (expiresAt !== undefined && deps.clock.now().getTime() >= expiresAt) {
       const message = "outbox.flush claim expired before delivery";
-      console.warn(message);
+      logger.warn(
+        message,
+        event && { workflowRunId: event.workflowRunId, eventId: event.id },
+        () => [message],
+      );
       firstError ??= message;
       return true;
     }
@@ -153,7 +160,7 @@ export async function handleOutboxFlush(
         const sent: string[] = [];
         try {
           for (const event of run) {
-            if (writeError || interrupted(expiresAt)) return;
+            if (writeError || interrupted(expiresAt, event)) return;
             try {
               await deps.eventSink.emit(event.payload as KernelEvent, {
                 eventId: event.id,

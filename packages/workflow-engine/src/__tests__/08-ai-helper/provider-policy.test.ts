@@ -12,6 +12,7 @@ import {
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AIAdapter } from "../../ai/types.js";
+import { setLogger } from "../../kernel/index.js";
 import type { AICallLogger } from "../../persistence/interface.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { kernelDatabase, realDatabase } from "../sqlite8-kernel-utils.js";
@@ -429,6 +430,31 @@ describe("helper provider policy", () => {
       /openai.*routing\.provider\.only/i,
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps audio URLs out of transcription diagnostics", async () => {
+    const ai = makeHelper({ only: ["anthropic"] });
+    const debug = vi.fn();
+    const error = vi.fn();
+    setLogger({ debug, info: vi.fn(), warn: vi.fn(), error });
+    try {
+      await expect(
+        ai.transcribe(
+          "policy-transcribe",
+          new URL("https://example.invalid/audio?token=trace-fixture"),
+        ),
+      ).rejects.toThrow(/routing\.provider\.only/i);
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] transcribe request",
+        expect.objectContaining({ audio: "[audio URL]" }),
+      );
+      expect(
+        JSON.stringify([debug.mock.calls, error.mock.calls]),
+      ).not.toContain("trace-fixture");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      setLogger(undefined);
+    }
   });
 
   it("allows a native transcription when its provider is listed", async () => {

@@ -156,6 +156,7 @@ describe("host support defaults", () => {
     persistence.completeOutboxDelivery = async () => {
       throw new Error("write failed");
     };
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const counts = await runMaintenanceTick(kernel);
@@ -168,6 +169,7 @@ describe("host support defaults", () => {
     } finally {
       persistence.completeOutboxDelivery = complete;
       log.mockRestore();
+      vi.unstubAllEnvs();
     }
     clock.advance(65_001);
     expect(

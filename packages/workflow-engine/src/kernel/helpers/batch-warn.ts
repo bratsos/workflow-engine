@@ -4,11 +4,14 @@
  * Such a WARN is often the only record of the batch, so it is written on the
  * run, never on a stage record (a `run.redrive` that deletes the record would
  * take a stage-scoped log with it), and a write that fails is tried once more
- * and then reported on `console.error` rather than dropped.
+ * and then reported through the engine logger rather than dropped.
  */
 
+import { createLogger, isTraceTextEnabled } from "../../utils/logger.js";
 import type { KernelDeps } from "../kernel.js";
 import { toErrorMessage } from "./error-message.js";
+
+const logger = createLogger("workflow-engine");
 
 export async function writeBatchWarn(
   persistence: KernelDeps["persistence"],
@@ -30,7 +33,14 @@ export async function writeBatchWarn(
       failure = error;
     }
   }
-  console.error(
-    `[workflow-engine] run ${workflowRunId}: a WARN naming a provider batch could not be written (${toErrorMessage(failure)}): ${message}`,
+  const diagnostic = "a WARN naming a provider batch could not be written";
+  const includeText = isTraceTextEnabled();
+  const detail = includeText ? toErrorMessage(failure) : undefined;
+  logger.error(
+    diagnostic,
+    { workflowRunId, ...(includeText && { error: detail, warning: message }) },
+    () => [
+      `run ${workflowRunId}: ${diagnostic} (${detail ?? "error details omitted"})${includeText ? `: ${message}` : ""}`,
+    ],
   );
 }

@@ -32,6 +32,7 @@ import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
+  isTraceTextEnabled,
   logger,
 } from "./shared";
 import type {
@@ -270,7 +271,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const nativeModelId = resolveModelForProvider(this.modelKey, provider);
     const warn = (message: string) => {
       if (this.batchLogFn) this.batchLogFn("WARN", message);
-      else logger.warn(message);
+      else logger.warn(message, { topic: this.ctx.topic }, () => [message]);
     };
     try {
       const batchModel = await resolveAiSdkBatchModel(provider, nativeModelId, {
@@ -420,7 +421,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     if (this.batchLogFn) {
       this.batchLogFn("WARN", warning, { batchId });
     } else {
-      logger.warn(warning, { batchId });
+      logger.warn(
+        warning.replace(`batch "${batchId}"`, "this batch"),
+        { batchId, topic: this.ctx.topic },
+        () => [warning, { batchId }],
+      );
     }
 
     const ref: EngineBatchRef = {
@@ -483,6 +488,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const modelConfig = getModel(this.modelKey);
 
     logger.debug(`batch submit request`, {
+      topic: this.ctx.topic,
       provider,
       model: this.modelKey,
       requestCount: requests.length,
@@ -593,6 +599,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             !excluded.includes(adopted.id)
           ) {
             logger.debug(`adopted batch created before the worker crashed`, {
+              topic: this.ctx.topic,
               provider,
               batchId: adopted.id,
               externalKey: partitionKey,
@@ -667,6 +674,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     this.submittedAtByBatch.set(primaryBatchId, Date.now());
 
     logger.debug(`batch submitted`, {
+      topic: this.ctx.topic,
       provider,
       batchId: primaryBatchId,
       batchIds,
@@ -777,11 +785,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           total: totalCount,
         });
       } else {
-        logger.warn(warnMsg, {
-          batchId,
-          failed: failedCount,
-          total: totalCount,
-        });
+        const fields = { batchId, failed: failedCount, total: totalCount };
+        logger.warn(
+          warnMsg.replace(`batch ${batchId}`, "the batch"),
+          { ...fields, topic: this.ctx.topic },
+          () => [warnMsg, fields],
+        );
       }
     }
 
@@ -1108,7 +1117,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       if (this.batchLogFn) {
         this.batchLogFn("WARN", warnMsg, { unvalidatedCount, batchId });
       } else {
-        logger.warn(warnMsg, { unvalidatedCount, batchId });
+        logger.warn(warnMsg, {
+          unvalidatedCount,
+          batchId,
+          topic: this.ctx.topic,
+        });
       }
     }
 
@@ -1137,10 +1150,18 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         providerFailures,
         total: results.length,
       };
+      const diagnostic = isTraceTextEnabled()
+        ? warnMsg
+        : `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${schemaFailures} schema validation failure(s), ${providerFailures} provider failure(s).`;
       if (this.batchLogFn) {
-        this.batchLogFn("WARN", warnMsg, meta);
+        this.batchLogFn("WARN", warnMsg, meta, diagnostic);
       } else {
-        logger.warn(describe(isTraceTextEnabled()), meta);
+        const consoleMessage = describe(isTraceTextEnabled());
+        logger.warn(
+          consoleMessage.replace(`batch ${batchId}`, "the batch"),
+          { ...meta, topic: this.ctx.topic },
+          () => [consoleMessage, meta],
+        );
       }
     }
 
@@ -1171,7 +1192,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     extra: { batchDurationMs?: number; provider?: AIBatchProvider } = {},
   ): Promise<void> {
     if (this.recordedBatchIds.has(batchId)) {
-      logger.debug(`Batch ${batchId} already recorded, skipping.`);
+      logger.debug(
+        "Batch already recorded, skipping.",
+        { batchId, topic: this.ctx.topic },
+        () => [`Batch ${batchId} already recorded, skipping.`],
+      );
       return;
     }
 
@@ -1188,7 +1213,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             throw error;
           })
         ) {
-          logger.debug(`Batch ${batchId} already recorded, skipping.`);
+          logger.debug(
+            "Batch already recorded, skipping.",
+            { batchId, topic: this.ctx.topic },
+            () => [`Batch ${batchId} already recorded, skipping.`],
+          );
           this.recordedBatchIds.add(batchId);
           return;
         }

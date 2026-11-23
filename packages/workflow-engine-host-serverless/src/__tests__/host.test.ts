@@ -516,6 +516,11 @@ describe("ServerlessHost", () => {
       dead: true,
       error: expect.stringContaining("workflowId"),
     });
+    await expect(host.handleJob(null!)).resolves.toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("Invalid job message"),
+    });
   });
 
   it("finalises the job row when a suspended stage fails for good from the poll path", async () => {
@@ -1027,6 +1032,7 @@ describe("ServerlessHost", () => {
 
   it("logs a hook that throws or rejects and still returns the counts", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       let calls = 0;
@@ -1052,6 +1058,7 @@ describe("ServerlessHost", () => {
       expect(messages).toContain("Error: hook rejected");
     } finally {
       logged.mockRestore();
+      vi.unstubAllEnvs();
     }
   });
 
