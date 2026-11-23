@@ -24,8 +24,12 @@ function validateLabels(labels: unknown): Record<string, string> | undefined {
       "labels must be a plain object with string values, well-formed Unicode, and no null characters or __proto__ key",
     );
   if (labels === null || typeof labels !== "object") throw error();
+  // Any realm's Object.prototype has a null prototype; arrays, dates and
+  // class instances do not.
   const prototype = Object.getPrototypeOf(labels);
-  if (prototype !== Object.prototype && prototype !== null) throw error();
+  if (prototype !== null && Object.getPrototypeOf(prototype) !== null) {
+    throw error();
+  }
 
   // Take a snapshot of the JSON data. Inherited properties and accessors
   // cannot affect what the persistence adapter serializes after an await.

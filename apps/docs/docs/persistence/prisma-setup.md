@@ -709,39 +709,38 @@ PERFORM workflow_engine_enqueue(
 The function ships in `node_modules/@bratsos/workflow-engine/sql/enqueue.sql`.
 Install it after creating the engine tables.
 
-The file is one statement, so it commits or rolls back as a whole however
-it is run. It installs into the schema of the `workflow_runs` table that the
-search path finds. psql takes a libpq connection string: remove Prisma-only
-parameters such as `schema` and `statement_cache_size`, and select a
-non-public engine schema with `PGOPTIONS='-c search_path=<schema>'`.
+The same file installs and upgrades. It is idempotent and drops nothing:
+it creates the nine-argument overload, then replaces the released
+seven-argument function in place, which keeps that function's owner, ACL,
+comment and the views or wrappers that depend on it. Table names resolve
+through the caller's search path. psql takes a libpq connection string:
+remove Prisma-only parameters such as `schema` and `statement_cache_size`,
+and select a non-public engine schema with
+`PGOPTIONS='-c search_path=<schema>'`.
 
-#### Fresh install
-
-A new function gets the database's default function ACL, which lets `PUBLIC`
-execute it. To restrict it to an application role, commit the `REVOKE` and
+A new function gets the database's default function ACL, which lets
+`PUBLIC` execute it. The seven-argument function calls the nine-argument one
+as the calling role, so every role that enqueues needs `EXECUTE` on the new
+overload. To restrict it to an application role, commit the `REVOKE` and
 `GRANT` with the install:
 
 ```bash
-# Fresh install. Omit both -c lines to keep the default ACL.
+# Omit both -c lines to keep the default ACL.
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
   -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
   -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
   -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
 
-#### Upgrade an existing function
-
-Running the file again replaces the released seven-argument signature and
-keeps that function's owner and ACL, so its grants and any `PUBLIC`
-revocation carry over. A view or SQL function that depends on the old
-signature makes the install fail with SQLSTATE `2BP01` and change nothing.
-Follow the [PostgreSQL upgrade](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
-to apply the table migrations first and to recreate such wrappers in the same
-transaction, even when they still pass seven arguments.
+On a fresh install, run the same two statements for the seven-argument
+signature `workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text)`
+as well. When upgrading, apply the table migrations in the
+[PostgreSQL upgrade](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
+first.
 
 The same scripts work with Prisma 6, 7 and 8.
 
-Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
+Requires PostgreSQL 14 or newer (for the built-in `gen_random_uuid()` and SQL-standard function bodies).
 
 ### Calling it from TypeScript
 
@@ -765,6 +764,22 @@ Prisma 8's raw lane takes strings, numbers and booleans as interpolations and re
 ### Signature
 
 ```sql
+-- All nine arguments, no defaults. NULL config stores '{}', NULL priority
+-- stores 5, and NULL tenant and labels store no attribution.
+workflow_engine_enqueue(
+  p_idempotency_key    text,
+  p_workflow_id        text,
+  p_workflow_name      text,
+  p_input              jsonb,
+  p_config             jsonb,
+  p_priority           integer,
+  p_definition_version text,
+  p_tenant_id          text,
+  p_labels             jsonb
+) RETURNS text   -- the workflow run id
+
+-- The released signature. It calls the nine-argument form with NULL tenant
+-- and labels.
 workflow_engine_enqueue(
   p_idempotency_key    text,
   p_workflow_id        text,
@@ -772,10 +787,8 @@ workflow_engine_enqueue(
   p_input              jsonb,
   p_config             jsonb   DEFAULT '{}'::jsonb,
   p_priority           integer DEFAULT 5,
-  p_definition_version text    DEFAULT NULL,
-  p_tenant_id          text    DEFAULT NULL,
-  p_labels             jsonb   DEFAULT NULL
-) RETURNS text   -- the workflow run id
+  p_definition_version text    DEFAULT NULL
+) RETURNS text
 ```
 
 It writes exactly the rows `run.create` writes, in the same order: the
@@ -785,8 +798,8 @@ job is enqueued here, so a host picks it up like any other run. Calling twice
 with one idempotency key returns the same run id and creates nothing the second
 time.
 
-Pass `p_tenant_id` and `p_labels` to store an opaque tenant ID and a JSON
-object with string values. Both default to SQL NULL. Both enqueue paths
+Pass `p_tenant_id` and `p_labels` to the nine-argument form to store an
+opaque tenant ID and a JSON object with string values. NULL stores neither. Both enqueue paths
 reject the `__proto__` key so all Prisma majors persist the same labels. Label keys and values
 use well-formed Unicode without null characters.
 The key row records the run

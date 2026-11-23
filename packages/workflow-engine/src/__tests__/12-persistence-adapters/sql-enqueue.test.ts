@@ -266,7 +266,7 @@ if (!DATABASE_URL) {
       await withListener(async (writer, received, flush) => {
         const enqueue = (labels?: string) =>
           writer.query<{ id: string }>(
-            "SELECT workflow_engine_enqueue($1, $2, $3, $4, p_labels => $5) AS id",
+            "SELECT workflow_engine_enqueue($1, $2, $3, $4, NULL, NULL, NULL, NULL, $5) AS id",
             [
               "label-check",
               workflow.id,
@@ -320,7 +320,7 @@ if (!DATABASE_URL) {
         expect(received).toEqual([created?.id]);
         await expect(
           writer.query(
-            "SELECT workflow_engine_enqueue('empty-map', $1, $2, $3, p_labels => '{}')",
+            "SELECT workflow_engine_enqueue('empty-map', $1, $2, $3, NULL, NULL, NULL, NULL, '{}')",
             [workflow.id, workflow.name, '{"value":"test"}'],
           ),
         ).resolves.toMatchObject({ rowCount: 1 });
@@ -371,16 +371,28 @@ if (!DATABASE_URL) {
       });
     });
 
-    it("replaces the old overload and reports a validation error for an invalid seven-argument call", async () => {
+    it("keeps the seven-argument signature, which creates an unattributed run through the new overload", async () => {
       const writer = new Client({ connectionString: DATABASE_URL });
       await writer.connect();
       try {
-        const {
-          rows: [signature],
-        } = await writer.query(
-          "SELECT to_regprocedure('workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)') AS old_signature",
+        const { rows } = await writer.query(
+          "SELECT to_regprocedure('workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)') IS NOT NULL AS seven, to_regprocedure('workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text,text,jsonb)') IS NOT NULL AS nine",
         );
-        expect(signature.old_signature).toBeNull();
+        expect(rows).toEqual([{ seven: true, nine: true }]);
+        const {
+          rows: [created],
+        } = await writer.query(SELECT_ENQUEUE, [
+          "seven-arguments",
+          workflow.id,
+          workflow.name,
+          '{"value":"test"}',
+          "{}",
+          5,
+          null,
+        ]);
+        expect(
+          await prisma.workflowRun.findUnique({ where: { id: created.id } }),
+        ).toMatchObject({ tenantId: null, labels: null });
         await expect(
           writer.query(SELECT_ENQUEUE, [
             "",

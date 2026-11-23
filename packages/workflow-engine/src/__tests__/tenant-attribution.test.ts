@@ -1,3 +1,4 @@
+import { runInNewContext } from "node:vm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../core/stage-factory.js";
@@ -131,6 +132,17 @@ describe.skipIf(!realDatabase)("tenant and run attribution", () => {
     ).toMatchObject({ labels });
     // Replaying a completed key observes the original run.
     expect(await createRun({ queue: [] })).toMatchObject({ workflowRunId });
+  });
+
+  it("accepts a plain label map created in another realm", async () => {
+    const { workflowRunId } = await createRun(
+      runInNewContext('({ queue: "normal" })'),
+    );
+    expect(
+      await db.client.workflowRun.findUnique({
+        where: { id: workflowRunId },
+      }),
+    ).toMatchObject({ labels: { queue: "normal" } });
   });
 
   it("attributes the worker's job.execute attempt key to its run", async () => {

@@ -73,7 +73,7 @@ What it does not do: no arbitrary DAG or child workflows (pipelines are linear e
 - **Node.js** >= 22.11
 - **TypeScript** >= 5.0.0
 - **Zod** ^4.1.12
-- **PostgreSQL** >= 14 or **SQLite** (for Prisma persistence; `sql/enqueue.sql` needs PostgreSQL 13+)
+- **PostgreSQL** >= 14 or **SQLite** (for Prisma persistence; `sql/enqueue.sql` needs PostgreSQL 14+)
 - **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
 - **Prisma 8** additionally needs an ES module project (`"type": "module"`), TypeScript >= 5.9 and Node.js 22.18+, 24.11+ or 26+ for PostgreSQL. SQLite is tested and supported on Node.js 22.20+, 24.11+ or 26+ (the Prisma 8 CLI declares `^22.18.0 || ^24.11.0 || >=26.0.0`). PostgreSQL requires PostgreSQL >= 15; SQLite uses the SQLite target package. The engine's general Node.js requirement remains >= 22.11.
 
@@ -1179,7 +1179,7 @@ With a registry built by `createWorkflowRegistry`, a host claims and polls only 
 
 ### Enqueue from SQL
 
-`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?, tenant_id?, labels?)`. Install it after creating the engine tables. The install is one atomic statement in the engine tables' schema; replacing an existing function keeps its owner and grants. Follow the migration guide when a view or SQL function depends on the old signature. A trigger or a non-TypeScript service can then create a run in its own transaction.
+`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)` and a nine-argument form that adds `tenant_id` and `labels` and takes all nine. Install it after creating the engine tables; the same file upgrades the released function in place and keeps its grants. Grant `EXECUTE` on the nine-argument form to every role that enqueues. A trigger or a non-TypeScript service can then create a run in its own transaction.
 
 ```sql
 PERFORM workflow_engine_enqueue(
@@ -1187,7 +1187,7 @@ PERFORM workflow_engine_enqueue(
   jsonb_build_object('orderId', v_order_id));
 ```
 
-It writes exactly the rows `run.create` writes and leaves the run `PENDING`. It cannot validate input against the Zod schema, creates the run unpinned unless you pass a registered `definition_version`, and stores `config` verbatim. PostgreSQL 13+.
+It writes exactly the rows `run.create` writes and leaves the run `PENDING`. It cannot validate input against the Zod schema, creates the run unpinned unless you pass a registered `definition_version`, and stores `config` verbatim. PostgreSQL 14+.
 
 ---
 

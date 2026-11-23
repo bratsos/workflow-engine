@@ -399,11 +399,12 @@ your own migration. Configure your migration runner to stop on errors and
 allow concurrent index builds to run outside transaction blocks.
 
 If the command exits on `55P03`, let the blocking transaction finish and
-rerun the script. Completed table steps and indexes are reusable. A failed
-or canceled concurrent build can leave an invalid index. The script checks
-all six indexes before returning success. If it reports an invalid index,
-inspect its state in `pg_index` or `\d` in psql. Drop only the invalid index
-with `DROP INDEX CONCURRENTLY` outside a transaction, then rerun. Deploy the
+rerun the script. Completed table steps and indexes are reusable. Before
+returning success, the script checks that each of the six names is a valid
+index of the planned table and columns. A failed or canceled concurrent build
+leaves an invalid index, and an older index can hold the name with another
+definition. If the script reports an index, inspect it with `\d` in psql,
+drop it with `DROP INDEX CONCURRENTLY` outside a transaction, then rerun. Deploy the
 updated schema or contract and clients after the script succeeds and the
 optional enqueue upgrade below is complete.
 
@@ -440,57 +441,40 @@ CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
 CREATE INDEX IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys" ("createdAt");
 ```
 
-#### Replace an existing PostgreSQL enqueue function
+#### Upgrade the PostgreSQL enqueue function
 
-After the column and index script succeeds, apply the new enqueue function.
-Its trailing defaults preserve valid seven-argument calls. The file is one
-`DO` statement, so it commits or rolls back as a whole however it is run:
-psql with or without `ON_ERROR_STOP` or `--single-transaction`, or a
-migration runner that sends it whole or statement by statement. It installs
-into the schema of the `workflow_runs` table that the search path finds and
-fails with SQLSTATE `42P01` when there is none. There it drops the released
-seven-argument signature and gives the new signature that function's owner
-and ACL, including any `PUBLIC` revocation. Functions in other schemas are
-left alone.
+After the column and index script succeeds, apply the new `sql/enqueue.sql`.
+The same file installs and upgrades, and it drops nothing:
 
-PostgreSQL reports SQLSTATE `2BP01` when an object has a catalog dependency
-on the old signature, and the install then changes nothing. This includes
-views and SQL-language functions defined with a `RETURN` or `BEGIN ATOMIC`
-body. List the direct dependents in the engine schema with the same search
-path.
+- It creates `workflow_engine_enqueue(..., p_tenant_id text, p_labels jsonb)`,
+  which takes all nine arguments and has no defaults.
+- It then replaces the released seven-argument function in place with
+  `CREATE OR REPLACE`. Its signature, defaults, owner, ACL, comment and the
+  views or wrappers that depend on it stay as they are. Its body calls the
+  new overload with NULL tenant and labels.
 
-```sql
-SELECT pg_describe_object(classid, objid, objsubid) AS dependent
-FROM pg_depend
-WHERE refclassid = 'pg_proc'::regclass
-  AND refobjid = to_regprocedure(
-    (SELECT relnamespace::regnamespace::text FROM pg_class
-      WHERE oid = to_regclass('workflow_runs'))
-    || '.workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)'
-  );
-```
+No call can match both overloads, so existing calls keep resolving. Table
+names resolve through the caller's search path as before, also for triggers
+on the engine tables and after a schema rename. The nine-argument overload is
+created first: if a later statement fails, the released function still
+works, and with `--single-transaction` nothing changes.
 
-Save definitions, owners and ACLs. Inspect dependents of the listed objects
-as well. Put explicit drops in `before-enqueue.sql` in dependent-first order.
-Put recreation, with each wrapper's own grants, in `after-enqueue.sql` in
-dependency-first order. Use non-cascading drops so any dependency you missed
-aborts the upgrade. Recreate tracked wrappers even when their call text still
-passes seven arguments. Run all three files in one transaction. Use empty
-companion files when nothing depends on the old signature.
+The new overload gets the database's default function ACL, which lets
+`PUBLIC` execute it. The seven-argument function calls it as the calling
+role, so every role that enqueues needs `EXECUTE` on the new overload. If you
+restricted the released function, restrict the new one in the same
+transaction:
 
 ```bash
+# Omit both -c lines to keep the default ACL.
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-  -c "SET LOCAL lock_timeout = '500ms'" \
-  -f before-enqueue.sql \
   -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
-  -f after-enqueue.sql
+  -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
+  -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
 
-On error, psql exits nonzero and the previous function, its wrappers and its
-ACL remain in place. Without `ON_ERROR_STOP`, psql prints the error and exits
-0, so automation cannot see the failure. Resolve a reported dependency or lock
-conflict before retrying. Use the same transaction in a migration runner that
-stops on SQL errors.
+Without `ON_ERROR_STOP`, psql prints an error but exits 0, so automation
+cannot see the failure. `sql/enqueue.sql` requires PostgreSQL 14 or newer.
 
 Custom persistence adapters receive the run ID as the fourth argument to
 `completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument
