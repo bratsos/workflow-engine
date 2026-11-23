@@ -4,15 +4,14 @@ import { MockLanguageModelV4 } from "ai/test";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
+  callLoggerOf,
   createAIHelper,
+  failSafeCallLogger,
   registerEvaluationProvider,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import { isRetryableStageError } from "../../kernel/helpers/stage-retry.js";
-import type {
-  AICallLogger,
-  CreateAICallInput,
-} from "../../persistence/interface.js";
+import type { CreateAICallInput } from "../../persistence/interface.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { createLogger } from "../../utils/logger.js";
 
@@ -474,13 +473,10 @@ it("rejects an awaited failed write safely, reports every failure and forwards l
     },
     custom: () => "forwarded",
   });
-  let bound: AICallLogger | undefined;
   const ai = createAIHelper("accounting", logger, undefined, undefined, {
     onLogError,
-    bindCallLogger: (callLogger) => {
-      bound = callLogger;
-    },
   });
+  const bound = callLoggerOf(ai);
   const call = { ...externalCall, topic: "accounting", modelId: "m" };
   const awaited = await Promise.resolve(bound!.logCall(call)).catch(
     (error: unknown) => error,
@@ -503,6 +499,53 @@ it("rejects an awaited failed write safely, reports every failure and forwards l
   }) as unknown as typeof logger.logCall;
   expect(() => ai.recordCall(externalCall)).toThrow(refusal);
   expect(await ai.flush()).toEqual({ failed: 4, pending: 0 });
+});
+
+it("gives an unresolved helper the root's attribution and the strictest text policy", async () => {
+  const written: CreateAICallInput[] = [];
+  const base = Object.assign(new InMemoryAICallLogger(), {
+    logCall(call: CreateAICallInput) {
+      written.push(call);
+    },
+  });
+  const root = createAIHelper("stage", base, undefined, undefined, {
+    attribution: { tenantId: "tenant-a", labels: { task: "classify" } },
+  });
+  const child = (text: { store: "full" | "none"; ttlMs?: number }) =>
+    root.createChild("private", undefined, {
+      text,
+      attribution: { labels: { scope: "private" } },
+    });
+  const call = { ...externalCall, topic: "stage", modelId: "m" };
+  const before = Date.now();
+  await failSafeCallLogger([
+    root,
+    child({ store: "full", ttlMs: 60_000 }),
+    child({ store: "full", ttlMs: 1_000 }),
+  ])!.logCall(call);
+  await failSafeCallLogger([
+    root,
+    child({ store: "full", ttlMs: 1_000 }),
+    child({ store: "none" }),
+  ])!.logCall(call);
+  const [shortest, none] = written;
+  expect(shortest).toMatchObject({
+    tenantId: "tenant-a",
+    labels: { task: "classify" },
+    response: "response marker",
+  });
+  expect(shortest!.textExpiresAt!.getTime()).toBeLessThanOrEqual(
+    Date.now() + 1_000,
+  );
+  expect(shortest!.textExpiresAt!.getTime()).toBeGreaterThanOrEqual(
+    before + 1_000,
+  );
+  expect(none).toMatchObject({
+    labels: { task: "classify" },
+    prompt: "",
+    response: "",
+  });
+  expect(failSafeCallLogger([])).toBeUndefined();
 });
 
 it("traces how many evaluation questions there are, not their keys", async () => {

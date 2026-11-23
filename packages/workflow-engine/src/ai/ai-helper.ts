@@ -53,6 +53,7 @@ import type {
   AIHelper,
   AIHelperChildOptions,
   AIHelperContext,
+  AIHelperOptions,
   AIHelperStats,
   AIObjectResult,
   AIStreamResult,
@@ -82,14 +83,36 @@ import { AICallWriteTracker } from "./write-tracker";
 // AIHelper Implementation
 // ============================================================================
 
-const callLoggers = new WeakMap<AIHelper, AICallLogger>();
+// Symbol.for, so a second copy of this module resolves the same key.
+const CALL_LOGGER: unique symbol = Symbol.for("workflow-engine.callLogger");
 
-/** The policy-applying logger of a helper made here, including children. */
+/**
+ * The policy-applying logger of a helper made here, including children. Spread,
+ * Proxy and Object.create wrappers of such a helper resolve to it as well.
+ */
 export function callLoggerOf(helper: AIHelper): AICallLogger | undefined {
-  return callLoggers.get(helper);
+  return (helper as { [CALL_LOGGER]?: AICallLogger })[CALL_LOGGER];
+}
+
+type TextPolicy = AIHelperOptions["text"];
+// Lower is stricter: no text, then the shortest expiry, then text kept without expiry.
+const strictness = (text: TextPolicy) =>
+  text?.store === "none" ? -1 : (text?.ttlMs ?? Number.POSITIVE_INFINITY);
+
+/**
+ * For a helper the engine cannot resolve: a logger with the attribution of the
+ * first of `helpers` and the strictest text policy among them, counted by the
+ * helper that has that policy. Undefined when none of them was made here.
+ */
+export function failSafeCallLogger(
+  helpers: readonly AIHelper[],
+): AICallLogger | undefined {
+  return AIHelperImpl.failSafeLogger(helpers);
 }
 
 class AIHelperImpl implements AIHelper {
+  /** Own and enumerable, so spread copies it; Proxy and Object.create reach it. */
+  readonly [CALL_LOGGER]: AICallLogger;
   readonly topic: string;
   private readonly aiCallLogger: AICallLogger;
   private readonly logContext?: LogContext;
@@ -138,7 +161,7 @@ class AIHelperImpl implements AIHelper {
     this.trackedLogger = forwardingProxy(aiCallLogger, (key, value) =>
       Object.hasOwn(writes, key) ? writes[key as keyof AICallLogger] : value,
     );
-    callLoggers.set(this, this.trackedLogger);
+    this[CALL_LOGGER] = this.trackedLogger;
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -166,6 +189,7 @@ class AIHelperImpl implements AIHelper {
         );
       };
     }
+    options?.onHelper?.(this);
   }
 
   private prepareCall(input: CreateAICallInput): CreateAICallInput {
@@ -247,8 +271,23 @@ class AIHelperImpl implements AIHelper {
     return tracked;
   }
 
-  bindCallLogger(): void {
-    this.options?.bindCallLogger?.(this.trackedLogger);
+  static failSafeLogger(
+    helpers: readonly AIHelper[],
+  ): AICallLogger | undefined {
+    const made = helpers.filter((h) => h instanceof AIHelperImpl);
+    const root = made[0];
+    if (!root) return undefined;
+    const strictest = made.reduce((a, b) =>
+      strictness(b.options?.text) < strictness(a.options?.text) ? b : a,
+    );
+    return new AIHelperImpl(
+      root.topic,
+      root.aiCallLogger,
+      root.logContext,
+      root.providerResolver,
+      { ...root.options, text: strictest.options?.text },
+      strictest.writes,
+    ).trackedLogger;
   }
 
   /** Bundle the state generateText/generateObject/embed/streamText/batch need. */
@@ -469,15 +508,7 @@ export function createAIHelper(
   providerResolver?: ProviderResolver,
   options?: StageAIHelperOptions,
 ): AIHelper {
-  const helper = new AIHelperImpl(
-    topic,
-    logger,
-    logContext,
-    providerResolver,
-    options,
-  );
-  helper.bindCallLogger();
-  return helper;
+  return new AIHelperImpl(topic, logger, logContext, providerResolver, options);
 }
 
 // ============================================================================

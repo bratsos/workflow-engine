@@ -1,4 +1,8 @@
-import { callLoggerOf, createAIHelper } from "../../ai/ai-helper.js";
+import {
+  callLoggerOf,
+  createAIHelper,
+  failSafeCallLogger,
+} from "../../ai/ai-helper.js";
 import type {
   AIHelper,
   LogContext,
@@ -43,7 +47,10 @@ export function defineLazyAIContext<T extends object>(
   deps: ExecutorDeps,
 ): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
   let helper: AIHelper | undefined;
-  let boundLogger: AICallLogger | undefined;
+  let stageLogger: AICallLogger | undefined;
+  // Helpers made from the stage's options while the factory runs.
+  const made: AIHelper[] = [];
+  let inFactory = false;
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
@@ -90,20 +97,25 @@ export function defineLazyAIContext<T extends object>(
       labels: params.labels,
       workflowRunId: params.workflowRunId,
     },
-    bindCallLogger: (logger) => {
-      boundLogger ??= logger;
+    onHelper: (created) => {
+      if (inFactory) made.push(created);
     },
   };
   const getHelper = (): AIHelper => {
     if (!helper) {
       const services = configured();
-      helper = services.ai(
-        topic,
-        services.aiLogger,
-        logContext,
-        undefined,
-        options,
-      );
+      inFactory = true;
+      try {
+        helper = services.ai(
+          topic,
+          services.aiLogger,
+          logContext,
+          undefined,
+          options,
+        );
+      } finally {
+        inFactory = false;
+      }
     }
     return helper;
   };
@@ -118,17 +130,25 @@ export function defineLazyAIContext<T extends object>(
       enumerable: true,
       configurable: true,
       get: () => {
-        const own = callLoggerOf(getHelper());
-        if (own) return own;
-        if (!boundLogger) {
-          // A custom implementation can omit the binding supplied by createAIHelper.
-          // Its capture policy is unknown, so use a text-free logger for direct writes.
-          createAIHelper(topic, configured().aiLogger, logContext, undefined, {
-            ...options,
-            text: { store: "none" },
-          });
-        }
-        return boundLogger;
+        // A returned wrapper that hides the helper it delegates to gets the
+        // strictest text policy made during the factory call; a custom
+        // implementation that made none gets no text.
+        stageLogger ??=
+          callLoggerOf(getHelper()) ??
+          failSafeCallLogger(made) ??
+          callLoggerOf(
+            createAIHelper(
+              topic,
+              configured().aiLogger,
+              logContext,
+              undefined,
+              {
+                ...options,
+                text: { store: "none" },
+              },
+            ),
+          );
+        return stageLogger!;
       },
     },
   });

@@ -18,7 +18,7 @@ import {
   registerTranscriptionProvider,
 } from "../ai/ai-helper.js";
 import { registerModels } from "../ai/model-helper.js";
-import type { AIAdapter } from "../ai/types.js";
+import type { AIAdapter, AIHelper, RecordCallParams } from "../ai/types.js";
 import type { Stage } from "../core/stage.js";
 import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { defineWorkflow } from "../core/workflow.js";
@@ -1618,6 +1618,167 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     for (const row of rows) {
       expect(row.metadata).toMatchObject({ error: "AI call failed" });
       expect(JSON.stringify(row)).not.toContain(sensitive);
+    }
+  });
+
+  // A factory's child helper behind a wrapper that meters recordCall.
+  const metered = (
+    child: AIHelper,
+    form: string,
+    count: () => void,
+  ): AIHelper => {
+    const recordCall = (params: RecordCallParams) => {
+      count();
+      child.recordCall(params);
+    };
+    const methods = {
+      generateText: child.generateText.bind(child),
+      generateObject: child.generateObject.bind(child),
+      embed: child.embed.bind(child),
+      streamText: child.streamText.bind(child),
+      evaluate: child.evaluate.bind(child),
+      transcribe: child.transcribe.bind(child),
+      batch: child.batch.bind(child),
+      createChild: child.createChild.bind(child),
+      flush: child.flush.bind(child),
+      getStats: child.getStats.bind(child),
+    };
+    switch (form) {
+      case "Proxy":
+        return new Proxy(child, {
+          get: (target, key, receiver) =>
+            key === "recordCall"
+              ? recordCall
+              : Reflect.get(target, key, receiver),
+        });
+      case "Object.create":
+        return Object.assign(Object.create(child) as AIHelper, { recordCall });
+      case "spread":
+        return { ...child, ...methods, recordCall };
+      default:
+        return { topic: child.topic, ...methods, recordCall };
+    }
+  };
+
+  it.each(
+    ["Proxy", "Object.create", "spread", "plain wrapper"].flatMap(
+      (form) =>
+        [
+          [form, "none", undefined],
+          [form, "full", 60_000],
+        ] as const,
+    ),
+  )("applies the text policy of a child returned in a %s with store %s and ttlMs %s to every stage write", async (form, store, ttlMs) => {
+    let meteredCalls = 0;
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const failed = { status: "error", error: sensitive };
+        ctx.ai.recordCall({ ...manual, metadata: failed });
+        await ctx.aiLogger.logCall({
+          ...manual,
+          modelId: manual.modelKey,
+          topic: "scope",
+          metadata: failed,
+        });
+        // A library given the stage logger, with its own default options.
+        const library = createAIHelper(
+          "library",
+          ctx.aiLogger,
+          undefined,
+          () =>
+            new MockLanguageModelV4({
+              async doGenerate() {
+                throw new APICallError({
+                  message: sensitive,
+                  url: "https://provider.invalid/v1",
+                  requestBodyValues: {},
+                  statusCode: 400,
+                  isRetryable: false,
+                });
+              },
+            }),
+        );
+        await library
+          .generateText(modelKey, "request marker", { maxRetries: 0 })
+          .catch(() => {});
+        await library
+          .batch(modelKey, "openrouter", {
+            apiKey: "fixture-key",
+            fetch: async () =>
+              Response.json({
+                id: "batch-1",
+                status: "completed",
+                results: [
+                  { custom_id: "item-1", error: { message: sensitive } },
+                ],
+              }),
+          })
+          .getResults("batch-1");
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, resolver, options) =>
+          metered(
+            createAIHelper(
+              topic,
+              logger,
+              context,
+              resolver,
+              options,
+            ).createChild("private", undefined, {
+              text: { store, ttlMs },
+              attribution: { labels: { scope: "private" } },
+            }),
+            form,
+            () => meteredCalls++,
+          ),
+      },
+    });
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(
+        (
+          await executeJobWithHeartbeat(kernel, {
+            job,
+            jobTransport: db.jobTransport,
+          })
+        ).outcome,
+      ).toBe("completed");
+    } finally {
+      warnings.mockRestore();
+    }
+    await kernel.flush();
+    expect(meteredCalls).toBe(1);
+    const rows = await db.client.aICall.findMany({ where: { workflowRunId } });
+    expect(rows).toHaveLength(4);
+    const childLabels = { ...attribution.labels, scope: "private" };
+    for (const row of rows) {
+      // A plain wrapper hides the child, so writes through ctx.aiLogger keep
+      // the root's labels; the text policy is the child's in every form.
+      const labels =
+        form === "plain wrapper" && !row.topic.endsWith(".private")
+          ? attribution.labels
+          : childLabels;
+      expect(row).toMatchObject({
+        tenantId: attribution.tenantId,
+        labels,
+        workflowRunId,
+        metadata: expect.objectContaining({ error: "AI call failed" }),
+      });
+      expect(JSON.stringify(row)).not.toContain(sensitive);
+      if (store === "none") {
+        expect(row).toMatchObject({
+          prompt: "",
+          response: "",
+          textExpiresAt: null,
+        });
+      } else {
+        expect(row.textExpiresAt).toBeInstanceOf(Date);
+      }
     }
   });
 

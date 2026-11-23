@@ -181,6 +181,10 @@ inherits the parent's TTL when omitted. The default stores full text without
 expiry. `store: "none"` leaves the prompt and response empty and drops stream
 instructions from the accounting row. Direct `ctx.aiLogger` writes share the
 stage helper's attribution and text policy, including with custom loggers.
+A factory that returns a wrapper should spread the helper into it or wrap it
+in a `Proxy` or `Object.create`, so these writes keep the helper's labels. A
+wrapper that hides the helper it delegates to gets the strictest text policy
+among the helpers the factory made, with the run's attribution.
 A full-text TTL sets `textExpiresAt` on the row so
 `engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
 requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
