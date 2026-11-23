@@ -1541,6 +1541,50 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       });
     });
 
+    it.each([
+      "completed",
+      "cancelled",
+    ] as const)("answers a late signal to a %s run as for a live one and writes nothing", async (ending) => {
+      // What a live run answers is what a run that has ended always answered.
+      const control = await db.seed("RUNNING", "SUSPENDED");
+      const worker = kernel();
+      expect([
+        await worker.dispatch(signal(control.id)),
+        await worker.dispatch(signal(control.id)),
+      ]).toEqual([
+        { signalled: true, ok: true, alreadyCompleted: false },
+        { signalled: true, ok: true, alreadyCompleted: true },
+      ]);
+      const end = async (id: string) => {
+        if (ending === "cancelled") {
+          await worker.dispatch({ type: "run.cancel", workflowRunId: id });
+        } else {
+          await db.client.workflowRun.update({
+            where: { id },
+            data: { status: "COMPLETED" },
+          });
+        }
+      };
+      // Never signalled, then signalled before the run ended.
+      const fresh = await db.seed("RUNNING", "SUSPENDED");
+      const signalled = await db.seed("RUNNING", "SUSPENDED");
+      await worker.dispatch(signal(signalled.id));
+      await end(fresh.id);
+      await end(signalled.id);
+      const before = await leftovers();
+      expect(await worker.dispatch(signal(fresh.id))).toEqual({
+        signalled: true,
+        ok: true,
+        alreadyCompleted: false,
+      });
+      expect(await worker.dispatch(signal(signalled.id))).toEqual({
+        signalled: true,
+        ok: true,
+        alreadyCompleted: true,
+      });
+      expect(await leftovers()).toEqual(before);
+    });
+
     it("writes nothing once the run it read has been erased", async () => {
       const { id } = await db.seed("RUNNING", "SUSPENDED");
       const gate = hold();

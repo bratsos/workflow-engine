@@ -556,8 +556,8 @@ the stage records a redrive archived through its `run.supersededAttempt`
 annotations. Stage executions, suspended-stage polls, signal senders and
 cancellation sweeps register as writers of their run in `idempotency_keys`
 (command type `run.write`); erasure reports `writers` while one is registered
-and refreshed. A `step.signal` for a run that has ended is rejected: it writes
-nothing. A registration whose process stopped refreshing it stops counting
+and refreshed. A `step.signal` for a run that has ended returns what it
+returned before and writes nothing. A registration whose process stopped refreshing it stops counting
 after one minute (`RUN_WRITE_LEASE_MS`), and a writer that finds its lease
 lapsed does not revive it. `engine.prune` with `idempotencyKeys` removes
 registrations nobody has refreshed for ten leases, so those a crashed host
