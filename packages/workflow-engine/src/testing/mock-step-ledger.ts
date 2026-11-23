@@ -346,5 +346,13 @@ export function createMockStepLedger(
     };
   }
 
+  if (inner.deleteForPurge) {
+    const deleteForPurge = inner.deleteForPurge.bind(inner);
+    ledger.deleteForPurge = async (stageRecordId, persistence) => {
+      track(stageRecordId);
+      return deleteForPurge(stageRecordId, persistence);
+    };
+  }
+
   return ledger;
 }

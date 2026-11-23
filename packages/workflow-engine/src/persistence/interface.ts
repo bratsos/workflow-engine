@@ -101,6 +101,24 @@ export interface PurgeableRun {
   stageRecordIds: string[];
 }
 
+export interface RunPurgeFence {
+  id: string;
+  status: PurgeableRunStatus;
+  version: number;
+}
+
+export interface RunPurgePersistenceCounts {
+  stages: number;
+  steps: number;
+  logs: number;
+  artifacts: number;
+  annotations: number;
+  outboxEvents: number;
+  idempotencyKeys: number;
+}
+
+export const RUN_PURGE_RESERVATION = "run.purge.reserve";
+
 export interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
@@ -794,6 +812,26 @@ export interface PersistenceCore {
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
 
+  /** Terminal runs are listed first, then live runs, up to the batch limit. */
+  listTenantRunsForPurge?(tenantId: string, limit: number): Promise<string[]>;
+  listArchivedStageIdsForPurge?(
+    workflowRunId: string,
+    archiveKey: string,
+  ): Promise<string[]>;
+  /** Reserve the generation for erasure and remember the legacy job ids across retries. */
+  reserveRunPurge?(
+    fence: RunPurgeFence,
+    jobIds: readonly string[],
+  ): Promise<void>;
+  /** Reference steps on this client are deleted in the persistence transaction. */
+  purgeRun?(
+    fence: RunPurgeFence,
+    stageRecordIds: readonly string[],
+  ): Promise<RunPurgePersistenceCounts>;
+  isRunPurgeReserved?(id: string): Promise<boolean>;
+  pruneOutbox?(publishedOlderThan: Date, limit: number): Promise<number>;
+  pruneIdempotencyKeys?(olderThan: Date, limit: number): Promise<number>;
+
   /**
    * Terminal runs eligible for retention deletion, oldest first: runs whose
    * `status` is one of `statuses` and which finished at or before `cutoff`
@@ -1166,6 +1204,11 @@ export interface AIHelperStats {
 }
 
 export interface AICallLogger {
+  /** Delete calls attributed to runs, including legacy workflow topics. */
+  deleteForRuns?(runIds: readonly string[]): Promise<number>;
+  pruneCalls?(olderThan: Date, limit: number): Promise<number>;
+  clearExpiredText?(now: Date, limit: number): Promise<number>;
+
   /**
    * Log a single AI call (fire and forget)
    */
@@ -1231,6 +1274,11 @@ export interface JobQueue {
    * the downstream stages it deletes without recreating, which nothing
    * would ever re-enqueue). An empty `stageIds` is a no-op.
    */
+  /** Read job identifiers without resolving job payloads for erasure. */
+  getJobsForPurge?(
+    workflowRunId: string,
+  ): Promise<{ id: string; stageId: string }[]>;
+  deleteForRun?(workflowRunId: string): Promise<number>;
   deleteByRunAndStages(
     workflowRunId: string,
     stageIds: string[],

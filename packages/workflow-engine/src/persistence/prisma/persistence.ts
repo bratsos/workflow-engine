@@ -30,6 +30,8 @@ import type {
   OutboxRecord,
   PurgeableRun,
   PurgeableRunStatus,
+  RunPurgeFence,
+  RunPurgePersistenceCounts,
   SaveArtifactInput,
   ServedDefinition,
   Status,
@@ -46,6 +48,7 @@ import type {
 import {
   ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
+  RUN_PURGE_RESERVATION,
   StaleVersionError,
 } from "../interface";
 import { countActiveByStatus, SQLITE_RARE, sqliteDate } from "./active-stats";
@@ -65,6 +68,7 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
+import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
 import {
   isSerializationFailure,
   isSqliteBusy,
@@ -572,6 +576,248 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       orderBy: { createdAt: "asc" },
     });
     return runs.map((run: any) => this.mapWorkflowRun(run));
+  }
+
+  async listTenantRunsForPurge(
+    tenantId: string,
+    limit: number,
+  ): Promise<string[]> {
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].map((status) =>
+      this.enums.status(status),
+    );
+    const find = (
+      status: { in: typeof terminal } | { notIn: typeof terminal },
+      take: number,
+    ) =>
+      this.prisma.workflowRun.findMany({
+        where: { tenantId, status },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: { id: true },
+        take,
+      });
+    const rows = await find({ in: terminal }, limit);
+    if (rows.length < limit) {
+      rows.push(...(await find({ notIn: terminal }, limit - rows.length)));
+    }
+    return rows.map((row: { id: string }) => row.id);
+  }
+
+  async isRunPurgeReserved(id: string): Promise<boolean> {
+    return (
+      (await this.prisma.idempotencyKey.findUnique({
+        where: {
+          key_commandType: { key: id, commandType: RUN_PURGE_RESERVATION },
+        },
+        select: { id: true },
+      })) !== null
+    );
+  }
+
+  async reserveRunPurge(
+    fence: RunPurgeFence,
+    jobIds: readonly string[],
+  ): Promise<void> {
+    if (
+      this.skipTransactions ||
+      this.isOutboxTransaction ||
+      !this.prisma.$transaction
+    ) {
+      throw new Error(
+        "Run erasure requires a root client with interactive transactions",
+      );
+    }
+    await this.withTransaction(async (tx) => {
+      const adapter = tx as PrismaWorkflowPersistence;
+      // Serialize with redrive's run update before publishing the reservation.
+      await adapter.lockPurgeFence(fence);
+      const where = {
+        key_commandType: { key: fence.id, commandType: RUN_PURGE_RESERVATION },
+      };
+      const existing = await adapter.prisma.idempotencyKey.findUnique({
+        where,
+        select: { result: true },
+      });
+      const result = {
+        ...IDEMPOTENCY_IN_PROGRESS_MARKER,
+        jobIds: [
+          ...new Set([
+            ...((existing?.result?.jobIds ?? []) as string[]),
+            ...jobIds,
+          ]),
+        ],
+      };
+      if (existing) {
+        await adapter.prisma.idempotencyKey.update({ where, data: { result } });
+      } else {
+        await adapter.prisma.idempotencyKey.create({
+          data: {
+            ...where.key_commandType,
+            workflowRunId: fence.id,
+            result,
+            createdAt: this.now(),
+          },
+        });
+      }
+    });
+  }
+
+  private async lockPurgeFence(fence: RunPurgeFence): Promise<void> {
+    const status =
+      this.databaseType === "postgresql" ? '"status"::text' : '"status"';
+    // Keep Prisma's updatedAt and version unchanged while taking the writer lock.
+    const locked = await writeRetentionSql(
+      this.prisma,
+      this.databaseType,
+      `UPDATE "workflow_runs" SET "version" = "version"
+        WHERE "id" = $1 AND "version" = $2 AND ${status} = $3`,
+      [fence.id, fence.version, fence.status],
+    );
+    if (locked !== 1) throw new Error("Run changed during erasure");
+  }
+
+  async listArchivedStageIdsForPurge(
+    workflowRunId: string,
+    archiveKey: string,
+  ): Promise<string[]> {
+    const rows = await this.prisma.workflowAnnotation.findMany({
+      where: {
+        workflowRunId,
+        key: archiveKey,
+        scope: "stage",
+        actorKind: "engine",
+        actorId: "run.redrive",
+      },
+      select: { payload: true },
+    });
+    return rows.flatMap(
+      ({ payload }: { payload: { stageRecordId?: unknown } | null }) =>
+        typeof payload?.stageRecordId === "string"
+          ? [payload.stageRecordId]
+          : [],
+    );
+  }
+
+  async purgeRun(
+    fence: RunPurgeFence,
+    stageRecordIds: readonly string[],
+  ): Promise<RunPurgePersistenceCounts> {
+    if (!this.isOutboxTransaction)
+      throw new Error("Run erasure requires a persistence transaction");
+    const workflowRunId = fence.id;
+    const where = { workflowRunId };
+    const reservation = await this.prisma.idempotencyKey.findUnique({
+      where: {
+        key_commandType: {
+          key: workflowRunId,
+          commandType: RUN_PURGE_RESERVATION,
+        },
+      },
+      select: { result: true },
+    });
+    if (!reservation) throw new Error("Run erasure reservation is missing");
+    const execute = (sql: string, ...args: unknown[]) =>
+      writeRetentionSql(this.prisma, this.databaseType, sql, args);
+    const pg = this.databaseType === "postgresql";
+    let idempotencyKeys = (
+      await this.prisma.idempotencyKey.deleteMany({
+        where: { ...where, commandType: { not: RUN_PURGE_RESERVATION } },
+      })
+    ).count;
+    const legacyRunId = pg
+      ? `"result"->>'workflowRunId'`
+      : `json_extract("result", '$.workflowRunId')`;
+    idempotencyKeys += await execute(
+      `DELETE FROM "idempotency_keys" WHERE "workflowRunId" IS NULL AND (${legacyRunId}) = $1`,
+      workflowRunId,
+    );
+    const deleteLegacyKeys = (commandType: string, prefix: string) =>
+      execute(
+        `DELETE FROM "idempotency_keys" WHERE "workflowRunId" IS NULL AND "commandType" = $1
+          AND "key"${pg ? ' COLLATE "C"' : ""} >= $2 AND "key"${pg ? ' COLLATE "C"' : ""} < $3`,
+        commandType,
+        ...prefixRange(prefix),
+      );
+    for (const id of (reservation.result.jobIds ?? []) as string[]) {
+      idempotencyKeys += await deleteLegacyKeys(
+        "job.execute",
+        `job:${id}:attempt:`,
+      );
+    }
+    for (const id of stageRecordIds) {
+      idempotencyKeys += await deleteLegacyKeys(
+        "step.signal.wake",
+        `[${JSON.stringify(id)},`,
+      );
+    }
+    const steps = await execute(
+      `DELETE FROM "workflow_steps" WHERE "stageRecordId" IN (
+        SELECT "id" FROM "workflow_stages" WHERE "workflowRunId" = $1
+      )`,
+      workflowRunId,
+    );
+    let { count: logs } = await this.prisma.workflowLog.deleteMany({ where });
+    logs += await execute(
+      `DELETE FROM "workflow_logs" WHERE "workflowStageId" IN (
+        SELECT "id" FROM "workflow_stages" WHERE "workflowRunId" = $1
+      )`,
+      workflowRunId,
+    );
+    const { count: artifacts } = await this.prisma.workflowArtifact.deleteMany({
+      where,
+    });
+    const { count: annotations } =
+      await this.prisma.workflowAnnotation.deleteMany({ where });
+    const { count: stages } = await this.prisma.workflowStage.deleteMany({
+      where,
+    });
+    // Share the lock order of engine.prune (run, then outbox) and redrive
+    // (stages, then run). The final delete still verifies the fence.
+    await this.lockPurgeFence(fence);
+    const { count: outboxEvents } = await this.prisma.outboxEvent.deleteMany({
+      where,
+    });
+    await this.releaseIdempotencyKey(workflowRunId, RUN_PURGE_RESERVATION);
+    const { count: runs } = await this.prisma.workflowRun.deleteMany({
+      where: {
+        id: workflowRunId,
+        status: this.enums.status(fence.status),
+        version: fence.version,
+      },
+    });
+    if (runs !== 1) throw new Error("Run changed during erasure");
+    return {
+      stages,
+      steps,
+      logs,
+      artifacts,
+      annotations,
+      outboxEvents,
+      idempotencyKeys,
+    };
+  }
+
+  async pruneOutbox(publishedOlderThan: Date, limit: number): Promise<number> {
+    return pruneRows(
+      this.prisma,
+      this.databaseType,
+      "outbox",
+      publishedOlderThan,
+      limit,
+    );
+  }
+
+  async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<number> {
+    return pruneRows(
+      this.prisma,
+      this.databaseType,
+      "idempotencyKeys",
+      olderThan,
+      limit,
+    );
+  }
+
+  ownsStepLedger(prisma: EnginePrismaClient): boolean {
+    return this.prisma === prisma;
   }
 
   async listRunsForPurge(
@@ -2401,6 +2647,7 @@ guardSqliteAdapter(PrismaWorkflowPersistence.prototype, [
   "mapWorkflowRun",
   "mapWorkflowStage",
   "purgeable",
+  "ownsStepLedger",
   "servesFilter",
   "supportsDefinitionVersioning",
 ]);

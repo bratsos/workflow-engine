@@ -9,6 +9,8 @@
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EnginePruneCommand,
+  EnginePruneResult,
   EngineStatsCommand,
   EngineStatsResult,
   EngineStatsSection,
@@ -36,7 +38,12 @@ export type {
   RunCreateResult,
   RunListVersionsCommand,
   RunListVersionsResult,
+  RunPurgeByAgeCommand,
+  RunPurgeByAgeResult,
+  RunPurgeByTargetCommand,
+  RunPurgeByTargetResult,
   RunPurgeCommand,
+  RunPurgeCounts,
   RunPurgeResult,
   RunReapStuckCommand,
   RunReapStuckResult,
@@ -88,6 +95,10 @@ export {
   createRoutingExecutor,
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
+export {
+  AICallDeletionUnavailableError,
+  RunPurgeInProgressError,
+} from "./handlers/run-purge.js";
 // Definition pinning helpers, for hosts that resolve definitions themselves.
 export { SUPERSEDED_ATTEMPT_KEY } from "./handlers/run-redrive.js";
 export {
@@ -117,6 +128,7 @@ export {
   type MaintenanceTickCounts,
   type MaintenanceTickHook,
   normalizeAnnotateArgs,
+  type PruneOptions,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,

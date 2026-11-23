@@ -12,6 +12,7 @@
 
 import {
   assertTimerMs,
+  type EnginePruneResult,
   type EventSinkStatus,
   executeJobWithHeartbeat,
   flushOutboxWithin,
@@ -19,6 +20,7 @@ import {
   type JobTransport,
   type Kernel,
   type MaintenanceTickHook,
+  type PruneOptions,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
   runTickHook,
@@ -75,6 +77,8 @@ export interface ServerlessHostConfig {
    * default: nothing is deleted unless this is set.
    */
   retention?: RetentionOptions;
+  /** Optional age and text retention for engine tables. */
+  prune?: PruneOptions;
 
   /**
    * Called at the end of every `runMaintenanceTick()` with a copy of the
@@ -172,6 +176,7 @@ export interface MaintenanceTickResult {
   stuckReaped: number;
   /** Terminal runs deleted by `run.purge`; 0 unless `retention` is configured. */
   purged: number;
+  pruned?: EnginePruneResult;
   /** Events claimed but not published this tick; the next flush retries them. */
   eventsFailed: number;
   /** Events that exhausted their retry budget and moved to the DLQ. */
@@ -218,6 +223,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly prune: PruneOptions | undefined;
   private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly flushOutboxAfterJob: boolean;
@@ -241,6 +247,7 @@ class ServerlessHostImpl implements ServerlessHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
+    this.prune = config.prune;
     if (config.onTick !== undefined && typeof config.onTick !== "function") {
       throw new TypeError(
         `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
@@ -401,6 +408,7 @@ class ServerlessHostImpl implements ServerlessHost {
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
+      ...(this.prune !== undefined ? { prune: this.prune } : {}),
       logPrefix: "[ServerlessHost]",
     });
     if (counts.eventSinkStatus === "degraded") {

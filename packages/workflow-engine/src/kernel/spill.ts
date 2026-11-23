@@ -436,6 +436,14 @@ export function withStepResultSpill(
       await spill.deleteUnder(stepWriteSpillPrefix(stageRecordId));
     },
 
+    async deleteForPurge(stageRecordId, persistence) {
+      if (ledger.deleteForPurge)
+        return ledger.deleteForPurge(stageRecordId, persistence);
+      const rows = await ledger.list(stageRecordId);
+      await ledger.clear(stageRecordId);
+      return rows.length;
+    },
+
     // `clearExcept` is optional on the port and the kernel branches on its
     // presence: a ledger without it gets the whole-ledger clear that
     // destroys the external keys of effects still in flight. So the
@@ -667,6 +675,20 @@ export function createSpillingJobTransport(
         }),
       );
       return transport.enqueueParallel(packed);
+    },
+
+    async getJobsForPurge(workflowRunId) {
+      return transport.getJobsForPurge
+        ? transport.getJobsForPurge(workflowRunId)
+        : transport.getJobsByWorkflowRun(workflowRunId);
+    },
+
+    async deleteForRun(workflowRunId) {
+      if (transport.deleteForRun) return transport.deleteForRun(workflowRunId);
+      const jobs = await transport.getJobsByWorkflowRun(workflowRunId);
+      return transport.deleteByRunAndStages(workflowRunId, [
+        ...new Set(jobs.map((job) => job.stageId)),
+      ]);
     },
 
     async deleteByRunAndStages(workflowRunId: string, stageIds: string[]) {

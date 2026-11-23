@@ -390,7 +390,7 @@ Order is decided at claim time. A replayed dead letter is delivered after later 
 
 An alpha.20 flusher ignores new claims and can lose an event by stamping before emit. Stop all alpha.20 flushers before relying on the new guarantee. A legacy stamp without a claim means published to the new code; an event already lost by an old flusher cannot be recovered.
 
-Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. If a persistence write fails, `kernel.dispatch` rejects without logging; host maintenance logs `outbox.flush error` and reports degraded delivery. A later flush recovers still-claimed rows after expiry; if the write committed before the error, its recorded outcome applies.
+Targeted `run.purge` removes outbox rows and `engine.prune` removes published events of terminal runs. Age-based `run.purge` leaves outbox rows. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. If a persistence write fails, `kernel.dispatch` rejects without logging; host maintenance logs `outbox.flush error` and reports degraded delivery. A later flush recovers still-claimed rows after expiry; if the write committed before the error, its recorded outcome applies.
 
 When
 publishing fails, `outbox.flush` releases the failed event so the next

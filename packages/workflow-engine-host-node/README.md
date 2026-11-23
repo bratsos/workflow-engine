@@ -53,6 +53,7 @@ Creates a new Node host instance.
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
 | `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs older than this through `run.purge` at the end of every tick |
+| `prune` | `PruneOptions` | off | Run configured age and text retention clauses through `engine.prune` on every maintenance tick |
 | `shutdownTimeoutMs` | `number` | `10_000` | Bound on `stop()`: wait for the in-flight job, then for the final outbox flush |
 | `outboxFlushTimeoutMs` | `number` | `5_000` | Maximum wait for a maintenance outbox flush; an in-flight emit can continue after the timeout |
 | `flushOutboxOnStop` | `boolean` | `true` | Run a final `outbox.flush` in `stop()` |

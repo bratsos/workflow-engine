@@ -394,6 +394,7 @@ const SYNC_PERSISTENCE = [
   "mapWorkflowArtifact",
   "mapWorkflowRun",
   "mapWorkflowStage",
+  "ownsStepLedger",
   "purgeable",
   "servesFilter",
   "supportsDefinitionVersioning",

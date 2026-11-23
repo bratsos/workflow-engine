@@ -45,6 +45,8 @@ export type {
   PersistenceCore,
   PurgeableRun,
   PurgeableRunStatus,
+  RunPurgeFence,
+  RunPurgePersistenceCounts,
   SaveArtifactInput,
   Status,
   UpdateRunInput,

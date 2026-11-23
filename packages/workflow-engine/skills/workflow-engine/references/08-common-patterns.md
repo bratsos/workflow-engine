@@ -28,7 +28,7 @@ If the same key is currently executing, dispatch throws `IdempotencyInProgressEr
 
 ## Transactional Outbox
 
-Events commit with their state change in the transactional outbox. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. See 03-runtime-setup.md for claim expiry and ordering:
+Events commit with their state change in the transactional outbox. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. After age-based `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. Targeted purge deletes all outbox events of erased runs. `engine.prune` deletes old published events of terminal runs. See 03-runtime-setup.md for claim expiry and ordering:
 
 ```typescript
 // Events accumulate in the outbox as commands execute
@@ -139,10 +139,10 @@ cannot change the definition version and it still refuses a `CANCELLED` run.
 Nothing deletes a terminal run on its own. `run.purge` (`{ olderThan,
 statuses?, limit? }` → `{ purged, workflowRunIds }`) clears each run's step
 ledger, job rows and blobs and deletes the run with its stages, logs, artifacts
-and annotations (not its `outbox_events`: nothing in the engine deletes outbox
-rows);
-both hosts run it at the end of the maintenance tick once `retention:
-{ olderThanMs, statuses?, limit? }` is set (off by default). See "Run
+and annotations. Targeted purge by run IDs or tenant also removes attributed
+AI calls, outbox events and idempotency keys. For age-based table retention,
+use `engine.prune`. Both hosts run age-based purge on maintenance ticks
+when `retention: { olderThanMs, statuses?, limit? }` is configured. See "Run
 Retention" in [09-troubleshooting.md](09-troubleshooting.md).
 
 ## Near-synchronous runs: `runToCompletion`

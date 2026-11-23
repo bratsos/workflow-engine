@@ -34,6 +34,7 @@ export {
   MAX_TIMER_MS,
   type MaintenanceTickCounts,
   type MaintenanceTickHook,
+  type PruneOptions,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   retryBackoffMs,

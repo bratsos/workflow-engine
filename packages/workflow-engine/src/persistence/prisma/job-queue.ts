@@ -960,6 +960,20 @@ export class PrismaJobQueue implements JobQueue {
   /**
    * Get all job rows for a workflow run (any status).
    */
+  async getJobsForPurge(
+    workflowRunId: string,
+  ): Promise<{ id: string; stageId: string }[]> {
+    return this.prisma.jobQueue.findMany({
+      where: { workflowRunId },
+      select: { id: true, stageId: true },
+    });
+  }
+
+  async deleteForRun(workflowRunId: string): Promise<number> {
+    return (await this.prisma.jobQueue.deleteMany({ where: { workflowRunId } }))
+      .count;
+  }
+
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
     const jobs = await this.prisma.jobQueue.findMany({
       where: { workflowRunId },

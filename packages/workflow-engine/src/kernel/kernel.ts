@@ -34,6 +34,7 @@ import type {
 } from "../persistence/interface";
 import type {
   CommandResult,
+  EnginePruneResult,
   EngineStatsResult,
   JobExecuteResult,
   JobHeartbeatResult,
@@ -56,6 +57,7 @@ import type {
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
 import { createLocalExecutor } from "./executor/local-executor.js";
+import { handleEnginePrune } from "./handlers/engine-prune";
 import { handleEngineStats } from "./handlers/engine-stats";
 import { handleJobExecute } from "./handlers/job-execute";
 import { handleJobHeartbeat } from "./handlers/job-heartbeat";
@@ -66,7 +68,11 @@ import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
 import { handleRunListVersions } from "./handlers/run-list-versions";
-import { handleRunPurge } from "./handlers/run-purge";
+import {
+  handleRunPurge,
+  handleTargetedRunPurge,
+  RunPurgeInProgressError,
+} from "./handlers/run-purge";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRedrive } from "./handlers/run-redrive";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
@@ -302,7 +308,8 @@ type AnyCommandResult =
   | OutboxFlushResult
   | PluginReplayDLQResult
   | RunReapStuckResult
-  | RunPurgeResult;
+  | RunPurgeResult
+  | EnginePruneResult;
 
 /** Strip the internal `_events`/`_postCommit` fields off a handler result. */
 function stripEvents<R>(result: HandlerResult<R>): R {
@@ -433,6 +440,19 @@ export function createKernel(config: KernelConfig): Kernel {
   async function dispatchAny(
     command: KernelCommand,
   ): Promise<AnyCommandResult> {
+    if (command.type === "run.purge") {
+      const selectors = ["olderThan", "workflowRunIds", "tenantId"].filter(
+        (key) => key in command,
+      );
+      if (selectors.length !== 1)
+        throw new Error("run.purge requires exactly one selector");
+      if (!("olderThan" in command))
+        return handleTargetedRunPurge(command, deps);
+    }
+    if (command.type === "engine.prune") {
+      return handleEnginePrune(command, deps);
+    }
+
     // -----------------------------------------------------------------
     // outbox.flush routes directly — no outbox write, no idempotency
     // -----------------------------------------------------------------
@@ -569,6 +589,14 @@ export function createKernel(config: KernelConfig): Kernel {
                 }
               : services,
           };
+          const reopening =
+            command.type === "run.redrive" || command.type === "run.rerunFrom";
+          if (
+            reopening &&
+            (await tx.isRunPurgeReserved?.(command.workflowRunId))
+          ) {
+            throw new RunPurgeInProgressError(command.workflowRunId);
+          }
           let result: HandlerResult<any>;
 
           switch (command.type) {
@@ -602,6 +630,16 @@ export function createKernel(config: KernelConfig): Kernel {
                 `Unknown command type: ${(_exhaustive as KernelCommand).type}`,
               );
             }
+          }
+
+          // Reopening holds the run's write lock by now. Check the
+          // reservation under that lock so either the reopen commits first
+          // or its entire transaction rolls back before erasure continues.
+          if (
+            reopening &&
+            (await tx.isRunPurgeReserved?.(command.workflowRunId))
+          ) {
+            throw new RunPurgeInProgressError(command.workflowRunId);
           }
 
           const events = result._events;

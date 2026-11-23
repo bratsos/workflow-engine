@@ -230,6 +230,8 @@ export type {
   PersistenceCore,
   PurgeableRun,
   PurgeableRunStatus,
+  RunPurgeFence,
+  RunPurgePersistenceCounts,
   SaveArtifactInput,
   // Unified status type (preferred)
   Status,
@@ -287,6 +289,8 @@ export {
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EnginePruneCommand,
+  EnginePruneResult,
   EngineStatsCommand,
   EngineStatsResult,
   EngineStatsSection,
@@ -311,7 +315,12 @@ export type {
   RunCreateResult,
   RunListVersionsCommand,
   RunListVersionsResult,
+  RunPurgeByAgeCommand,
+  RunPurgeByAgeResult,
+  RunPurgeByTargetCommand,
+  RunPurgeByTargetResult,
   RunPurgeCommand,
+  RunPurgeCounts,
   RunPurgeResult,
   RunReapStuckCommand,
   RunReapStuckResult,
@@ -342,6 +351,11 @@ export type {
   KernelEventType,
   StepSignalledEvent,
 } from "./kernel/events";
+export {
+  AICallDeletionUnavailableError,
+  type PruneOptions,
+  RunPurgeInProgressError,
+} from "./kernel/index.js";
 export {
   createKernel,
   createWorkflowRegistry,

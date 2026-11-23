@@ -21,6 +21,7 @@ import {
   type Kernel,
   type MaintenanceTickCounts,
   type MaintenanceTickHook,
+  type PruneOptions,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
   runTickHook,
@@ -119,6 +120,8 @@ export interface NodeHostConfig {
    * default: nothing is deleted unless this is set.
    */
   retention?: RetentionOptions;
+  /** Optional age and text retention for engine tables. */
+  prune?: PruneOptions;
 
   /**
    * Called after every orchestration tick with a copy of the counts that tick
@@ -250,6 +253,7 @@ class NodeHostImpl implements NodeHost {
   private readonly maxOutboxFlushPerTick: number;
   private readonly outboxFlushTimeoutMs: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly prune: PruneOptions | undefined;
   private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly shutdownTimeoutMs: number;
@@ -291,6 +295,7 @@ class NodeHostImpl implements NodeHost {
       config.outboxFlushTimeoutMs ?? HOST_DEFAULTS.outboxFlushTimeoutMs,
     );
     this.retention = config.retention;
+    this.prune = config.prune;
     if (config.onTick !== undefined && typeof config.onTick !== "function") {
       throw new TypeError(
         `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
@@ -560,6 +565,7 @@ class NodeHostImpl implements NodeHost {
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
+      ...(this.prune !== undefined ? { prune: this.prune } : {}),
       logPrefix: "[NodeHost]",
     });
     if (!this.isCurrent(lifecycle)) return;

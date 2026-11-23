@@ -434,6 +434,11 @@ CREATE INDEX IF NOT EXISTS "workflow_runs_tenantId_createdAt_id_idx"
   ON "workflow_runs" ("tenantId", "createdAt" DESC, "id" DESC);
 CREATE INDEX IF NOT EXISTS "ai_calls_tenantId_createdAt_idx"
   ON "ai_calls" ("tenantId", "createdAt");
+CREATE INDEX IF NOT EXISTS "workflow_artifacts_workflowStageId_idx"
+  ON "workflow_artifacts" ("workflowStageId");
+CREATE INDEX IF NOT EXISTS "workflow_annotations_workflowStageRecordId_idx"
+  ON "workflow_annotations" ("workflowStageRecordId");
+CREATE INDEX IF NOT EXISTS "ai_calls_createdAt_idx" ON "ai_calls" ("createdAt");
 CREATE INDEX IF NOT EXISTS "ai_calls_workflowRunId_idx" ON "ai_calls" ("workflowRunId");
 CREATE INDEX IF NOT EXISTS "ai_calls_textExpiresAt_idx" ON "ai_calls" ("textExpiresAt");
 CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
@@ -498,6 +503,19 @@ is `null` when the caller has no run ID. Existing keys need no backfill. To
 identify older keys that lack the column value, use `result->>'workflowRunId'`
 where present. For older `job.execute` keys, the original job ID binds a
 `job:<jobId>:attempt:` prefix while the job rows still exist.
+
+#### Retention and erasure indexes
+
+Put these indexes in the same release's migration as the column and index
+upgrade above. Include `sql/retention-indexes.postgresql.sql` or
+`sql/retention-indexes.sqlite.sql` from the engine package. These indexes
+serve literal AI topic and idempotency key prefixes and the legacy idempotency
+result's JSON run ID. Keep them in the migration SQL since the Prisma schemas
+cannot express their expressions and collations.
+
+The indexes are rolling-safe. Upgrade or stop all older hosts before using
+targeted `run.purge` with run IDs or a tenant ID. Redrive and rerun commands on
+older hosts do not check the reservation that protects erasure.
 
 ### Custom port implementations
 

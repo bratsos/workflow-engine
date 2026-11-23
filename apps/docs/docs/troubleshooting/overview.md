@@ -138,7 +138,8 @@ The host orchestration tick executes these operations sequentially. Each operati
 3. **`lease.reapStale`**: Recovers job locks from crashed worker processes and fails jobs past the absolute cap.
 4. **`outbox.flush`**: Emits events to the `EventSink`.
 5. **`run.reapStuck`**: Cleans up zombie runs that have lost database activity.
-6. **`run.purge`** (only when the host is given `retention`): Deletes terminal runs past their retention age.
+6. **`engine.prune`** (only when the host is given `prune`): Applies configured retention in bounded batches.
+7. **`run.purge`** (only when the host is given `retention`): Deletes terminal runs past their retention age.
 
 ---
 
@@ -150,7 +151,31 @@ Nothing deletes a finished run by itself. Opt in per host with `retention: { old
 await kernel.dispatch({ type: "run.purge", olderThan: new Date(Date.now() - 30 * 86_400_000) });
 ```
 
-Deleting by SQL instead: with the reference schema, `DELETE FROM "workflow_runs" WHERE ...` cascades to stages, logs, artifacts and annotations, and from `workflow_stages` to `workflow_steps` **only once the `workflow_steps_stageRecordId_fkey` foreign key exists** (package schema from the release that added `run.purge`; earlier 1.0 alphas need the `ADD CONSTRAINT` in the [0.13 → 1.0 migration guide](../migrations/migrate-0.13-to-1.0.md)). `job_queue` and `outbox_events` have no foreign key to the run and must be deleted explicitly, and blobs live outside the database. `run.purge` itself never deletes outbox rows (nor `ai_calls`): nothing in the engine does, so the outbox table is not bounded by retention and you remove its rows with SQL.
+### Targeted erasure
+
+Configure `services.aiLogger.deleteForRuns` and dispatch one of these commands:
+
+```typescript
+await kernel.dispatch({ type: "run.purge", workflowRunIds: ["run-1", "run-2"] });
+await kernel.dispatch({ type: "run.purge", tenantId: "tenant-a", limit: 100 });
+```
+
+Both forms return `removed` with per-table and blob counts, `skipped` with live runs and their statuses, and `incomplete` with the failing cleanup phase for each affected run. Cancel live runs first. Retry incomplete requests to finish erasing them. A reservation keeps the run discoverable for retry and prevents redrive during erasure. Tenant requests select terminal runs first and default to 100 runs per batch.
+
+### Table retention
+
+```typescript
+await kernel.dispatch({
+  type: "engine.prune",
+  aiCalls: { olderThan: aiCallCutoff },
+  aiCallText: { now: new Date() },
+  outbox: { publishedOlderThan: outboxCutoff },
+  idempotencyKeys: { olderThan: keyCutoff },
+  limit: 100,
+});
+```
+
+Each optional clause has its own count and batch limit. AI call text expiry clears prompt, response and metadata instructions while keeping the call's accounting data. Outbox retention applies to published events whose runs still exist and are terminal. Idempotency retention applies to completed keys. Both hosts accept `prune: { aiCalls?: { olderThanMs }, aiCallText?: boolean, outbox?: { publishedOlderThanMs }, idempotencyKeys?: { olderThanMs }, limit? }` and run it before age-based run purge.
 
 ---
 

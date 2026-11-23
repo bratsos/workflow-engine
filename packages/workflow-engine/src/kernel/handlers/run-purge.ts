@@ -4,8 +4,8 @@
  * Retention sweep. Deletes terminal runs that finished at or before the
  * cutoff, bounded by `limit`, and takes the following along: the durable-step ledger, the run's blobs, its job rows, and
  * the run row itself (stages, logs, artifacts and annotations go with it
- * through `PersistenceCore.deleteRun`). Not the run's `outbox_events` (no
- * foreign key, nothing in the engine deletes them) nor its `ai_calls`.
+ * through `PersistenceCore.deleteRun`). Age retention leaves outbox events
+ * available for delivery and AI calls on their own retention policy.
  *
  * INVARIANT: jobs, ledger rows and blobs are removed in `_postCommit`, never
  * inside the persistence transaction (see run-cancel.ts). These ports use
@@ -40,13 +40,20 @@ import type {
   PurgeableRun,
   PurgeableRunStatus,
 } from "../../persistence/interface.js";
-import type { RunPurgeCommand, RunPurgeResult } from "../commands";
+import type {
+  RunPurgeByAgeCommand,
+  RunPurgeByAgeResult,
+  RunPurgeByTargetCommand,
+  RunPurgeByTargetResult,
+  RunPurgeCounts,
+} from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   jobSpillPrefix,
   stepSpillPrefix,
   stepWriteSpillPrefix,
 } from "../spill.js";
+import { SUPERSEDED_ATTEMPT_KEY } from "./run-redrive.js";
 import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
@@ -82,9 +89,9 @@ export function runBlobPrefixes(run: {
 }
 
 export async function handleRunPurge(
-  command: RunPurgeCommand,
+  command: RunPurgeByAgeCommand,
   deps: KernelDeps,
-): Promise<HandlerResult<RunPurgeResult>> {
+): Promise<HandlerResult<RunPurgeByAgeResult>> {
   const statuses = command.statuses ?? DEFAULT_PURGE_STATUSES;
   const limit = command.limit ?? DEFAULT_PURGE_LIMIT;
   if (!(limit > 0)) {
@@ -112,6 +119,7 @@ export async function handleRunPurge(
               return (
                 run !== null &&
                 statuses.some((status) => status === run.status) &&
+                !(await postDeps.persistence.isRunPurgeReserved?.(id)) &&
                 (run.completedAt ?? run.updatedAt) <= command.olderThan
               );
             };
@@ -200,4 +208,147 @@ export async function handleRunPurge(
         }
       : {}),
   };
+}
+
+export class AICallDeletionUnavailableError extends Error {
+  readonly code = "AI_CALL_DELETION_UNAVAILABLE";
+
+  constructor(method: "deleteForRuns" | "pruneCalls" | "clearExpiredText") {
+    super(`Configure services.aiLogger.${method} to erase AI call data`);
+    this.name = "AICallDeletionUnavailableError";
+  }
+}
+
+export class RunPurgeInProgressError extends Error {
+  readonly code = "RUN_PURGE_IN_PROGRESS";
+
+  constructor(public readonly workflowRunId: string) {
+    super(`Run ${workflowRunId} is reserved for erasure`);
+    this.name = "RunPurgeInProgressError";
+  }
+}
+
+export async function handleTargetedRunPurge(
+  command: RunPurgeByTargetCommand,
+  deps: KernelDeps,
+): Promise<RunPurgeByTargetResult> {
+  const { persistence, blobStore, jobTransport, stepLedger } = deps;
+  const aiLogger = deps.services?.aiLogger;
+  if (!aiLogger?.deleteForRuns)
+    throw new AICallDeletionUnavailableError("deleteForRuns");
+  if (
+    !persistence.reserveRunPurge ||
+    !persistence.purgeRun ||
+    !persistence.isRunPurgeReserved
+  ) {
+    throw new Error(
+      "Targeted run erasure requires a persistence adapter with purge support",
+    );
+  }
+
+  let ids: readonly string[];
+  if ("workflowRunIds" in command) {
+    ids = command.workflowRunIds;
+  } else {
+    const limit = command.limit ?? DEFAULT_PURGE_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new Error("run.purge: limit must be a positive integer");
+    }
+    if (!persistence.listTenantRunsForPurge) {
+      throw new Error("Tenant erasure requires persistence tenant selection");
+    }
+    ids = await persistence.listTenantRunsForPurge(command.tenantId, limit);
+  }
+
+  const removed: RunPurgeCounts = {
+    runs: 0,
+    stages: 0,
+    steps: 0,
+    jobs: 0,
+    logs: 0,
+    artifacts: 0,
+    annotations: 0,
+    outboxEvents: 0,
+    idempotencyKeys: 0,
+    aiCalls: 0,
+    blobs: 0,
+  };
+  const skipped: RunPurgeByTargetResult["skipped"] = [];
+  const incomplete: RunPurgeByTargetResult["incomplete"] = [];
+  for (const id of new Set(ids)) {
+    let phase: RunPurgeByTargetResult["incomplete"][number]["failed"][number] =
+      "persistence";
+    try {
+      const run = await persistence.getRun(id);
+      if (!run || ("tenantId" in command && command.tenantId !== run.tenantId))
+        continue;
+      const terminal = DEFAULT_PURGE_STATUSES.find(
+        (status) => status === run.status,
+      );
+      if (!terminal) {
+        skipped.push({ workflowRunId: id, status: run.status });
+        continue;
+      }
+      const fence = { id, status: terminal, version: run.version };
+      const stages = await persistence.getStagesByRun(id);
+      const archived =
+        (await persistence.listArchivedStageIdsForPurge?.(
+          id,
+          SUPERSEDED_ATTEMPT_KEY,
+        )) ?? [];
+      const stageRecordIds = [
+        ...new Set([...stages.map((stage) => stage.id), ...archived]),
+      ];
+      phase = "jobs";
+      const jobs = await (jobTransport.getJobsForPurge?.(id) ??
+        jobTransport.getJobsByWorkflowRun(id));
+      phase = "persistence";
+      await persistence.reserveRunPurge(
+        fence,
+        jobs.map((job) => job.id),
+      );
+
+      // Blobs go first so a storage failure leaves all attributed rows and
+      // the stage ids needed to recompute prefixes for the next request.
+      phase = "blobs";
+      for (const prefix of runBlobPrefixes({
+        ...run,
+        stageRecordIds,
+      })) {
+        for (const key of await blobStore.list(prefix)) {
+          if (!key.startsWith(prefix)) continue;
+          await blobStore.delete(key);
+          removed.blobs++;
+        }
+      }
+      phase = "aiCalls";
+      removed.aiCalls += await aiLogger.deleteForRuns([id]);
+
+      phase = "jobs";
+      removed.jobs += await (jobTransport.deleteForRun?.(id) ??
+        jobTransport.deleteByRunAndStages(id, [
+          ...new Set(jobs.map((job) => job.stageId)),
+        ]));
+
+      phase = "steps";
+      for (const stageRecordId of stageRecordIds) {
+        removed.steps += await (stepLedger?.deleteForPurge?.(
+          stageRecordId,
+          persistence,
+        ) ?? 0);
+      }
+
+      phase = "persistence";
+      const counts = await persistence.withTransaction((tx) =>
+        tx.purgeRun!(fence, stageRecordIds),
+      );
+      removed.runs++;
+      for (const key of Object.keys(counts) as (keyof typeof counts)[]) {
+        removed[key] += counts[key];
+      }
+    } catch {
+      incomplete.push({ workflowRunId: id, failed: [phase] });
+    }
+  }
+  return { removed, skipped, incomplete };
 }

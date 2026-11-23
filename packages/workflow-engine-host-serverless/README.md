@@ -52,6 +52,7 @@ Creates a new serverless host instance.
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
 | `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs through `run.purge` at the end of every tick |
+| `prune` | `PruneOptions` | off | Run configured age and text retention clauses through `engine.prune` on every maintenance tick |
 | `flushOutboxAfterJob` | `boolean` | `true` | Publish the job's outbox events right after `handleJob` settles it |
 | `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on post-job and maintenance flushes; an in-flight emit can continue after timeout |
 

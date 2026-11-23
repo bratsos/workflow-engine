@@ -1,4 +1,5 @@
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
 import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
@@ -410,6 +411,37 @@ export class PrismaAICallLogger implements AICallLogger {
           })) as AICallRow[]
         ).filter((row) => row.topic.startsWith(topicPrefix));
     return rows.map(toRecord);
+  }
+
+  async deleteForRuns(runIds: readonly string[]): Promise<number> {
+    const pg = this.databaseType === "postgresql";
+    const topic = pg ? '"topic" COLLATE "C"' : '"topic"';
+    let removed = 0;
+    for (const id of new Set(runIds)) {
+      removed += await writeRetentionSql(
+        this.prisma,
+        this.databaseType,
+        `DELETE FROM "ai_calls" WHERE "workflowRunId" = $1 OR (
+          "workflowRunId" IS NULL AND ${topic} >= $2 AND ${topic} < $3
+        )`,
+        [id, ...prefixRange(`workflow.${id}.`)],
+      );
+    }
+    return removed;
+  }
+
+  async pruneCalls(olderThan: Date, limit: number): Promise<number> {
+    return pruneRows(
+      this.prisma,
+      this.databaseType,
+      "aiCalls",
+      olderThan,
+      limit,
+    );
+  }
+
+  async clearExpiredText(now: Date, limit: number): Promise<number> {
+    return pruneRows(this.prisma, this.databaseType, "aiCallText", now, limit);
   }
 }
 
