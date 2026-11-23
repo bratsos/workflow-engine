@@ -1046,7 +1046,7 @@ a tenant and period, with optional label grouping. Set `AIHelperOptions.text`
 to suppress stored text or to set an expiry on captured text. Set both
 `WORKFLOW_ENGINE_TRACE=1` and `WORKFLOW_ENGINE_TRACE_TEXT=1` for text in traces.
 `ai.recordCall` accepts an explicit USD cost for external calls, and
-`ai.flush()` waits for pending accounting writes at the end of a request.
+`ai.flush()` waits for calls, stream reads and writes that can still write a row at the end of a request.
 Stage outcomes do not wait for accounting writes. Text capture covers AI call
 rows and trace output; provider error messages, which can echo request text,
 are stored elsewhere as before. Apply separate retention to caller metadata,
