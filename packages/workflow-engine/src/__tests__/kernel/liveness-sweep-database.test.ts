@@ -12,6 +12,7 @@ import {
   realDatabase,
   sqlite,
 } from "../sqlite8-kernel-utils.js";
+import { yieldToHost } from "../utils/yield-to-host.js";
 import {
   drive,
   lateDeliveryAfterRedriveErrors,
@@ -96,6 +97,8 @@ describe.skipIf(!realDatabase)(
       databaseTransactions: true,
       async prepare() {
         await db.reset();
+        // One macrotask per drive: a sweep is a single test of 40 s and more.
+        await yieldToHost();
       },
       async advanceTime(clock) {
         // The Prisma queue stamps a retry deadline from the host clock and
