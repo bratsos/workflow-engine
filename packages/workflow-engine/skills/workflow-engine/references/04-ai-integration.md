@@ -146,6 +146,14 @@ Per-call `timeoutMs` on text, object, embed and stream options overrides `timeou
 
 OpenRouter's "No endpoints found that can handle the requested parameters" is the outcome of `requireParameters: true` excluding endpoints that ignore a requested parameter (typically `maxTokens`); the error names `routing: { requireParameters: false }` as the change to make.
 
+Set `routing.provider` with `only` (provider slugs), `order`, `allowFallbacks` and `dataCollection` (`"allow"` or `"deny"`) to apply an upstream policy to a helper and its children. Built-in OpenRouter calls intersect per-call and helper allow-lists, follow the stricter privacy and fallback settings, and preserve compatible extra restrictions such as `zdr`. Rankings are compared on eligible providers after allowlists and exclusions. An unordered no-fallback policy permits one endpoint, so a compatible singleton order becomes an allowlist with fallbacks disabled and a multi-provider order fails before submission. Direct built-in calls, including transcription and native batches, check their vendor against `only` when set. They reject `dataCollection: "deny"` and an excluded vendor when `order` is set and fallbacks are disabled.
+
+The helper preserves an eligible regional preference within a variant such as `baseten/fp4/us` within `baseten/fp4`. OpenRouter text batches and native-to-OpenRouter fallbacks send allowlists and fallback settings at the top level. A single eligible regional preference can be pinned there with fallbacks disabled. The helper refuses rankings that need multiple eligible providers or backups, data-collection denial, and provider restrictions on the embeddings batch endpoint. [OpenRouter endpoint matching](https://openrouter.ai/docs/guides/routing/provider-selection#base-slug-matching), [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
+
+Each batch submission checks the helper policy against the transport building the request. Stored refs select the transport for a poll, collection, or cancellation of that batch, and the client keeps that transport for its later calls, including new submissions. A call fixes its transport when it starts, so a concurrent call cannot change where it sends or which provider it is checked as.
+
+The `providerResolver` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument and must honour it. Calls handled by an `AIAdapter` refuse a configured provider policy.
+
 `max_price` is an exclusive filter on OpenRouter's side — a request whose price ceiling is below the live price fails outright rather than costing more — so the default headroom absorbs ordinary price drift between `workflow-engine-sync` runs. It bounds the per-token price of a routed call, not spend, and not the non-token charges OpenRouter documents as uncovered.
 
 ## AIHelper Interface
@@ -715,7 +723,7 @@ interface BatchOptions {
 }
 ```
 
-`apiKey`, `baseURL` and `fetch` are honoured by every vendor transport (`resolveAiSdkBatchModel` takes them), not only OpenRouter.
+Polling, collecting and cancelling use the provider named by the saved refs, carry the current client options, and leave the client on that provider for later calls. With a provider policy, a noncanonical `baseURL` for a provider other than the configured one makes reads use its default URL and environment credential and refuses submissions through it. A matching or unset URL preserves the inline key. The injected `fetch` applies in every case.
 
 ### Batch Request Configuration (`AIBatchRequest`)
 
@@ -777,7 +785,7 @@ const batch = ai.batch("gemini-2.5-flash", "google");
 const openrouterBatch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: myKey });
 ```
 
-Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` **throws an error immediately** with an actionable message. When the vendor SDK is not installed (`@ai-sdk/anthropic` / `@ai-sdk/openai` are optional peers), or its release exposes neither batch seam (`NotBatchCapableError`), and OpenRouter can batch the model, the helper falls back to the OpenRouter transport with a WARN instead of failing the submit. A batch is polled and collected through the transport its stored refs name, so changing `batchProvider` while a batch is in flight does not strand it.
+Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` throws. If the native SDK is absent or exposes neither batch interface and OpenRouter supports the model, automatic fallback logs a WARN and carries the client options. With a provider policy, fallback accepts an unset `baseURL` or `https://openrouter.ai/api/v1`. Other URLs cause refusal before fetch. The canonical URL checks ignore host case and trailing slashes.
 
 **Idempotent submits.** A `submit()` replayed after a crash (a durable `run` step whose lease expired) can create and bill a second batch. Inside `ctx.step.ai.map` the OpenAI and Google adapters stamp the step's external key into the batch (`metadata` / `displayName`) and a reclaimed submit adopts the batch it finds; Anthropic and OpenRouter carry no such field, so a reclaimed submit there throws `BatchNotAdoptableError` unless `batch: { onReclaim: "resubmit" }` accepts the duplicate cost. See 12-durable-steps.md.
 
@@ -886,7 +894,7 @@ Every call row (`AICallRecord`, read back with `aiLogger.listCalls(topicPrefix)`
 | `estimatedCost` | The registry figure, always computed: `inputCostPerMillion` / `outputCostPerMillion` (or the long-context tier), with cached input tokens priced at `cachedInputCostPerMillion` when the registry has one. |
 | `reportedCost` | The provider's own USD figure (OpenRouter's `usage.cost`, BYOK-adjusted; an adapter's `costUsd`). Absent when the provider reports none. |
 | `costSource` | `"reported"` or `"estimated"` — which of the two `cost` is. |
-| `servedBy` | The endpoint that served the request — OpenRouter's `provider` metadata (`"Google"`, `"DeepInfra"`, ...). Absent for providers that do not name one. |
+| `servedBy` | The serving provider or comma-separated distinct providers for a multi-step call. `metadata.servedBySteps` records each provider in step order, including the steps reported before a call failed, with `null` for an unknown provider. Rows keep the billable tokens and cost when reading structured output fails or a stream callback throws. |
 | `cachedInputTokens` | Input tokens served from the prompt cache. Part of `inputTokens`, not in addition to it. |
 | `reasoningTokens` | Reasoning tokens the model emitted. Part of `outputTokens` and billed as output; no separate charge. |
 

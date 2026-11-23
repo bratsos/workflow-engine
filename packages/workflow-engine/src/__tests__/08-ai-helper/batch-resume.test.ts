@@ -111,17 +111,14 @@ function newBatch(
   options: Record<string, unknown> = {},
   logFn?: (level: string, message: string, meta?: unknown) => void,
 ) {
-  const batch = new AIBatchImpl(
+  return new AIBatchImpl(
     { topic: "resume-test", aiCallLogger: logger as never },
     MODEL_ID,
     "openrouter",
     logFn as never,
     { apiKey: "k", ...options } as never,
+    backend as never,
   );
-  // Bypass credential resolution; we are testing AIBatchImpl, not the backends.
-  (batch as unknown as { providerPromise: unknown }).providerPromise =
-    Promise.resolve(backend);
-  return batch;
 }
 
 describe("fan-out survives a suspend/resume", () => {

@@ -29,9 +29,11 @@ export interface AIHelperOptions {
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
  * LanguageModel to use, or null/undefined to fall back to built-in resolution.
+ * A returned model must honour the supplied provider policy.
  */
 export type ProviderResolver = (
   modelConfig: ModelConfig,
+  policy?: OpenRouterRoutingOptions["provider"],
 ) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
 export type AICallType =
@@ -509,7 +511,9 @@ import type { EngineBatchRef } from "./batch/model";
 export type AIBatchProvider = "google" | "anthropic" | "openai" | "openrouter";
 
 export interface BatchOptions {
+  /** Credential supplied to the batch transport. */
   apiKey?: string;
+  /** Batch API URL. Fallback and saved-ref operations check it under a provider policy. */
   baseURL?: string;
   fetch?: typeof globalThis.fetch;
   endpoint?:

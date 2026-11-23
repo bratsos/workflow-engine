@@ -5,11 +5,9 @@
  * must not strand the run.
  */
 
-import { describe, expect, it, vi } from "vitest";
-import {
-  AIBatchImpl,
-  batchProviderFromRefProvider,
-} from "../../ai/batch-helper.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { batchProviderFromRefProvider } from "../../ai/batch/model.js";
+import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
@@ -27,6 +25,8 @@ registerModels({
 });
 
 describe("batch provider follows the stored refs", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
   it("maps a ref's provider id onto the engine provider", () => {
     expect(batchProviderFromRefProvider("openrouter")).toBe("openrouter");
     expect(batchProviderFromRefProvider("google.generative-ai")).toBe("google");
@@ -38,6 +38,7 @@ describe("batch provider follows the stored refs", () => {
   });
 
   it("polls an OpenRouter batch through OpenRouter although the registry now names google", async () => {
+    vi.stubEnv("OPENROUTER_API_KEY", "test-openrouter-environment");
     const urls: string[] = [];
     const fetchFn = vi.fn(async (url: string | URL | Request) => {
       urls.push(String(url));
@@ -55,7 +56,7 @@ describe("batch provider follows the stored refs", () => {
       "refs-provider-gemini",
       "google",
       undefined,
-      { apiKey: "sk-or-test", fetch: fetchFn as never },
+      { apiKey: "test-google-option", fetch: fetchFn },
     );
 
     const status = await batch.getStatus("batch-or-9", {

@@ -16,9 +16,11 @@ import { isMissingPackageError } from "./batch/ai-sdk";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
+  assertDirectProviderPolicy,
   calculateCostWithDiscount,
   extractReportedCost,
   logger,
+  type OpenRouterRoutingOptions,
 } from "./shared";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
@@ -32,15 +34,21 @@ import type {
 // Custom Transcription Provider Registry
 // ============================================================================
 
+type TranscriptionProviderFactory = (
+  modelId: string,
+  policy?: OpenRouterRoutingOptions["provider"],
+) => TranscriptionModelV4;
+
 const transcriptionProviderRegistry = new Map<
   string,
-  (modelId: string) => TranscriptionModelV4
+  TranscriptionProviderFactory
 >();
 
 /**
  * Register a transcription model factory for a registry `provider` name, the
  * way `registerEmbeddingProvider` does for embeddings. The factory receives
- * the model id and returns an AI SDK transcription model.
+ * the model id and returns an AI SDK transcription model that honours the
+ * supplied provider policy.
  *
  * @example
  * ```typescript
@@ -52,7 +60,7 @@ const transcriptionProviderRegistry = new Map<
  */
 export function registerTranscriptionProvider(
   providerName: string,
-  factory: (modelId: string) => TranscriptionModelV4,
+  factory: TranscriptionProviderFactory,
 ): void {
   transcriptionProviderRegistry.set(providerName, factory);
 }
@@ -60,19 +68,24 @@ export function registerTranscriptionProvider(
 /** @internal Exported for testing only */
 export async function getTranscriptionModelProvider(
   modelConfig: ModelConfig,
+  policy?: OpenRouterRoutingOptions["provider"],
 ): Promise<TranscriptionModelV4> {
   const customFactory = transcriptionProviderRegistry.get(modelConfig.provider);
   if (customFactory) {
-    return customFactory(modelConfig.id);
+    return policy === undefined
+      ? customFactory(modelConfig.id)
+      : customFactory(modelConfig.id, policy);
   }
 
   if (modelConfig.provider === "google") {
+    assertDirectProviderPolicy("google", policy);
     // The registry may carry the catalogue slug (`google/...`); the Google
     // API wants the bare model id.
     return google.transcription(modelConfig.id.replace(/^google\//, ""));
   }
 
   if (modelConfig.provider === "openai") {
+    assertDirectProviderPolicy("openai", policy);
     // An optional peer, loaded only when an OpenAI transcription is asked for.
     try {
       const { openai } = await import("@ai-sdk/openai");
@@ -176,7 +189,10 @@ export async function transcribe(
   });
 
   try {
-    const model = await getTranscriptionModelProvider(modelConfig);
+    const model = await getTranscriptionModelProvider(
+      modelConfig,
+      ctx.routing?.provider,
+    );
     const result = await runWithCallTimeout(timeout, (signal) =>
       aiTranscribe({
         model,

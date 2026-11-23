@@ -1,11 +1,15 @@
 import { z } from "zod";
 import { toPortableJsonSchema } from "../schema-portability";
 import {
+  eligibleProviderSlugs,
   extractReportedCost,
   extractServedBy,
   extractUsageDetails,
+  type OpenRouterRoutingOptions,
+  sameProviderSlug,
 } from "../shared";
 import {
+  batchBaseURLs,
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -22,11 +26,58 @@ export interface OpenRouterBatchConfig {
   baseURL?: string; // default "https://openrouter.ai/api/v1"
   fetch?: typeof globalThis.fetch; // default globalThis.fetch
   headers?: Record<string, string>;
+  routing?: OpenRouterRoutingOptions;
   endpoint?:
     | "/v1/chat/completions"
     | "/v1/responses"
     | "/v1/messages"
     | "/v1/embeddings"; // default "/v1/chat/completions"
+}
+
+export function openRouterBatchProvider(
+  policy: OpenRouterRoutingOptions["provider"],
+  endpoint: OpenRouterBatchConfig["endpoint"],
+): { only?: string[]; allow_fallbacks?: boolean } | undefined {
+  if (policy === undefined) return undefined;
+  let only = policy.only && eligibleProviderSlugs(policy.only);
+  const { order, allowFallbacks, dataCollection } = policy;
+  if (only?.length === 0) {
+    throw new Error("OpenRouter batch provider policy has an empty allowlist.");
+  }
+  if (dataCollection === "deny") {
+    throw new Error(
+      'OpenRouter batch cannot enforce provider policy dataCollection: "deny".',
+    );
+  }
+  if (order?.length) {
+    const ordered = eligibleProviderSlugs(order, only);
+    if (allowFallbacks === false && ordered.length === 1) {
+      // A single eligible provider can be pinned through the batch allowlist.
+      only = ordered;
+    } else if (
+      allowFallbacks === false ||
+      (ordered.length > 0 &&
+        (only?.length !== 1 ||
+          ordered.length !== 1 ||
+          !sameProviderSlug(ordered[0]!, only[0]!)))
+    ) {
+      throw new Error(
+        "OpenRouter batch cannot enforce the provider policy order.",
+      );
+    }
+  }
+  if (only === undefined && allowFallbacks === undefined) return undefined;
+  if (endpoint === "/v1/embeddings") {
+    throw new Error(
+      "OpenRouter batch embeddings do not support provider policy fields.",
+    );
+  }
+  return {
+    ...(only !== undefined ? { only } : {}),
+    ...(allowFallbacks !== undefined
+      ? { allow_fallbacks: allowFallbacks }
+      : {}),
+  };
 }
 
 const OpenRouterBatchResultItemSchema = z.object({
@@ -246,10 +297,7 @@ export function createOpenRouterBatchModel(
   // GET /api/v1/batches/{id} (https://openrouter.ai/docs/projects/docs/batch-quickstart).
   // The earlier default, /api/beta, is no longer in the documentation; pass
   // `baseURL` to keep using it.
-  const baseURL = (cfg.baseURL ?? "https://openrouter.ai/api/v1").replace(
-    /\/+$/,
-    "",
-  );
+  const baseURL = (cfg.baseURL ?? batchBaseURLs.openrouter).replace(/\/+$/, "");
   const fetchFn = cfg.fetch ?? globalThis.fetch;
   const endpoint = cfg.endpoint ?? "/v1/chat/completions";
 
@@ -277,6 +325,7 @@ export function createOpenRouterBatchModel(
       requests: EngineBatchRequest[],
       opts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
+      const provider = openRouterBatchProvider(cfg.routing?.provider, endpoint);
       const items = requests.map((req) => {
         const body: Record<string, unknown> = {
           messages: req.system
@@ -317,16 +366,13 @@ export function createOpenRouterBatchModel(
         };
       });
 
-      // LOAD-BEARING: OpenRouter stream-parses the body and returns 400 if `requests`
-      // appears before `endpoint` and `model`. Must build string directly.
-      const payload =
-        '{"endpoint":' +
-        JSON.stringify(endpoint) +
-        ',"model":' +
-        JSON.stringify(modelId) +
-        ',"requests":' +
-        JSON.stringify(items) +
-        "}";
+      // OpenRouter stream-parses the body. Routing fields must precede requests.
+      const payload = JSON.stringify({
+        endpoint,
+        model: modelId,
+        ...(provider !== undefined ? { provider } : {}),
+        requests: items,
+      });
 
       // NEVER auto-retry the POST. There is no idempotency key; a retry after a network timeout
       // would create and bill a second batch. Retry only GETs, and honor Retry-After when present.

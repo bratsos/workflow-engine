@@ -54,6 +54,35 @@ import { createAIHelper } from "@bratsos/workflow-engine";
 const ai = createAIHelper("cli.reindex", createPrismaAICallLogger(prisma));
 ```
 
+### Provider policy
+
+Set `routing.provider` on the helper to apply a policy to its calls and those of its children.
+
+```typescript
+const ai = createAIHelper(topic, logger, undefined, undefined, {
+  routing: {
+    provider: {
+      only: ["openai", "azure"],
+      order: ["azure", "openai"],
+      allowFallbacks: false,
+      dataCollection: "deny",
+    },
+  },
+});
+```
+
+Built-in OpenRouter text, object, streaming, embedding and evaluation calls combine the helper policy with per-call OpenRouter provider settings. Allow-lists intersect, the stricter privacy and fallback settings win, and extra restrictions such as `zdr` are preserved. The helper compares rankings after applying allowlists and exclusions. If either side disables fallbacks without an order, a compatible singleton preference becomes an allowlist with fallbacks disabled. A ranking that would require backups fails before submission.
+
+Direct built-in calls, including transcription and native batches, require their vendor to appear in `only` when set. They also reject a provider outside `order` when fallbacks are disabled and reject `dataCollection: "deny"` because the direct transports cannot enforce that setting.
+
+An OpenRouter variant slug such as `baseten/fp4` can include regional endpoints such as `baseten/fp4/us`. The helper preserves an eligible regional preference when it combines two rankings. [OpenRouter endpoint matching](https://openrouter.ai/docs/guides/routing/provider-selection#base-slug-matching)
+
+OpenRouter text batches, including fallback from a native transport, send supported constraints in the top-level `provider` object. A single eligible preference with fallbacks disabled can be sent as an allowlist, including a regional endpoint. The helper refuses rankings that need multiple eligible providers or backups, data-collection denial, and provider restrictions on the embeddings batch endpoint. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
+
+Each submission checks its provider policy against the transport that builds the batch. Polling, collecting, and cancelling a saved batch use its stored refs, and the batch client keeps that transport for its later calls, including new submissions. A call fixes its transport when it starts, so a concurrent poll does not change where an in-flight submission sends.
+
+`providerResolver(modelConfig, policy)` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument. The application is responsible for enforcing it in those models. Calls handled by an `AIAdapter` refuse a configured provider policy.
+
 ---
 
 ## Hierarchical Cost Tracking
@@ -247,5 +276,7 @@ const reasoning = await stream.getReasoning();
 
 Every AI result exposes `reportedCostUsd` (the provider's own figure, when it reports one) and `costSource` (`"reported"` or `"estimated"`). `cost` prefers the reported figure and falls back to the model registry's prices, including long-context pricing tiers. BYOK is handled correctly: the upstream inference cost is added only when the provider bills it separately. Batch cost follows the transport actually used — a native vendor batch bills the vendor's documented discount, the OpenRouter transport bills the `:batch` catalog row's absolute price.
 
-The `ai_calls` row behind each result keeps both figures rather than the winner alone: `cost` (the authoritative number `getStats` sums and `WorkflowRun.totalCost` rolls up), `estimatedCost` (the registry figure, always computed), `reportedCost` (the provider's figure, when any), `costSource` (which of the two `cost` is), `servedBy` (the endpoint that served the request — OpenRouter's `provider` metadata), plus `cachedInputTokens` and `reasoningTokens` (breakdowns of `inputTokens` and `outputTokens`, not additions to them). The estimate prices cached input tokens at the model's `cachedInputCostPerMillion` when the registry has one (`workflow-engine-sync` emits it from OpenRouter's `input_cache_read` price) and at the full input rate otherwise; reasoning tokens are billed as output. `aiLogger.listCalls(topicPrefix)` reads the rows back. OpenRouter's `max_price` guard is the same registry price times `routing.priceHeadroom` (default 1.25). Comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic, not proof of an overcharge: cache-read rates are not guarded and `priceHeadroom: 0` disables the guard, so unexpected differences should prompt checking the endpoint's rates, caching, routing, and fees.
+The `ai_calls` row behind each result keeps both figures rather than the winner alone: `cost` (the authoritative number `getStats` sums and `WorkflowRun.totalCost` rolls up), `estimatedCost` (the registry figure, always computed), `reportedCost` (the provider's figure, when any), `costSource` (which of the two `cost` is), `servedBy` (the serving provider or comma-separated distinct providers), plus `cachedInputTokens` and `reasoningTokens` (breakdowns of `inputTokens` and `outputTokens`, not additions to them). The estimate prices cached input tokens at the model's `cachedInputCostPerMillion` when the registry has one (`workflow-engine-sync` emits it from OpenRouter's `input_cache_read` price) and at the full input rate otherwise; reasoning tokens are billed as output. `aiLogger.listCalls(topicPrefix)` reads the rows back. OpenRouter's `max_price` guard is the same registry price times `routing.priceHeadroom` (default 1.25). Comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic, not proof of an overcharge: cache-read rates are not guarded and `priceHeadroom: 0` disables the guard, so unexpected differences should prompt checking the endpoint's rates, caching, routing, and fees.
+
+Multi-step call rows store the provider for each step in order under `metadata.servedBySteps`. Unknown providers are represented as `null`. The row keeps the billable usage and cost reported by the SDK or adapter if reading structured output fails or a stream callback throws.
 

@@ -1,13 +1,18 @@
-import { batchProviderFromRefProvider } from "../batch-helper";
+import type { BatchOptions } from "../types";
 import { type AiSdkBatchModelOptions, resolveAiSdkBatchModel } from "./ai-sdk";
-import type { EngineBatchModel, EngineBatchRef } from "./model";
+import {
+  batchProviderFromRefProvider,
+  type EngineBatchModel,
+  type EngineBatchRef,
+} from "./model";
 import { createOpenRouterBatchModel } from "./openrouter";
 
 /**
  * The built-in transport for a stored batch ref, for a process that did not
  * create the batch (`run.cancel` is the caller). The ref names the provider
- * and the native model id; the credentials come from `options` or, as for any
- * AI SDK provider, the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+ * and the native model id. The caller selects the transport options for the ref.
+ * Without explicit options, the resolver uses the provider's default URL and
+ * environment credentials (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
  * `GOOGLE_GENERATIVE_AI_API_KEY` / `GEMINI_API_KEY`, `OPENROUTER_API_KEY`).
  *
  * Throws when no built-in transport serves the ref's provider, when the vendor
@@ -16,9 +21,7 @@ import { createOpenRouterBatchModel } from "./openrouter";
  */
 export async function resolveBatchModelForRef(
   ref: EngineBatchRef,
-  options: AiSdkBatchModelOptions & {
-    endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages";
-  } = {},
+  options: AiSdkBatchModelOptions & Pick<BatchOptions, "endpoint"> = {},
 ): Promise<EngineBatchModel> {
   const provider = batchProviderFromRefProvider(ref.provider);
   if (provider === undefined) {

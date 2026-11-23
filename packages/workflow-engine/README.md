@@ -109,7 +109,7 @@ For SQLite, install `@prisma/orm-sqlite@8.0.0-rc.21` instead of the Postgres dri
 
 Then follow "Prisma 8" under [Database Setup](#1-database-setup) below for the Postgres contract and setup.
 
-> `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`. OpenRouter models and OpenRouter `:batch` processing need no extra vendor SDK; when `@ai-sdk/anthropic` / `@ai-sdk/openai` is not installed and OpenRouter can batch the model, the batch falls back to OpenRouter with a WARN.
+> `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`. OpenRouter models and OpenRouter `:batch` processing need no extra vendor SDK; when `@ai-sdk/anthropic` / `@ai-sdk/openai` is absent and OpenRouter can batch the model, automatic fallback forwards the client options. A provider policy permits fallback with an unset `baseURL` or the canonical OpenRouter base URL.
 
 ---
 

@@ -604,9 +604,8 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
         apiKey: "test-key",
         maxRequestsPerBatch: 2,
       },
+      mockBatchModel,
     );
-
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
 
     // 3 requests with schemaA, 1 with schemaB, 1 without schema
     const handle = await batch.submit([
@@ -654,8 +653,8 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
         maxRequestsPerBatch: 1,
         maxPartitions: 2,
       },
+      mockBatchModel,
     );
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
 
     await expect(
       batch.submit([
@@ -687,8 +686,14 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
 
     const { logger } = makeFakeAICallLogger();
     const ctx = { topic: "test", aiCallLogger: logger as any };
-    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      undefined,
+      mockBatchModel,
+    );
 
     const results = await batch.getResults("batch-test");
     expect(results.length).toBe(1);
@@ -719,8 +724,14 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
 
     const { logger } = makeFakeAICallLogger();
     const ctx = { topic: "test", aiCallLogger: logger as any };
-    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      undefined,
+      mockBatchModel,
+    );
 
     (batch as any).refsByBatch.set("b1", [
       { version: 1, type: "text", id: "b1", provider: "mock", modelId: "m" },
@@ -818,8 +829,14 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     };
     const { logger, loggedBatchResults } = makeFakeAICallLogger();
     const ctx = { topic: "test", aiCallLogger: logger as any };
-    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      undefined,
+      mockBatchModel,
+    );
 
     const schema = z.object({ a: z.string() });
     const results = await batch.getResults("b-validation", {
@@ -873,6 +890,8 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     const mockBatchModel = {
       provider: "openrouter",
       modelId: "openai/gpt-4o",
+      start: vi.fn(),
+      status: vi.fn(),
       results: vi.fn(async function* () {
         yield {
           id: "r-accounting",
@@ -889,8 +908,14 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     };
     const { logger, loggedBatchResults } = makeFakeAICallLogger();
     const ctx = { topic: "test-topic", aiCallLogger: logger as any };
-    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
-    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      undefined,
+      mockBatchModel,
+    );
 
     const results = await batch.getResults("b-accounting");
     expect(results[0]).toMatchObject({
