@@ -3,6 +3,7 @@ import {
   createAIHelper,
   failSafeCallLogger,
 } from "../../ai/ai-helper.js";
+import { forwardingProxy } from "../../ai/provider-diagnostics.js";
 import type {
   AIHelper,
   LogContext,
@@ -54,10 +55,11 @@ export function defineLazyAIContext<T extends object>(
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
-  // The stage's calls name its run, so erasing the run finds them.
+  // The stage's calls name its run, so erasing the run finds them. Every
+  // other member is the configured logger's own, bound to it.
   let scopedLogger: AICallLogger | undefined;
   const loggerForRun = (logger: AICallLogger): AICallLogger => {
-    return (scopedLogger ??= {
+    const stamped: Partial<AICallLogger> = {
       logCall: (call) =>
         logger.logCall({ ...call, workflowRunId: params.workflowRunId }),
       logBatchResults: (batchId, calls) =>
@@ -68,10 +70,10 @@ export function defineLazyAIContext<T extends object>(
             workflowRunId: params.workflowRunId,
           })),
         ),
-      getStats: logger.getStats.bind(logger),
-      isRecorded: logger.isRecorded.bind(logger),
-      ...(logger.listCalls && { listCalls: logger.listCalls.bind(logger) }),
-    });
+    };
+    return (scopedLogger ??= forwardingProxy(logger, (key, value) =>
+      Object.hasOwn(stamped, key) ? stamped[key as keyof AICallLogger] : value,
+    ));
   };
 
   const configured = () => {

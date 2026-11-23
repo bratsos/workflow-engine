@@ -525,6 +525,48 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     }
   });
 
+  it.each([
+    "calls",
+    "checks for",
+  ] as const)("keeps a custom logger read on ctx.aiLogger when a stage %s it", async (use) => {
+    type Budget = { budgetRemaining?(topic: string): Promise<number> };
+    const decisions: string[] = [];
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const logger = ctx.aiLogger as typeof ctx.aiLogger & Budget;
+        const remaining =
+          use === "calls" || typeof logger.budgetRemaining === "function"
+            ? await logger.budgetRemaining!(ctx.ai.topic)
+            : 0;
+        decisions.push(remaining > 0 ? "approve" : "hold");
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: override(db.aiLogger as typeof db.aiLogger & Budget, {
+          async budgetRemaining(topic: string) {
+            return 10 - (await db.aiLogger.getStats(topic)).totalCost;
+          },
+        }),
+        ai: createAIHelper,
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(decisions).toEqual(["approve"]);
+    expect(
+      await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+    ).toMatchObject({ status: "COMPLETED" });
+  });
+
   it("erases every row a run's stage helpers wrote when the run is purged", async () => {
     const model = everyPathModel();
     const stage = defineStage({
