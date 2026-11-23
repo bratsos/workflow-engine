@@ -14,6 +14,7 @@ import {
 } from "../../kernel/helpers/host-support.js";
 import { FakeClock } from "../../kernel/testing/index.js";
 import { createTestHarness } from "../../testing/index.js";
+import { yieldToHost } from "../utils/yield-to-host.js";
 import {
   describeRun,
   drive,
@@ -409,12 +410,6 @@ async function runTwoWorkerSchedule(
     describe: async () => describeRun(h, runId),
   };
 }
-
-/**
- * A sweep runs on promises alone, which never let Vitest's worker answer its
- * RPC: yield one macrotask per run so a long sweep keeps its heartbeat.
- */
-const yieldToHost = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 async function assertInterleavings(
   build: () => SweepScenario,

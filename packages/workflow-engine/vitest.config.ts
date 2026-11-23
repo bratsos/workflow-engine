@@ -13,6 +13,7 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   test: {
+    setupFiles: ["./src/__tests__/utils/yield-between-tests.setup.ts"],
     // Vitest on Bun drops zod's named `z` export (it reads `export default z`
     // as CJS interop); inlining zod avoids that. Nothing changes under Node.
     server: { deps: { inline: process.versions.bun ? ["zod"] : [] } },
