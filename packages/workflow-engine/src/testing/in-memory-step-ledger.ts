@@ -145,6 +145,15 @@ export class InMemoryStepLedger implements StepLedger {
       .map(cloneRecord);
   }
 
+  async listPendingWaits(stageRecordId: string): Promise<StepRecord[]> {
+    return (await this.list(stageRecordId)).filter(
+      (record) =>
+        (record.kind === "wait" || record.kind === "signal") &&
+        record.status === "pending" &&
+        record.deadlineAt !== null,
+    );
+  }
+
   async clear(stageRecordId: string): Promise<void> {
     await this.deleteForPurge(stageRecordId);
   }

@@ -71,7 +71,7 @@ import {
   withClaimedRun,
 } from "../helpers/index.js";
 import { fenceRunWrites } from "../helpers/run-writes.js";
-import { waitTimeoutPatch } from "../helpers/step-api.js";
+import { pendingWaits, waitTimeoutPatch } from "../helpers/step-api.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type {
   ActivityRunInput,
@@ -377,13 +377,18 @@ async function claimSuspendedStage(
   if (deadline !== undefined && deadline > now && deadline < leaseUntil) {
     leaseUntil = deadline;
   }
-  // `maxWaitUntil` may name the deadline this pass settles; a later one must
-  // still bound the lease in case this poller dies mid-replay.
-  const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
-    () => undefined,
-  );
-  if (waitDeadline !== undefined && waitDeadline < leaseUntil) {
-    leaseUntil = waitDeadline;
+  if (isDurableStage(stageRecord)) {
+    // If this poller dies mid-replay, a wait the replay opened is not in the
+    // stored schedule: the lease bounds how long it goes unseen.
+    leaseUntil = Math.min(leaseUntil, now + MIN_CLAIM_LEASE_MS);
+    // `maxWaitUntil` may name the deadline this pass settles; a later one
+    // must still bound the lease.
+    const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+      () => undefined,
+    );
+    if (waitDeadline !== undefined && waitDeadline < leaseUntil) {
+      leaseUntil = waitDeadline;
+    }
   }
   const nextPollAt = new Date(leaseUntil);
   try {
@@ -455,25 +460,28 @@ async function releaseStageClaim(
   }
 }
 
+function isDurableStage(stageRecord: WorkflowStageRecord): boolean {
+  const metadata = (
+    stageRecord.suspendedState as { metadata?: Record<string, unknown> } | null
+  )?.metadata;
+  return metadata?.[DURABLE_SUSPEND_MARKER] === true;
+}
+
 /**
- * The earliest deadline among a durable stage's pending waits that is still
- * ahead, read from the ledger. No claim lease or retry backoff may pass it.
+ * The earliest deadline still ahead among a durable stage's pending waits
+ * with an explicit `onTimeout`. No claim lease or retry backoff may pass it.
  */
 async function nextWaitDeadline(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
 ): Promise<number | undefined> {
-  const metadata = (
-    stageRecord.suspendedState as { metadata?: Record<string, unknown> } | null
-  )?.metadata;
-  if (!deps.stepLedger || metadata?.[DURABLE_SUSPEND_MARKER] !== true) return;
+  if (!deps.stepLedger || !isDurableStage(stageRecord)) return;
   const now = deps.clock.now().getTime();
   let earliest: number | undefined;
-  for (const record of await deps.stepLedger.list(stageRecord.id)) {
-    const deadline = record.deadlineAt?.getTime();
+  for (const record of await pendingWaits(deps.stepLedger, stageRecord.id)) {
+    const deadline = record.deadlineAt!.getTime();
     if (
-      record.status === "pending" &&
-      deadline !== undefined &&
+      record.waitState?.onTimeout !== undefined &&
       deadline > now &&
       (earliest === undefined || deadline < earliest)
     ) {
@@ -489,16 +497,15 @@ async function settleExpiredDurableWait(
 ): Promise<void> {
   if (!deps.stepLedger) return;
   const now = deps.clock.now().getTime();
-  // Concurrent waits can expire together. Settle every deadline before a
-  // different wait in the replay can suspend the stage again.
-  for (const record of await deps.stepLedger.list(stageRecordId)) {
-    if (
-      (record.kind !== "wait" && record.kind !== "signal") ||
-      record.status !== "pending" ||
-      record.deadlineAt === null ||
-      record.deadlineAt.getTime() > now
-    ) {
-      continue;
+  let failedDefault = false;
+  // Waits with an explicit `onTimeout` can expire together: settle each
+  // before another wait in the replay suspends the stage again. Of the
+  // others, only the first expired wait is failed, as before.
+  for (const record of await pendingWaits(deps.stepLedger, stageRecordId)) {
+    if (record.deadlineAt!.getTime() > now) continue;
+    if (record.waitState?.onTimeout === undefined) {
+      if (failedDefault) continue;
+      failedDefault = true;
     }
     const error = new StepTimeoutError(record.stepId);
     const patch = waitTimeoutPatch(record, error);

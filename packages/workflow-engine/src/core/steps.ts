@@ -325,14 +325,16 @@ export interface StepPollSchedule {
 }
 
 /**
- * The next poll of each pending durable wait, by step id. Stored in the
- * suspended state under `DURABLE_WAIT_POLLS` so a replay that does not reach
- * a wait keeps that wait's poll.
+ * The next poll of each pending wait with an explicit `onTimeout`. Stored in
+ * the suspended state under `DURABLE_WAIT_POLLS` so a replay that does not
+ * reach a wait keeps that wait's poll. A list, so a step id is never used as
+ * an object key.
  */
-export type StepWaitPolls = Record<
-  string,
-  { nextPollAt: string; pollInterval: number }
->;
+export type StepWaitPolls = Array<{
+  stepId: string;
+  nextPollAt: string;
+  pollInterval: number;
+}>;
 
 export interface StepSuspendSchedule extends StepPollSchedule {
   polls: StepWaitPolls;

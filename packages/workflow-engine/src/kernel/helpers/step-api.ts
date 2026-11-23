@@ -160,6 +160,24 @@ export function waitTimeoutPatch(
   return { status: "failed", error: error.message, leaseExpiresAt: null };
 }
 
+/**
+ * A stage's pending wait and signal rows that carry a deadline, read without
+ * the results of its completed steps.
+ */
+export async function pendingWaits(
+  ledger: StepLedger,
+  stageRecordId: string,
+): Promise<StepRecord[]> {
+  const rows = await (ledger.listPendingWaits?.(stageRecordId) ??
+    ledger.list(stageRecordId));
+  return rows.filter(
+    (row) =>
+      (row.kind === "wait" || row.kind === "signal") &&
+      row.status === "pending" &&
+      row.deadlineAt !== null,
+  );
+}
+
 function waitResult<T>(
   record: StepRecord,
   onTimeout: StepTimeoutMode | undefined,
@@ -357,7 +375,6 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
   }
 
   function begin(id: string, kind: StepRecord["kind"]): StepInvocation {
-    if (suspendedBy) throw suspendedBy;
     if (!id) throw new Error("Durable step id must not be empty");
     const seq = ++nextSeq;
     const first = requestedIds.get(id);
@@ -679,65 +696,63 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       }
     }
     if (!suspension) return;
-    // Track only checkpointing. An external poll can still be in progress
+    // Track only checkpointing. An opted-in poll can still be in progress
     // when another wait suspends the stage, so use its provisional schedule.
     while (waitCheckpoints.size > 0) await Promise.all(waitCheckpoints);
-    // An outstanding poll can finish after this snapshot. Its result can be
-    // recorded, but a continuation must start new steps on replay.
+    // From here a continuation cannot open an opted-in wait: its deadline
+    // would miss this schedule. Steps that already exist still run.
     suspendedBy = suspension;
-    const schedules = [...waitSchedules.values()];
-    const polls: StepWaitPolls = {};
-    // A branch can stop short of a wait it reached before. Schedule from
-    // every pending wait row, keeping the poll the last suspension stored
-    // for a wait this invocation did not evaluate.
-    if (options.stepLedger && options.stageRecordId) {
-      const now = suspension.at.getTime();
-      const rows = await options.stepLedger.list(options.stageRecordId);
-      for (const row of rows) {
-        if (row.status !== "pending" || !row.deadlineAt) continue;
-        const fresh = waitSchedules.get(row.stepId);
-        const carried = options.waitPolls?.[row.stepId];
-        const carriedAt = Date.parse(carried?.nextPollAt ?? "");
-        const wakeAt = Date.parse(row.waitState?.wakeAt ?? "");
-        let nextPoll: number;
-        let pollInterval: number | undefined;
-        if (fresh) {
-          nextPoll = fresh.nextPollAt.getTime();
-          pollInterval = fresh.pollInterval;
-        } else if (Number.isFinite(wakeAt)) {
-          // A sleep's wake time is on its row.
-          nextPoll = wakeAt > now ? wakeAt : row.deadlineAt.getTime();
-        } else if (
-          Number.isFinite(carriedAt) &&
-          Number.isFinite(carried?.pollInterval)
-        ) {
-          pollInterval = carried!.pollInterval;
-          // Overdue and still not reached: the next poll follows its interval.
-          nextPoll = carriedAt > now ? carriedAt : now + pollInterval;
-        } else {
-          nextPoll = row.deadlineAt.getTime();
-        }
-        nextPoll = Math.min(nextPoll, row.deadlineAt.getTime());
-        pollInterval ??= Math.max(0, nextPoll - now);
-        polls[row.stepId] = {
-          nextPollAt: new Date(nextPoll).toISOString(),
-          pollInterval,
-        };
-        schedules.push({
-          nextPollAt: new Date(nextPoll),
-          maxWaitUntil: row.deadlineAt,
-          pollInterval,
-        });
-      }
-    }
+    if (!options.stepLedger || !options.stageRecordId) return;
+    // A wait with an explicit `onTimeout` wakes the stage at its poll or
+    // deadline, also when this invocation did not reach it. Other waits keep
+    // the schedule of the wait that suspended the stage.
+    const now = suspension.at.getTime();
+    const polls: StepWaitPolls = [];
+    const carriedPolls = new Map(
+      (Array.isArray(options.waitPolls) ? options.waitPolls : []).map(
+        (poll) => [poll.stepId, poll],
+      ),
+    );
     let earliest: StepPollSchedule | undefined;
     let maxWaitUntil: Date | undefined;
-    for (const schedule of schedules) {
-      if (!earliest || schedule.nextPollAt < earliest.nextPollAt) {
-        earliest = schedule;
+    for (const row of await pendingWaits(
+      options.stepLedger,
+      options.stageRecordId,
+    )) {
+      if (row.waitState?.onTimeout === undefined) continue;
+      const deadline = row.deadlineAt!.getTime();
+      const fresh = waitSchedules.get(row.stepId);
+      const carried = carriedPolls.get(row.stepId);
+      const carriedAt = Date.parse(carried?.nextPollAt ?? "");
+      let nextPoll = deadline;
+      let pollInterval: number | undefined;
+      if (fresh) {
+        nextPoll = fresh.nextPollAt.getTime();
+        pollInterval = fresh.pollInterval;
+      } else if (
+        Number.isFinite(carriedAt) &&
+        Number.isFinite(carried?.pollInterval)
+      ) {
+        pollInterval = carried!.pollInterval;
+        // Overdue and not reached yet: the next poll follows its interval.
+        nextPoll = carriedAt > now ? carriedAt : now + pollInterval;
       }
-      if (!maxWaitUntil || schedule.maxWaitUntil < maxWaitUntil) {
-        maxWaitUntil = schedule.maxWaitUntil;
+      nextPoll = Math.min(nextPoll, deadline);
+      pollInterval ??= Math.max(0, nextPoll - now);
+      polls.push({
+        stepId: row.stepId,
+        nextPollAt: new Date(nextPoll).toISOString(),
+        pollInterval,
+      });
+      if (!earliest || nextPoll < earliest.nextPollAt.getTime()) {
+        earliest = {
+          nextPollAt: new Date(nextPoll),
+          maxWaitUntil: row.deadlineAt!,
+          pollInterval,
+        };
+      }
+      if (!maxWaitUntil || deadline < maxWaitUntil.getTime()) {
+        maxWaitUntil = row.deadlineAt!;
       }
     }
     if (earliest && maxWaitUntil) {
@@ -999,6 +1014,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       if (existing?.status === "completed" || existing?.status === "failed") {
         return waitResult<T>(existing, opts.onTimeout);
       }
+      if (!existing && suspendedBy && opts.onTimeout !== undefined) {
+        throw suspendedBy;
+      }
 
       const everyMs = parseStepDuration(opts.every);
       const timeoutMs = parseStepDuration(opts.timeout);
@@ -1093,14 +1111,13 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         );
       }
 
+      const ready = opts.ready(value);
+      // Read after the verdict, which can itself take time.
       const afterPoll = options.clock.now();
       const expired = afterPoll.getTime() >= record.deadlineAt.getTime();
-      // Under "return" the deadline decides: a ready answer seen at or after
-      // it is too late, like a signal delivered at that instant.
-      if (
-        opts.ready(value) &&
-        !(expired && record.waitState?.onTimeout === "return")
-      ) {
+      // With an explicit `onTimeout` the deadline decides: a ready answer
+      // seen at or after it is too late, like a signal at that instant.
+      if (ready && !(expired && record.waitState?.onTimeout !== undefined)) {
         const result = jsonRoundTrip(value, id);
         // A wait row is open while `pending`: an out-of-band completion
         // (a signal delivered, another poller ahead of this one) wins.
@@ -1142,6 +1159,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const existing = await get(invocation, "signal");
       if (existing?.status === "completed" || existing?.status === "failed") {
         return waitResult<T>(existing, opts.onTimeout);
+      }
+      if (!existing && suspendedBy && opts.onTimeout !== undefined) {
+        throw suspendedBy;
       }
 
       const timeoutMs = parseStepDuration(opts.timeout);

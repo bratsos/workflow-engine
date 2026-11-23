@@ -128,19 +128,18 @@ async function deliverSignal(
     };
   };
 
+  const timedOut = (): HandlerResult<StepSignalResult> => ({
+    ok: true,
+    signalled: false,
+    alreadyCompleted: true,
+    timedOut: true,
+    _events: [],
+  });
   const finish = async (
     record: StepRecord,
     alreadyCompleted: boolean,
   ): Promise<HandlerResult<StepSignalResult>> => {
-    if (record.waitState?.timedOut) {
-      return {
-        ok: true,
-        signalled: false,
-        alreadyCompleted: true,
-        timedOut: true,
-        _events: [],
-      };
-    }
+    if (record.waitState?.timedOut) return timedOut();
     return wake(record, alreadyCompleted);
   };
 
@@ -160,13 +159,15 @@ async function deliverSignal(
     }
     if (record.status === "completed") return finish(record, true);
 
-    // From its deadline on, an opted-in wait can only settle as timed out,
-    // the same verdict the poller and the stage replay reach.
+    // From its deadline on, a wait with an explicit `onTimeout` can only
+    // settle as timed out, the verdict the poller and the stage replay reach.
+    // A "throw" wait is left for them to fail where they always have.
     const expired =
       record.status === "pending" &&
-      record.waitState?.onTimeout === "return" &&
+      record.waitState?.onTimeout !== undefined &&
       record.deadlineAt !== null &&
       record.deadlineAt <= deps.clock.now();
+    if (expired && record.waitState?.onTimeout !== "return") return timedOut();
     const completed = await deps.stepLedger.compareAndSet(
       stage.id,
       command.stepId,

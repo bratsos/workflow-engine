@@ -430,6 +430,13 @@ export function withStepResultSpill(
       return Promise.all(records.map(resolve));
     },
 
+    // Pending waits hold no result, so nothing is read from the blob store.
+    listPendingWaits(stageRecordId) {
+      return (
+        ledger.listPendingWaits?.(stageRecordId) ?? ledger.list(stageRecordId)
+      );
+    },
+
     async clear(stageRecordId) {
       await ledger.clear(stageRecordId);
       await spill.deleteUnder(stepSpillPrefix(stageRecordId));

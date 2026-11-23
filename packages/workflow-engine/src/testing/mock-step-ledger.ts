@@ -328,6 +328,13 @@ export function createMockStepLedger(
       return inner.list(stageRecordId);
     },
 
+    async listPendingWaits(stageRecordId: string) {
+      track(stageRecordId);
+      return (
+        inner.listPendingWaits?.(stageRecordId) ?? inner.list(stageRecordId)
+      );
+    },
+
     async clear(stageRecordId: string) {
       track(stageRecordId);
       return inner.clear(stageRecordId);

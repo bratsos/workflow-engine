@@ -672,7 +672,13 @@ function durableControlFlowResult(
         ...(schedule ? { [DURABLE_WAIT_POLLS]: schedule.polls } : {}),
       },
     },
-    pollConfig: { pollInterval, maxWaitTime, nextPollAt, maxWaitUntil },
+    // Without an opted-in wait the stage keeps the suspending wait's bounds.
+    pollConfig: {
+      pollInterval,
+      maxWaitTime,
+      nextPollAt,
+      ...(schedule ? { maxWaitUntil } : {}),
+    },
     metrics: {
       startTime: 0,
       endTime: 0,

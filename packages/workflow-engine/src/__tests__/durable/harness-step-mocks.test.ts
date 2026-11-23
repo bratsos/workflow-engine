@@ -330,6 +330,7 @@ describe("createMockStepLedger forwarding", () => {
     update: true,
     compareAndSet: true,
     list: true,
+    listPendingWaits: true,
     clear: true,
     clearExcept: true,
     deleteForPurge: true,
@@ -374,6 +375,10 @@ describe("createMockStepLedger forwarding", () => {
         calls.push("list");
         return [sampleRecord];
       },
+      async listPendingWaits(_stageRecordId) {
+        calls.push("listPendingWaits");
+        return [];
+      },
       async clear(_stageRecordId) {
         calls.push("clear");
       },
@@ -402,6 +407,7 @@ describe("createMockStepLedger forwarding", () => {
     await wrapper.update("stage-1", "step-1", {});
     await wrapper.compareAndSet("stage-1", "step-1", { status: "running" }, {});
     await wrapper.list("stage-1");
+    await wrapper.listPendingWaits?.("stage-1");
     await wrapper.clear("stage-1");
     await wrapper.clearExcept?.("stage-1", ["step-1"]);
 

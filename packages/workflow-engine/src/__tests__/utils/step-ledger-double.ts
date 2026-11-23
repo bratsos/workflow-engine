@@ -29,6 +29,7 @@ export const STEP_LEDGER_METHODS = [
   "update",
   "compareAndSet",
   "list",
+  "listPendingWaits",
   "clear",
   "clearExcept",
   "deleteForPurge",

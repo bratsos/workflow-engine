@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../core/stage-factory.js";
-import type { StepApi } from "../core/steps.js";
+import { type StepApi, StepTimeoutError } from "../core/steps.js";
 import { WorkflowBuilder } from "../core/workflow.js";
 import {
   executeJobWithHeartbeat,
@@ -33,6 +33,13 @@ function barrier() {
       await release.promise;
     },
   };
+}
+
+/** A wait's answer as stage output, in either result shape. */
+function outcome(answer: unknown): string {
+  if (typeof answer !== "object" || answer === null) return String(answer);
+  const result = answer as { timedOut: boolean; value?: unknown };
+  return result.timedOut ? "timeout" : String(result.value);
 }
 
 describe.skipIf(!realDatabase)(
@@ -175,10 +182,12 @@ describe.skipIf(!realDatabase)(
       keepalive,
     }) => {
       let advanced = false;
-      const longSuspended = Promise.withResolvers<void>();
+      let longSuspended = Promise.withResolvers<void>();
       const stepLedger = override(db.stepLedger, {
         async get(stageId, stepId) {
-          // Let the long wait reject first while preserving both claims.
+          // Let the long wait reject first while preserving both claims, on
+          // every replay: a default wait schedules the stage only when it
+          // suspends first.
           if (stepId === "approval") await longSuspended.promise;
           return db.stepLedger.get(stageId, stepId);
         },
@@ -191,6 +200,7 @@ describe.skipIf(!realDatabase)(
               onTimeout: "return",
             });
           }
+          longSuspended = Promise.withResolvers<void>();
           const [, approval] = await Promise.all([
             step
               .waitForSignal("long", { timeout: "2h", keepalive })
@@ -359,11 +369,14 @@ describe.skipIf(!realDatabase)(
     });
 
     it.each([
-      { keepalive: undefined, due: 100 },
-      { keepalive: 50, due: 50 },
-    ] as const)("keeps a persisted wait's schedule when an early replay does not reach it (keepalive $keepalive)", async ({
+      { keepalive: undefined, due: 100, shortId: "short" },
+      { keepalive: 50, due: 50, shortId: "short" },
+      // A valid step id that a plain object would take as its prototype.
+      { keepalive: 50, due: 50, shortId: "__proto__" },
+    ] as const)("keeps a persisted wait's schedule when an early replay does not reach it (keepalive $keepalive, step $shortId)", async ({
       keepalive,
       due,
+      shortId,
     }) => {
       const shortClaimed = Promise.withResolvers<void>();
       const continuation = Promise.withResolvers<void>();
@@ -371,7 +384,7 @@ describe.skipIf(!realDatabase)(
       const stepLedger = override(db.stepLedger, {
         async claim(record) {
           const claimed = await db.stepLedger.claim(record);
-          if (record.stepId === "short") shortClaimed.resolve();
+          if (record.stepId === shortId) shortClaimed.resolve();
           return claimed;
         },
         async get(stageId, stepId) {
@@ -388,7 +401,7 @@ describe.skipIf(!realDatabase)(
               await step.waitForSignal("pre", { timeout: "2h" });
               // Unstepped work between two waits (a fetch, a digest).
               if (delayContinuation) await continuation.promise;
-              return step.waitForSignal<string>("short", {
+              return step.waitForSignal<string>(shortId, {
                 timeout: 100,
                 onTimeout: "return",
                 ...(keepalive ? { keepalive } : {}),
@@ -417,7 +430,7 @@ describe.skipIf(!realDatabase)(
         clock.set(new Date(started + 20));
         await t.signal(worker, true, "nudge");
         await t.tick(worker, "second");
-        expect(await t.record("short")).toMatchObject({
+        expect(await t.record(shortId)).toMatchObject({
           status: "pending",
           deadlineAt: deadline,
         });
@@ -437,12 +450,12 @@ describe.skipIf(!realDatabase)(
 
         clock.set(deadline);
         await t.tick(worker, "second");
-        expect(await t.record("short")).toMatchObject({
+        expect(await t.record(shortId)).toMatchObject({
           status: "completed",
           waitState: { timedOut: true },
         });
         await expect(
-          t.signal(t.worker(), "accepted", "short"),
+          t.signal(t.worker(), "accepted", shortId),
         ).resolves.toEqual({
           ok: true,
           signalled: false,
@@ -533,6 +546,7 @@ describe.skipIf(!realDatabase)(
               await step.waitFor("ready", {
                 every: "5m",
                 timeout: "1h",
+                onTimeout: "throw",
                 async poll() {
                   await checking.pause();
                   return true;
@@ -1066,6 +1080,277 @@ describe.skipIf(!realDatabase)(
       ]);
       expect(counts).toEqual([0, 0, 0, 0, 0, 0, 0]);
       expect(events.getByType("step:signalled")).toEqual([]);
+    });
+
+    async function storedOutput(t: { getStage: () => Promise<any> }) {
+      const { _artifactKey } = (await t.getStage())?.outputData as {
+        _artifactKey: string;
+      };
+      return ((await db.blobStore.get(_artifactKey)) as { branch: string })
+        .branch;
+    }
+
+    it.each([
+      { mode: "return", kick: false },
+      // Without `onTimeout` the poll does not schedule the stage: another
+      // signal wakes it at +30.
+      { mode: undefined, kick: true },
+    ] as const)("runs a due poll at the replay that reaches it after a sibling suspended (onTimeout $mode)", async ({
+      mode,
+      kick,
+    }) => {
+      let started = 0;
+      const polledAt: number[] = [];
+      let readyNow = false;
+      let hold: ReturnType<typeof barrier> | undefined;
+      let branch: Promise<unknown> = Promise.resolve();
+      const t = await start(async (step) => {
+        const short = (async () => {
+          await step.waitForSignal("pre", { timeout: "2h" });
+          // Unstepped work that ends after the sibling suspended the stage.
+          await hold?.pause();
+          return step.waitFor("short", {
+            every: 30,
+            timeout: 100,
+            ...(mode ? { onTimeout: mode } : {}),
+            async poll() {
+              polledAt.push(clock.now().getTime() - started);
+              return readyNow;
+            },
+            ready: (value: boolean) => value,
+          });
+        })();
+        branch = short.catch(() => {});
+        const [, answer] = await Promise.all([
+          step.waitForSignal("long", { timeout: "2h", keepalive: "1h" }),
+          short,
+          ...(kick
+            ? [step.waitForSignal("kick", { timeout: "2h", keepalive: "1h" })]
+            : []),
+        ]);
+        return outcome(answer);
+      });
+      const worker = t.worker();
+      started = clock.now().getTime();
+      await t.signal(worker, true, "pre");
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      expect(polledAt).toEqual([0]);
+
+      readyNow = true;
+      hold = barrier();
+      clock.set(new Date(started + 30));
+      if (kick) await t.signal(worker, true, "kick");
+      await t.tick(worker, "second");
+      await hold.reached;
+      hold.release();
+      await branch;
+      hold = undefined;
+      expect(polledAt).toEqual([0, 30]);
+      expect(await t.record("short")).toMatchObject({
+        status: "completed",
+        result: true,
+      });
+
+      await t.signal(worker, true, "long");
+      await t.tick(worker, "second");
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe("true");
+    });
+
+    it.each([
+      {
+        mode: undefined,
+        firstPoll: 3_600_000,
+        shortAfterTick: "pending",
+        late: { ok: true, signalled: true, alreadyCompleted: false },
+        stored: "accepted",
+      },
+      {
+        mode: "return",
+        firstPoll: 100,
+        shortAfterTick: "completed",
+        late: {
+          ok: true,
+          signalled: false,
+          alreadyCompleted: true,
+          timedOut: true,
+        },
+        stored: "timeout",
+      },
+    ] as const)("schedules parallel signals with onTimeout $mode when the longer wait suspends first", async ({
+      mode,
+      firstPoll,
+      shortAfterTick,
+      late,
+      stored,
+    }) => {
+      const longClaimed = Promise.withResolvers<void>();
+      const t = await start(
+        async (step) => {
+          const [, short] = await Promise.all([
+            step.waitForSignal("long", { timeout: "2h", keepalive: "1h" }),
+            step.waitForSignal<string>("short", {
+              timeout: 100,
+              ...(mode ? { onTimeout: mode } : {}),
+            }),
+          ]);
+          return outcome(short);
+        },
+        {
+          stepLedger: override(db.stepLedger, {
+            async claim(record) {
+              if (record.stepId === "short") await longClaimed.promise;
+              const claimed = await db.stepLedger.claim(record);
+              if (record.stepId === "long") longClaimed.resolve();
+              return claimed;
+            },
+          }),
+        },
+      );
+      const started = clock.now().getTime();
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      expect((await t.getStage())?.nextPollAt).toEqual(
+        new Date(started + firstPoll),
+      );
+      expect(await t.record("short")).toMatchObject({
+        status: "pending",
+        deadlineAt: new Date(started + 100),
+      });
+
+      const worker = t.worker();
+      clock.set(new Date(started + 100));
+      await t.tick(worker, "second");
+      expect((await t.record("short"))?.status).toBe(shortAfterTick);
+      clock.set(new Date(started + 101));
+      await expect(t.signal(worker, "accepted", "short")).resolves.toEqual(
+        late,
+      );
+      await t.signal(worker, true, "long");
+      await t.tick(worker, "second");
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe(stored);
+    });
+
+    it.each([
+      { mode: "return", verdict: true, stored: "timeout" },
+      { mode: "throw", verdict: true, stored: "caught timeout" },
+      { mode: undefined, verdict: false, stored: "caught timeout" },
+      { mode: undefined, verdict: true, stored: "ready" },
+    ] as const)("decides with the clock after the ready check when it crosses the deadline (onTimeout $mode, verdict $verdict)", async ({
+      mode,
+      verdict,
+      stored,
+    }) => {
+      let deadline = 0;
+      const t = await start(async (step) => {
+        try {
+          const answer = await step.waitFor("check", {
+            every: 30,
+            timeout: 100,
+            ...(mode ? { onTimeout: mode } : {}),
+            poll: async () => "ready",
+            ready: () => {
+              // The verdict takes until the deadline.
+              clock.set(new Date(deadline));
+              return verdict;
+            },
+          });
+          return outcome(answer);
+        } catch (error) {
+          if (error instanceof StepTimeoutError) return "caught timeout";
+          throw error;
+        }
+      });
+      deadline = clock.now().getTime() + 100;
+      await t.execute();
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe(stored);
+    });
+
+    it("replays within the claim lease when a worker dies after opening a wait", async () => {
+      const entered = barrier();
+      let dies = true;
+      const t = await start(async (step) => {
+        await step.waitForSignal("pre", { timeout: "2h", keepalive: "1h" });
+        const check = await step.waitFor("check", {
+          every: 30,
+          timeout: 100,
+          onTimeout: "return",
+          async poll() {
+            // Held until the survivor has finished: this worker is gone.
+            if (dies) await entered.pause();
+            return true;
+          },
+          ready: (value: boolean) => value,
+        });
+        return check.timedOut ? "timeout" : "ready";
+      });
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      const started = clock.now().getTime();
+      const survivor = t.worker();
+      await t.signal(survivor, true, "pre");
+      const lost = t.tick(t.worker(), "lost").catch(() => {});
+      await entered.reached;
+      dies = false;
+      expect(await t.record("check")).toMatchObject({
+        status: "pending",
+        deadlineAt: new Date(started + 100),
+      });
+      expect((await t.getStage())?.nextPollAt).toEqual(
+        new Date(started + 60_000),
+      );
+
+      clock.set(new Date(started + 100));
+      await t.tick(survivor, "survivor");
+      expect((await t.record("check"))?.status).toBe("pending");
+      clock.set(new Date(started + 60_000));
+      await t.tick(survivor, "survivor");
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe("timeout");
+      // The lost worker's late writes change nothing.
+      entered.release();
+      await lost;
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe("timeout");
+    });
+
+    it.each([
+      undefined,
+      "return",
+    ] as const)("reads no stored step result while suspending (onTimeout %s)", async (mode) => {
+      let suspending = false;
+      let reads = 0;
+      const blobStore = override(db.blobStore, {
+        async get(key: string) {
+          if (suspending) reads++;
+          return db.blobStore.get(key);
+        },
+      });
+      const t = await start(
+        async (step) => {
+          for (let i = 0; i < 12; i++) {
+            await step.run(`payload-${i}`, async () => "x".repeat(70_000));
+          }
+          suspending = true;
+          await step.waitForSignal("answer", {
+            timeout: "1h",
+            ...(mode ? { onTimeout: mode } : {}),
+          });
+          return "done";
+        },
+        { blobStore },
+      );
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      expect(await db.client.workflowBlob.count()).toBeGreaterThanOrEqual(12);
+      expect(reads).toBe(0);
     });
   },
 );
