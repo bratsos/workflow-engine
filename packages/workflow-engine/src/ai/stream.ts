@@ -9,7 +9,7 @@
 import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
-import { logFailure } from "./generate";
+import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
@@ -60,7 +60,7 @@ export function streamText(
 
   // Track whether we've logged an error (to avoid duplicate logs)
   let errorLogged = false;
-  let sdkError: { error: unknown } | undefined;
+  let streamError: { error: unknown } | undefined;
   const steps: ProviderResultLike[] = [];
   const onStepEnd: StreamOptions["onStepEnd"] = async (step) => {
     steps.push(step);
@@ -68,7 +68,11 @@ export function streamText(
   };
 
   // Error handler that logs the error to DB
-  const logError = (error: unknown, observed?: ProviderResultLike) => {
+  const logError = (
+    error: unknown,
+    accounting?: CallAccounting,
+    observed?: ProviderResultLike,
+  ) => {
     if (errorLogged || usageResolved) return;
     errorLogged = true;
     const callError = timeoutErrorIfExpired(timeout, error);
@@ -82,6 +86,7 @@ export function streamText(
       startTime,
       error: callError,
       steps,
+      accounting,
       result:
         observed ??
         (adapterResponse && {
@@ -99,6 +104,20 @@ export function streamText(
       },
     });
     timeout.cleanup();
+  };
+
+  const recordStreamError = (error: unknown) => {
+    if (streamError || usageResolved) return;
+    streamError = { error };
+    if (!result) {
+      logError(error);
+      return;
+    }
+    // Reading usage keeps the SDK draining when a consumer stops at an error.
+    // onEnd or getUsage will persist the bill once the SDK has reported it.
+    void Promise.resolve()
+      .then(() => getUsage())
+      .catch(() => {});
   };
 
   // Trace log before stream starts
@@ -136,6 +155,16 @@ export function streamText(
   ) => {
     if (usageResolved) return cachedUsage!;
 
+    const accounting: CallAccounting = {
+      inputTokens,
+      outputTokens,
+      ...resolveCost(
+        modelKey,
+        inputTokens,
+        outputTokens,
+        costResultLikeForSteps(resultLike),
+      ),
+    };
     const {
       cost,
       estimatedCostUsd,
@@ -145,15 +174,20 @@ export function streamText(
       servedBySteps,
       cachedInputTokens,
       reasoningTokens,
-    } = resolveCost(
-      modelKey,
-      inputTokens,
-      outputTokens,
-      costResultLikeForSteps(resultLike),
-    );
+    } = accounting;
     const durationMs = Date.now() - startTime;
 
-    if (sdkError) logError(sdkError.error, resultLike);
+    if (streamError) {
+      const usage = resultLike?.usage ?? resultLike?.totalUsage;
+      // A transport failure can leave finalized steps without an SDK aggregate.
+      const hasTotals =
+        usage?.inputTokens != null && usage?.outputTokens != null;
+      logError(
+        streamError.error,
+        hasTotals ? accounting : undefined,
+        resultLike,
+      );
+    }
     usageResolved = true;
     cachedUsage = {
       inputTokens,
@@ -250,25 +284,7 @@ export function streamText(
       stopWhen: options.stopWhen,
     }),
     onStepEnd,
-    // A failed stream can still report its final step after the error chunk.
-    onError: ({ error }: { error: unknown }) => {
-      if (sdkError) return;
-      sdkError = { error };
-      const sdkResult = result;
-      if (!sdkResult) {
-        logError(error);
-        return;
-      }
-      void runWithCallTimeout(timeout, async () => {
-        const [usage] = await Promise.all([sdkResult.usage, sdkResult.steps]);
-        return usage;
-      })
-        .then(
-          (usage) => logError(error, { usage }),
-          () => logError(error),
-        )
-        .catch(() => logger.error("Failed to record a stream call error."));
-    },
+    onError: ({ error }: { error: unknown }) => recordStreamError(error),
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.
@@ -341,8 +357,7 @@ export function streamText(
             options.onChunk?.(value);
             return { done: false, value };
           } catch (error) {
-            // Log streaming error before re-throwing
-            if (!sdkError) logError(error);
+            recordStreamError(error);
             throw timeoutErrorIfExpired(timeout, error);
           }
         },
@@ -363,31 +378,19 @@ export function streamText(
       if (timeout.timedOut() && timeout.error) throw timeout.error;
       if (adapterResponse) return persistAdapterUsage(adapterResponse);
       const sdkResult = result!;
-      const usage = await runWithCallTimeout(timeout, () => sdkResult.usage);
-      const reasoning = await getReasoning();
-      const responseText =
-        (await runWithCallTimeout(timeout, () => sdkResult.text)) || fullText;
-      const inputTokens = usage?.inputTokens ?? 0;
-      const outputTokens = usage?.outputTokens ?? 0;
-      const finalStep = await runWithCallTimeout(
-        timeout,
-        () => sdkResult.finalStep,
+      const [usage, steps] = await runWithCallTimeout(timeout, () =>
+        Promise.all([sdkResult.usage, sdkResult.steps]),
       );
-      const providerMetadata =
-        (await runWithCallTimeout(timeout, () => sdkResult.providerMetadata)) ??
-        finalStep?.providerMetadata;
-      // Every step, so a tool-calling call is billed as the sum of its
-      // steps rather than the final step alone (see step-cost.ts).
-      const steps = await runWithCallTimeout(timeout, () => sdkResult.steps);
-
-      return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
-        usage,
-        providerMetadata,
-        finalStep,
-        steps,
-      });
+      const finalStep = steps.at(-1);
+      return persistUsage(
+        usage?.inputTokens ?? 0,
+        usage?.outputTokens ?? 0,
+        finalStep?.text || fullText,
+        finalStep?.reasoningText,
+        { usage, finalStep, steps },
+      );
     } catch (error) {
-      logError(error);
+      logError(streamError ? streamError.error : error);
       throw timeoutErrorIfExpired(timeout, error);
     }
   };
@@ -401,7 +404,7 @@ export function streamText(
         ? (adapterResponse.text ?? fullText)
         : (await runWithCallTimeout(timeout, () => result!.text)) || fullText;
     } catch (error) {
-      logError(error);
+      recordStreamError(error);
       throw timeoutErrorIfExpired(timeout, error);
     }
   };
@@ -423,7 +426,7 @@ export function streamText(
         (await runWithCallTimeout(timeout, () => result!.reasoningText))
       );
     } catch (error) {
-      logError(error);
+      recordStreamError(error);
       throw timeoutErrorIfExpired(timeout, error);
     }
   };

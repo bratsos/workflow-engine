@@ -6,6 +6,7 @@ import {
   extractServedBy,
   extractUsageDetails,
   type OpenRouterRoutingOptions,
+  sameProviderSlug,
 } from "../shared";
 import {
   type EngineBatchItemResult,
@@ -55,7 +56,9 @@ export function openRouterBatchProvider(
     } else if (
       allowFallbacks === false ||
       (ordered.length > 0 &&
-        (only?.length !== 1 || ordered.length !== 1 || ordered[0] !== only[0]))
+        (only?.length !== 1 ||
+          ordered.length !== 1 ||
+          !sameProviderSlug(ordered[0]!, only[0]!)))
     ) {
       throw new Error(
         "OpenRouter batch cannot enforce the provider policy order.",

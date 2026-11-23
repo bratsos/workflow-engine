@@ -208,4 +208,76 @@ describe("vendor batch SDK missing", () => {
       allow_fallbacks: true,
     });
   });
+
+  it("pins the regional endpoint when a native batch falls back", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json(
+          { id: "regional-batch", status: "validating" },
+          { status: 202 },
+        ),
+      );
+    const ai = createAIHelper(
+      "batch-policy",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      {
+        routing: {
+          provider: {
+            only: ["baseten/fp4"],
+            order: ["baseten/fp4/us"],
+            allowFallbacks: false,
+          },
+        },
+      },
+    );
+    await expect(
+      ai
+        .batch("fallback-haiku", "anthropic", {
+          apiKey: "test",
+          fetch: fetchFn,
+        })
+        .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),
+    ).resolves.toMatchObject({ id: "regional-batch", provider: "openrouter" });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchFn.mock.calls[0]!;
+    expect(String(url)).toMatch(/openrouter\.ai\/api\/v1\/batches$/);
+    const body = String(init?.body);
+    expect(body.indexOf('"provider"')).toBeLessThan(body.indexOf('"requests"'));
+    const parsed = JSON.parse(body);
+    expect(parsed.provider).toEqual({
+      only: ["baseten/fp4/us"],
+      allow_fallbacks: false,
+    });
+    expect(parsed.requests[0].body).not.toHaveProperty("provider");
+  });
+
+  it.each([
+    { order: ["baseten/fp4/us", "anthropic"], allowFallbacks: false },
+    { order: ["baseten/fp4/us"], allowFallbacks: true },
+  ])("refuses an unrepresentable regional ranking on native fallback (%j)", async (policy) => {
+    const fetchFn = vi.fn<typeof fetch>();
+    const ai = createAIHelper(
+      "batch-policy",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      {
+        routing: {
+          provider: { ...policy, only: ["anthropic", "baseten/fp4"] },
+        },
+      },
+    );
+    await expect(
+      ai
+        .batch("fallback-haiku", "anthropic", {
+          apiKey: "test",
+          fetch: fetchFn,
+        })
+        .submit([{ id: "job-1", prompt: "Summarize the invoice." }]),
+    ).rejects.toThrow(/OpenRouter batch.*provider policy/i);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
 });

@@ -129,14 +129,7 @@ export function buildOpenRouterRoutingProvider(
   const fromRequest = eligibleProviderSlugs(requestOrder ?? [], only, ignore);
   let order = fromHelper.length ? fromHelper : fromRequest;
   if (helperOrder?.length && requestOrder?.length) {
-    const overlap = intersectProviderSlugs(fromHelper, fromRequest);
-    const reverse = intersectProviderSlugs(fromRequest, fromHelper);
-    if (overlap.length === 0 || !sameProviderOrder(overlap, reverse)) {
-      throw new Error(
-        "The helper and per-call OpenRouter provider orders conflict.",
-      );
-    }
-    order = overlap;
+    order = mergeProviderOrders(helperOrder, requestOrder, only, ignore);
   }
 
   if (
@@ -217,29 +210,79 @@ function providerSlugs(
   return value;
 }
 
-function sameProviderOrder(first: string[], second: string[]): boolean {
-  return (
-    first.length === second.length &&
-    first.every((slug, index) => slug === second[index])
-  );
+const serviceTierSuffix =
+  /\/(?:priority|fast|turbo|highspeed|prime|flex|ultrafast)$/;
+
+function comparableProviderSlug(slug: string): string {
+  return slug.replace(/\/fast$/, "/priority");
 }
 
-/** Base slugs include variants. A specific slug covers only itself. */
+export function sameProviderSlug(first: string, second: string): boolean {
+  return comparableProviderSlug(first) === comparableProviderSlug(second);
+}
+
+/** Base slugs match eligible endpoints. Variants also cover their standard regions. */
 function coversProviderSlug(filter: string, slug: string): boolean {
   return (
-    filter === slug || (!filter.includes("/") && slug.startsWith(`${filter}/`))
+    sameProviderSlug(filter, slug) ||
+    (slug.startsWith(`${filter}/`) &&
+      (!filter.includes("/") || !serviceTierSuffix.test(slug)))
   );
 }
 
 function intersectProviderSlugs(first: string[], second: string[]): string[] {
-  const intersection = new Set<string>();
+  const intersection: string[] = [];
   for (const a of first) {
     for (const b of second) {
-      if (coversProviderSlug(b, a)) intersection.add(a);
-      else if (coversProviderSlug(a, b)) intersection.add(b);
+      if (coversProviderSlug(b, a)) intersection.push(a);
+      else if (coversProviderSlug(a, b)) intersection.push(b);
     }
   }
-  return [...intersection];
+  return distinctProviderSlugs(intersection);
+}
+
+function distinctProviderSlugs(slugs: string[]): string[] {
+  const seen = new Set<string>();
+  return slugs.filter((slug) => {
+    const comparable = comparableProviderSlug(slug);
+    if (seen.has(comparable)) return false;
+    seen.add(comparable);
+    return true;
+  });
+}
+
+function mergeProviderOrders(
+  helperOrder: string[],
+  requestOrder: string[],
+  only: string[] | undefined,
+  ignore: string[] | undefined,
+): string[] {
+  const overlap = eligibleProviderSlugs(
+    intersectProviderSlugs(helperOrder, requestOrder),
+    only,
+    ignore,
+  );
+  // A broader preference gives all of its endpoints the same rank. A
+  // narrower preference from either side can order those endpoints.
+  const ranked = overlap.map((slug) => ({
+    slug,
+    helper: helperOrder.findIndex((filter) => coversProviderSlug(filter, slug)),
+    request: requestOrder.findIndex((filter) =>
+      coversProviderSlug(filter, slug),
+    ),
+  }));
+  ranked.sort((a, b) => a.helper - b.helper || a.request - b.request);
+  if (
+    !ranked.length ||
+    ranked.some(
+      ({ request }, index) => index > 0 && request < ranked[index - 1]!.request,
+    )
+  ) {
+    throw new Error(
+      "The helper and per-call OpenRouter provider orders conflict.",
+    );
+  }
+  return ranked.map(({ slug }) => slug);
 }
 
 export function eligibleProviderSlugs(
@@ -249,7 +292,7 @@ export function eligibleProviderSlugs(
 ): string[] {
   const included = only
     ? intersectProviderSlugs(candidates, only)
-    : [...new Set(candidates)];
+    : distinctProviderSlugs(candidates);
   // Keep broad slugs when only some of their variants are excluded. The
   // outgoing ignore list lets OpenRouter apply those finer exclusions.
   return included.filter(

@@ -449,9 +449,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     const policy = this.ctx.routing?.provider;
+    const batchModel = await this.provider$(true);
     if (this.provider !== "openrouter")
       assertDirectProviderPolicy(this.provider, policy);
-    const batchModel = await this.provider$(true);
     const modelConfig = getModel(this.modelKey);
 
     logger.debug(`batch submit request`, {

@@ -1,4 +1,5 @@
-import { Output, stepCountIs } from "ai";
+import { openrouter } from "@openrouter/ai-sdk-provider";
+import { Output, generateText as sdkGenerateText, stepCountIs } from "ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -10,6 +11,7 @@ import {
   registerTranscriptionProvider,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
+import type { AIAdapter } from "../../ai/types.js";
 import type { AICallLogger } from "../../persistence/interface.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { kernelDatabase, realDatabase } from "../sqlite8-kernel-utils.js";
@@ -296,6 +298,78 @@ describe("helper provider policy", () => {
       );
       expect(fetchMock).not.toHaveBeenCalled();
     });
+
+    it.each([
+      false,
+      true,
+    ])("keeps the first regional preference within a variant (fallbacks %s)", async (allowFallbacks) => {
+      await invoke(
+        { dataCollection: "deny" },
+        {
+          only: ["baseten/fp4", "deepinfra"],
+          order: ["baseten/fp4/us", "deepinfra"],
+          allow_fallbacks: allowFallbacks,
+        },
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider,
+      ).toMatchObject({
+        only: [allowFallbacks ? "baseten/fp4" : "baseten/fp4/us", "deepinfra"],
+        order: ["baseten/fp4/us", "deepinfra"],
+        allow_fallbacks: allowFallbacks,
+        data_collection: "deny",
+      });
+    });
+
+    it.each([
+      ["baseten/fp4", "baseten/fp4/us"],
+      ["baseten/fp4/us", "baseten/fp4"],
+    ])("intersects regional allowlists (%s and %s)", async (helper, caller) => {
+      await invoke({ only: [helper] }, { only: [caller] });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider.only,
+      ).toEqual(["baseten/fp4/us"]);
+    });
+
+    it("refuses a regional allowlist when its parent variant is ignored", async () => {
+      await invoke({ only: ["baseten/fp4/us"] }, { ignore: ["baseten/fp4"] });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("preserves the caller's order within a variant ranked by the helper", async () => {
+      await invoke(
+        { only: ["baseten/fp4/kr", "baseten/fp4/us"], order: ["baseten/fp4"] },
+        { order: ["baseten/fp4/us", "baseten/fp4/kr"], allow_fallbacks: false },
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider.order,
+      ).toEqual(["baseten/fp4/us", "baseten/fp4/kr"]);
+    });
+
+    it("keeps an explicit service tier separate from the standard region", async () => {
+      await invoke(
+        { only: ["google-vertex/global/flex"] },
+        { ignore: ["google-vertex/global"] },
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider,
+      ).toMatchObject({
+        only: ["google-vertex/global/flex"],
+        ignore: ["google-vertex/global"],
+      });
+    });
+
+    it("intersects the two documented labels for the same priority endpoint", async () => {
+      await invoke({ only: ["openai/priority"] }, { only: ["openai/fast"] });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider.only,
+      ).toEqual(["openai/priority"]);
+    });
   });
 
   it("preserves helper denial and the stricter helper price cap when call options loosen them", async () => {
@@ -505,6 +579,16 @@ describe("helper provider policy", () => {
   it.each([
     provider,
     { only: ["openai"], order: ["azure"], allowFallbacks: false },
+    {
+      only: ["anthropic", "baseten/fp4"],
+      order: ["baseten/fp4/us", "anthropic"],
+      allowFallbacks: false,
+    },
+    {
+      only: ["anthropic", "baseten/fp4"],
+      order: ["baseten/fp4/us"],
+      allowFallbacks: true,
+    },
   ])("refuses an unrepresentable OpenRouter batch policy (%j)", async (policy) => {
     const ai = makeHelper(policy);
     await expect(
@@ -513,6 +597,31 @@ describe("helper provider policy", () => {
         .submit(requests),
     ).rejects.toThrow(/OpenRouter batch.*provider policy/i);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("pins a regional endpoint in an explicit OpenRouter batch", async () => {
+    fetchMock.mockResolvedValueOnce(
+      Response.json({ id: "batch-1", status: "validating" }, { status: 202 }),
+    );
+    const ai = makeHelper({
+      only: ["baseten/fp4"],
+      order: ["baseten/fp4/us"],
+      allowFallbacks: false,
+    });
+    await expect(
+      ai
+        .batch("policy-text", "openrouter", { fetch: fetchMock })
+        .submit(requests),
+    ).resolves.toMatchObject({ id: "batch-1" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = String(fetchMock.mock.calls[0]![1]?.body);
+    expect(body.indexOf('"provider"')).toBeLessThan(body.indexOf('"requests"'));
+    const parsed = JSON.parse(body);
+    expect(parsed.provider).toEqual({
+      only: ["baseten/fp4/us"],
+      allow_fallbacks: false,
+    });
+    expect(parsed.requests[0].body).not.toHaveProperty("provider");
   });
 
   it("refuses an allowlist on OpenRouter batch embeddings before fetch", async () => {
@@ -648,6 +757,188 @@ describe("helper provider policy", () => {
     outputTokens: 4,
     cost: 0.000028,
   };
+  const alpha21ChunkCallbackTotals = {
+    inputTokens: 10,
+    outputTokens: 2,
+    cost: 0.125,
+  };
+
+  async function failAdapterOutput(
+    logger: AICallLogger,
+    call: "text" | "object",
+  ) {
+    const topic = `adapter-output-${crypto.randomUUID()}`;
+    const schema = z.object({ paid: z.boolean() });
+    mockToolSteps(undefined, 0.125);
+    const adapterCall = async () => {
+      const result = await sdkGenerateText({
+        model: openrouter(textModel.id),
+        prompt: "Check the invoice.",
+        tools: { check: { inputSchema: z.object({}), execute: () => true } },
+        stopWhen: stepCountIs(3),
+        output: Output.object({ schema }),
+        maxRetries: 0,
+      });
+      return {
+        text: result.text,
+        inputTokens: result.usage.inputTokens ?? 0,
+        outputTokens: result.usage.outputTokens ?? 0,
+        costUsd: result.steps.reduce((cost, step) => {
+          const usage = step.providerMetadata?.openrouter?.usage as {
+            cost: number;
+          };
+          return cost + usage.cost;
+        }, 0),
+        get object() {
+          return result.output;
+        },
+      };
+    };
+    const adapter: AIAdapter = {
+      generateText: adapterCall,
+      generateObject: adapterCall,
+    };
+    const ai = createAIHelper(topic, logger, undefined, undefined, { adapter });
+    const result =
+      call === "text"
+        ? ai.generateText("policy-text", "Check the invoice.", {
+            output: Output.object({ schema }),
+          })
+        : ai.generateObject("policy-text", "Check the invoice.", schema);
+    await expect(result).rejects.toMatchObject({
+      name: "AI_NoOutputGeneratedError",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    return topic;
+  }
+
+  async function failChunkCallback(logger: AICallLogger) {
+    const topic = `stream-callback-${crypto.randomUUID()}`;
+    const baseChunk = {
+      id: "gen-callback",
+      model: textModel.id,
+      provider: "Azure",
+    };
+    const first = {
+      ...baseChunk,
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", content: "Partial" },
+          finish_reason: null,
+        },
+      ],
+    };
+    const final = {
+      ...baseChunk,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+        cost: 0.125,
+      },
+    };
+    const encoder = new TextEncoder();
+    let finish!: () => void;
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(first)}\n\n`),
+        );
+        finish = () => {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify(final)}\n\ndata: [DONE]\n\n`,
+            ),
+          );
+          controller.close();
+        };
+      },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(readable, {
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+    const error = new Error("Consumer could not process chunk");
+    const stream = createAIHelper(topic, logger).streamText(
+      "policy-text",
+      { prompt: "Check the invoice." },
+      {
+        maxRetries: 0,
+        onChunk() {
+          throw error;
+        },
+      },
+    );
+    try {
+      await expect(stream.stream[Symbol.asyncIterator]().next()).rejects.toBe(
+        error,
+      );
+    } finally {
+      finish();
+    }
+    expect(await stream.getUsage()).toMatchObject({
+      ...alpha21ChunkCallbackTotals,
+      reportedCostUsd: 0.125,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    return topic;
+  }
+
+  const failedChunkCallback = {
+    ...alpha21ChunkCallbackTotals,
+    reportedCost: 0.125,
+    costSource: "reported",
+    servedBy: "Azure",
+    metadata: { status: "error", servedBySteps: ["Azure"] },
+  };
+
+  const failedAdapterOutput = {
+    ...alpha21ToolLimitTotals,
+    reportedCost: 0.375,
+    costSource: "reported",
+    metadata: { status: "error" },
+  };
+
+  it.each([
+    "text",
+    "object",
+  ] as const)("keeps the billable totals when an adapter's %s output getter throws", async (call) => {
+    const logger = new InMemoryAICallLogger();
+    const topic = await failAdapterOutput(logger, call);
+    expect(await logger.listCalls(topic)).toMatchObject([failedAdapterOutput]);
+  });
+
+  it("keeps the alpha.21 bill when onChunk throws before the stream reports usage", async () => {
+    const logger = new InMemoryAICallLogger();
+    const topic = await failChunkCallback(logger);
+    expect(await logger.listCalls(topic)).toMatchObject([failedChunkCallback]);
+  });
+
+  it.skipIf(!realDatabase)(
+    "stores the final bill when a consumer fails before reading output",
+    async () => {
+      const db = await kernelDatabase();
+      try {
+        const adapterTopic = await failAdapterOutput(db.aiLogger, "text");
+        fetchMock.mockClear();
+        const streamTopic = await failChunkCallback(db.aiLogger);
+        await vi.waitFor(async () => {
+          expect(await db.aiLogger.listCalls(adapterTopic)).toMatchObject([
+            failedAdapterOutput,
+          ]);
+          expect(await db.aiLogger.listCalls(streamTopic)).toMatchObject([
+            failedChunkCallback,
+          ]);
+        });
+      } finally {
+        await db.close();
+      }
+    },
+    20_000,
+  );
 
   async function failAtToolLimit(
     logger: AICallLogger,

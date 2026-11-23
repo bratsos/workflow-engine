@@ -136,34 +136,20 @@ export function usageFromError(error: unknown): {
   };
 }
 
-/**
- * Log a failed AI call (fire-and-forget persistence write) and return the
- * derived error fields. Shared by the catch blocks in generateText,
- * generateObject, and embed (which also trace-log via `logger.error` and
- * rethrow), and by streamText's error path (which only logs - see stream.ts).
- */
-export function logFailure(
-  aiCallLogger: AICallLogger,
-  params: {
-    topic: string;
-    callType: AICallType;
-    modelKey: ModelKey;
-    modelId: string;
-    prompt: string;
-    startTime: number;
-    error: unknown;
-    steps?: readonly ProviderResultLike[];
-    result?: ProviderResultLike;
-    metadata?: Record<string, unknown>;
-  },
-): { errorMessage: string; durationMs: number } {
-  const durationMs = Date.now() - params.startTime;
-  const errorMessage =
-    params.error instanceof Error ? params.error.message : String(params.error);
-  const steps = params.steps ?? [];
-  const errorUsage = usageFromError(params.error);
-  const errorResult = params.error as ProviderResultLike | undefined;
-  const observedUsage = params.result?.usage ?? params.result?.totalUsage;
+export type CallAccounting = CostResolution & {
+  inputTokens: number;
+  outputTokens: number;
+};
+
+function resolveFailureAccounting(
+  modelKey: ModelKey,
+  error: unknown,
+  steps: readonly ProviderResultLike[],
+  result?: ProviderResultLike,
+): CallAccounting {
+  const errorUsage = usageFromError(error);
+  const errorResult = error as ProviderResultLike | undefined;
+  const observedUsage = result?.usage ?? result?.totalUsage;
   let stepInputTokens = 0;
   let stepOutputTokens = 0;
   for (const step of steps) {
@@ -193,33 +179,74 @@ export function logFailure(
   });
   const costUsd =
     extractReportedCost(errorResult) ??
-    params.result?.costUsd ??
+    result?.costUsd ??
     (steps.length === 0
-      ? extractReportedCost(params.result)
+      ? extractReportedCost(result)
       : stepInputTokens === inputTokens && stepOutputTokens === outputTokens
         ? extractReportedCost(folded)
         : undefined);
-  let accounting: CostResolution = {
-    cost: costUsd ?? 0,
-    estimatedCostUsd: 0,
-    reportedCostUsd: costUsd,
-    costSource: costUsd === undefined ? "estimated" : "reported",
-    cachedInputTokens: errorUsage.cachedInputTokens,
-    reasoningTokens: errorUsage.reasoningTokens,
-  };
   try {
-    accounting = resolveCost(params.modelKey, inputTokens, outputTokens, {
-      costUsd,
-      usage: { ...errorUsage, ...folded.usage },
-      steps,
-    });
+    return {
+      ...totals,
+      ...resolveCost(modelKey, inputTokens, outputTokens, {
+        costUsd,
+        usage: { ...errorUsage, ...folded.usage },
+        steps,
+      }),
+    };
   } catch {
     // Preserve available reporting if the cost catalogue cannot price the failure.
+    return {
+      ...totals,
+      cost: costUsd ?? 0,
+      estimatedCostUsd: 0,
+      reportedCostUsd: costUsd,
+      costSource: costUsd === undefined ? "estimated" : "reported",
+      cachedInputTokens: errorUsage.cachedInputTokens,
+      reasoningTokens: errorUsage.reasoningTokens,
+    };
   }
+}
 
-  const { servedBy, servedBySteps } = summarizeStepProviders(
+/**
+ * Log a failed AI call and return the derived error fields. Use the same
+ * accounting as a successful call when the provider already returned its bill.
+ */
+export function logFailure(
+  aiCallLogger: AICallLogger,
+  params: {
+    topic: string;
+    callType: AICallType;
+    modelKey: ModelKey;
+    modelId: string;
+    prompt: string;
+    startTime: number;
+    error: unknown;
+    steps?: readonly ProviderResultLike[];
+    result?: ProviderResultLike;
+    accounting?: CallAccounting;
+    metadata?: Record<string, unknown>;
+  },
+): { errorMessage: string; durationMs: number } {
+  const durationMs = Date.now() - params.startTime;
+  const errorMessage =
+    params.error instanceof Error ? params.error.message : String(params.error);
+  const steps = params.steps ?? [];
+  const accounting =
+    params.accounting ??
+    resolveFailureAccounting(
+      params.modelKey,
+      params.error,
+      steps,
+      params.result,
+    );
+
+  const providerHistory = summarizeStepProviders(
     steps.map(extractStepProvider),
   );
+  const servedBy = providerHistory.servedBy ?? accounting.servedBy;
+  const servedBySteps =
+    providerHistory.servedBySteps ?? accounting.servedBySteps;
   aiCallLogger.logCall({
     topic: params.topic,
     callType: params.callType,
@@ -227,8 +254,8 @@ export function logFailure(
     modelId: params.modelId,
     prompt: params.prompt,
     response: "",
-    inputTokens,
-    outputTokens,
+    inputTokens: accounting.inputTokens,
+    outputTokens: accounting.outputTokens,
     cost: accounting.cost,
     estimatedCost: accounting.estimatedCostUsd,
     ...(accounting.reportedCostUsd !== undefined
@@ -289,6 +316,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   }
 
   const steps: ProviderResultLike[] = [];
+  let accounting: CallAccounting | undefined;
   // Capture provider history before tool logging or the caller's callback can fail.
   const wrappedOnStepEnd: TextOptions<TTools>["onStepEnd"] = async (
     stepResult,
@@ -408,30 +436,6 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
               } as Parameters<typeof aiGenerateText>[0]),
         );
 
-    // Debug logging for result
-    if (hasTools || hasOutputSchema) {
-      const resultAny = result as {
-        steps?: unknown[];
-        output?: unknown;
-        object?: unknown;
-      };
-      // `.output` is a getter that throws AI_NoOutputGeneratedError unless
-      // `output` was configured - only probe it when relevant. An adapter
-      // response carries the structured output as `object`.
-      let hasOutput = false;
-      if (hasOutputSchema) {
-        try {
-          hasOutput =
-            (isAdapter ? resultAny.object : resultAny.output) !== undefined;
-        } catch {
-          hasOutput = false;
-        }
-      }
-      logger.debug(
-        `generateText result: stepsCount=${resultAny.steps?.length ?? 0}, hasOutput=${hasOutput}, finishReason=${(result as { finishReason?: unknown }).finishReason}`,
-      );
-    }
-
     const resultAny = result as unknown as {
       text: string;
       inputTokens?: number;
@@ -445,15 +449,36 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       output?: unknown;
       object?: unknown;
     };
+    const inputTokens =
+      resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
+    const outputTokens =
+      resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
+    accounting = {
+      inputTokens,
+      outputTokens,
+      ...resolveCost(
+        modelKey,
+        inputTokens,
+        outputTokens,
+        isAdapter
+          ? {
+              providerMetadata: resultAny.providerMetadata,
+              costUsd: resultAny.costUsd,
+            }
+          : costResultLikeForSteps(result),
+      ),
+    };
     const output = hasOutputSchema
       ? isAdapter
         ? resultAny.object
         : resultAny.output
       : undefined;
-    const inputTokens =
-      resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
-    const outputTokens =
-      resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
+    if (hasTools || hasOutputSchema) {
+      logger.debug(
+        `generateText result: stepsCount=${steps.length}, hasOutput=${output !== undefined}, finishReason=${resultAny.finishReason}`,
+      );
+    }
+    const text = resultAny.text;
     const {
       cost,
       estimatedCostUsd,
@@ -463,17 +488,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       servedBySteps,
       cachedInputTokens,
       reasoningTokens,
-    } = resolveCost(
-      modelKey,
-      inputTokens,
-      outputTokens,
-      isAdapter
-        ? {
-            providerMetadata: resultAny.providerMetadata,
-            costUsd: resultAny.costUsd,
-          }
-        : costResultLikeForSteps(result),
-    );
+    } = accounting;
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
     // reasoning-only response isn't seen as empty output.
@@ -486,7 +501,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       modelKey,
       modelId: modelConfig.id,
       prompt: promptForLog,
-      response: resultAny.text,
+      response: text,
       inputTokens,
       outputTokens,
       cost,
@@ -516,9 +531,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     // Trace log after successful AI call
     logger.debug(`generateText response`, {
       model: modelKey,
-      response:
-        resultAny.text.substring(0, 500) +
-        (resultAny.text.length > 500 ? "..." : ""),
+      response: text.substring(0, 500) + (text.length > 500 ? "..." : ""),
       inputTokens,
       outputTokens,
       cost: cost.toFixed(6),
@@ -527,7 +540,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     });
 
     return {
-      text: resultAny.text,
+      text,
       inputTokens,
       outputTokens,
       cost,
@@ -547,6 +560,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       startTime,
       error,
       steps,
+      accounting,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -593,6 +607,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   const promptForLog = extractPromptForLog(prompt);
 
   const steps: ProviderResultLike[] = [];
+  let accounting: CallAccounting | undefined;
   const onStepEnd: ObjectOptions["onStepEnd"] = async (step) => {
     steps.push(step);
     await options.onStepEnd?.(step);
@@ -679,14 +694,26 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       reasoningText?: string;
       reasoning?: string;
     };
-    // The AI SDK exposes the structured result as `output`; an
-    // AdapterObjectResponse carries it as `object`. Resolve once, use everywhere.
-    const object = isAdapter ? resultAny.object : resultAny.output;
-
     const inputTokens =
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
+    accounting = {
+      inputTokens,
+      outputTokens,
+      ...resolveCost(
+        modelKey,
+        inputTokens,
+        outputTokens,
+        isAdapter
+          ? {
+              providerMetadata: resultAny.providerMetadata,
+              costUsd: resultAny.costUsd,
+            }
+          : costResultLikeForSteps(result),
+      ),
+    };
+    const object = isAdapter ? resultAny.object : resultAny.output;
     const {
       cost,
       estimatedCostUsd,
@@ -696,17 +723,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       servedBySteps,
       cachedInputTokens,
       reasoningTokens,
-    } = resolveCost(
-      modelKey,
-      inputTokens,
-      outputTokens,
-      isAdapter
-        ? {
-            providerMetadata: resultAny.providerMetadata,
-            costUsd: resultAny.costUsd,
-          }
-        : costResultLikeForSteps(result),
-    );
+    } = accounting;
     const durationMs = Date.now() - startTime;
 
     // Log the call (including error cases where finishReason is "error")
@@ -776,6 +793,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       startTime,
       error,
       steps,
+      accounting,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
