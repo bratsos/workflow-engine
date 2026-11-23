@@ -5,7 +5,7 @@ import { definePrismaConfig } from "prisma/config";
 // (contract.json, the migration baseline and its refs) goes to .generated.
 export default definePrismaConfig({
   orm: defineConfig({
-    contract: "../../workflow-engine/prisma/contract.prisma",
+    contract: process.env.PRISMA_FIXTURE_CONTRACT ?? "../../workflow-engine/prisma/contract.prisma",
     output: "./.generated",
     db: { connection: process.env.DATABASE_URL ?? "" },
     migrations: { dir: "./.generated/migrations" },

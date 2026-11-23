@@ -706,24 +706,33 @@ PERFORM workflow_engine_enqueue(
 );
 ```
 
-The function ships as SQL in the package (`node_modules/@bratsos/workflow-engine/sql/enqueue.sql`),
-not as something the engine creates at runtime, so your migration owns it. Apply
-it after the engine's tables exist. It is `CREATE OR REPLACE`, so re-running is safe.
+The function ships in `node_modules/@bratsos/workflow-engine/sql/enqueue.sql`.
+Install it after creating the engine tables.
+
+#### Fresh install
+
+Use the standalone command only on a fresh install where the database's
+default function ACL gives the intended access. If you restrict execution,
+prepare a file with your `REVOKE` and `GRANT` statements and add it as the last
+`-f` argument so the ACL takes effect in the same transaction.
 
 ```bash
-psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+# Fresh install with the intended default function ACL.
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
 ```
 
-Or, on Prisma 6 and 7, paste it into a migration:
+#### Upgrade an existing function
 
-```bash
-npx prisma migrate dev --create-only --name workflow-engine-enqueue-function
-cat node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
-  >> prisma/migrations/*_workflow_engine_enqueue_function/migration.sql
-npx prisma migrate dev
-```
+Follow the [PostgreSQL upgrade](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
+for the separate table migrations, tracked wrappers, and atomic function
+and ACL replacement. Dropping the original signature removes its privileges.
+Prepare the before and after files in the upgrade guide even when your
+wrapper still passes seven arguments.
 
-Prisma 8 has no `migrate dev --create-only`: the CLI fails with `CLI.COMMAND_MOVED` and points to `contract emit`, then `migration plan --name <name>` (for `--create-only`, stop here), then `db migrate --advance-ref db`. Apply the file with `psql`, as above (it works unchanged on a Prisma 8 database), or author a custom migration with `prisma migration new`.
+The same scripts work with Prisma 6, 7 and 8. If you use a custom migration,
+run the function change and its ACL statements in one transaction with error
+checking.
 
 Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
 
@@ -770,17 +779,17 @@ with one idempotency key returns the same run id and creates nothing the second
 time.
 
 Pass `p_tenant_id` and `p_labels` to store an opaque tenant ID and a JSON
-object of string labels. Both default to SQL NULL. The key row records the run
+object with string values. Both default to SQL NULL. Both enqueue paths
+reject the `__proto__` key so all Prisma majors persist the same labels. Label keys and values
+use well-formed Unicode without null characters.
+The key row records the run
 ID in `workflowRunId`. PostgreSQL `run.create` and SQL enqueue send the new run
 ID on `workflow_engine_runs` when their transaction commits. Replay and
 rollback leave the channel silent. Kernel notifications require a
-transaction, including when the caller owns it.
-
-When upgrading SQL enqueue, replace the function using the new script in your
-schema migration. The two trailing defaults preserve valid seven-argument
-calls. Restore any custom `EXECUTE` grants before the migration commits,
-because dropping the original signature drops its grants. Restore any
-revocation from `PUBLIC` in the same transaction.
+transaction, including when the caller owns it. A PostgreSQL transaction
+view can forward either a raw query or a raw execute method to send the wake.
+A delegate-only view with definition versioning disabled can still create
+runs, which hosts find through polling.
 
 A test in the engine's suite (`sql-enqueue.test.ts`, gated on `DATABASE_URL`)
 creates one run each way and asserts the two `workflow_runs` rows, the two

@@ -14,9 +14,11 @@
 -- This file is part of the schema, not something the engine creates at
 -- runtime: run it in your own migration, next to the tables it writes, so
 -- your migration history owns it. Apply it AFTER the workflow engine tables
--- exist. This replaces the original seven-argument signature atomically.
--- If you granted EXECUTE to application roles, restore those grants on the
--- new signature before COMMIT. Restore any revocation from PUBLIC as well.
+-- exist. Use a transaction with error checking, for example
+-- psql -X -v ON_ERROR_STOP=1 --single-transaction -f enqueue.sql.
+-- For upgrades, include the dependent-object changes and ACL restoration
+-- in that transaction. Restore EXECUTE grants and any PUBLIC revocation
+-- before committing the new signature.
 --
 -- Requires PostgreSQL 13+ (for the built-in gen_random_uuid()).
 --
@@ -75,8 +77,6 @@
 --     finished result — the replay path — rather than seeing the marker.
 --
 -- ---------------------------------------------------------------------------
-
-BEGIN;
 
 DROP FUNCTION IF EXISTS workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text);
 
@@ -148,9 +148,10 @@ BEGIN
 
   IF p_labels IS NOT NULL AND (
     jsonb_typeof(p_labels) <> 'object' OR
-    jsonb_path_exists(p_labels, '$.* ? (@.type() != "string")')
+    p_labels ? '__proto__' OR
+    jsonb_path_exists(p_labels, 'strict $.* ? (@.type() != "string")')
   ) THEN
-    RAISE EXCEPTION 'workflow_engine_enqueue: labels must be a JSON object with string values'
+    RAISE EXCEPTION 'workflow_engine_enqueue: labels must be a JSON object with string values and no __proto__ key'
       USING ERRCODE = '22023';
   END IF;
 
@@ -223,6 +224,3 @@ $$;
 
 COMMENT ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) IS
   'Create a PENDING workflow run in the caller''s transaction. Accepts optional tenant attribution and notifies workflow_engine_runs on commit. Mirrors run.create; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).';
-
--- Restore any application-specific EXECUTE grants here.
-COMMIT;

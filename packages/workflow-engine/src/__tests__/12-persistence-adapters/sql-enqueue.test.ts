@@ -24,11 +24,13 @@ import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  type PrismaWorkflowPersistenceOptions,
 } from "../../persistence/prisma/index.js";
 import {
   type EnginePrismaClient,
   rawFor,
 } from "../../persistence/prisma/prisma-client-type.js";
+import { override } from "../sqlite8-kernel-utils.js";
 import { createPostgresClient, isPrisma8 } from "../utils/postgres-client.js";
 
 /**
@@ -118,15 +120,16 @@ if (!DATABASE_URL) {
       .build();
 
     const workerId = "sql-enqueue-worker";
-    function makeKernel(client: EnginePrismaClient, statusEnumName?: string) {
+    function makeKernel(
+      client: EnginePrismaClient,
+      options?: PrismaWorkflowPersistenceOptions,
+    ) {
       const jobTransport = createPrismaJobQueue(client, { workerId });
       const clock: Clock = { now: () => new Date() };
       return {
         jobTransport,
         kernel: createKernel({
-          persistence: createPrismaWorkflowPersistence(client, {
-            statusEnumName,
-          }),
+          persistence: createPrismaWorkflowPersistence(client, options),
           jobTransport,
           blobStore: new InMemoryBlobStore(),
           eventSink: new CollectingEventSink(),
@@ -259,20 +262,113 @@ if (!DATABASE_URL) {
       });
     });
 
-    it("rejects SQL labels that are not a JSON object of strings", async () => {
-      for (const labels of ["null", "[]", '{"queue":1}']) {
+    it("rejects nonportable SQL labels without leaving a run, key or notification", async () => {
+      await withListener(async (writer, received, flush) => {
+        const enqueue = (labels?: string) =>
+          writer.query<{ id: string }>(
+            "SELECT workflow_engine_enqueue($1, $2, $3, $4, p_labels => $5) AS id",
+            [
+              "label-check",
+              workflow.id,
+              workflow.name,
+              '{"value":"test"}',
+              labels,
+            ],
+          );
+        for (const labels of [
+          "null",
+          "[]",
+          '"value"',
+          "true",
+          "1",
+          '{"queue":1}',
+          '{"queue":null}',
+          '{"queue":{}}',
+          '{"queue":[]}',
+          '{"queue":["value"]}',
+          '{"__proto__":"value"}',
+        ]) {
+          await expect(enqueue(labels)).rejects.toMatchObject({
+            code: "22023",
+          });
+        }
+        for (const labels of ['{"\\u0000":"value"}', '{"\\uD800":"value"}']) {
+          await expect(enqueue(labels)).rejects.toMatchObject({
+            code: expect.stringMatching(/^22/),
+          });
+        }
+        await flush();
+        expect(received).toEqual([]);
+        expect(await prisma.workflowRun.count()).toBe(0);
+        expect(await prisma.idempotencyKey.count()).toBe(0);
+
+        const labels =
+          '{"constructor":"ordinary","set":"value","toJSON":"ordinary","queue-🔔":"ready-🔔"}';
+        const {
+          rows: [created],
+        } = await enqueue(labels);
+        const {
+          rows: [replay],
+        } = await enqueue('{"queue":[]}');
+        expect(replay?.id).toBe(created?.id);
+        expect(
+          await prisma.workflowRun.findUnique({
+            where: { id: created?.id },
+          }),
+        ).toMatchObject({ labels: JSON.parse(labels) });
+        await flush();
+        expect(received).toEqual([created?.id]);
         await expect(
-          rawFor(prisma, { id: "text" }).$queryRawUnsafe!(
-            "SELECT workflow_engine_enqueue($1::text, $2::text, $3::text, $4::jsonb, p_labels => $5::jsonb) AS id",
-            "invalid-labels",
-            workflow.id,
-            workflow.name,
-            '{"value":"test"}',
-            labels,
+          writer.query(
+            "SELECT workflow_engine_enqueue('empty-map', $1, $2, $3, p_labels => '{}')",
+            [workflow.id, workflow.name, '{"value":"test"}'],
           ),
-        ).rejects.toThrow(/labels must be a JSON object with string values/);
-      }
-      expect(await prisma.workflowRun.count()).toBe(0);
+        ).resolves.toMatchObject({ rowCount: 1 });
+      });
+    });
+
+    it.each([
+      "$executeRaw",
+      "$executeRawUnsafe",
+      "delegate-only",
+    ] as const)("respects the raw capabilities of a caller-owned %s view", async (method) => {
+      await withListener(async (_writer, received, flush) => {
+        const workflowRunId = await prisma.$transaction!(
+          async (tx: EnginePrismaClient) => {
+            const facade = override(tx, {
+              $queryRaw: undefined,
+              $queryRawUnsafe: undefined,
+              $withColumns: undefined,
+              $transaction: undefined,
+              ...(method !== "$executeRaw" && { $executeRaw: undefined }),
+              ...(method !== "$executeRawUnsafe" && {
+                $executeRawUnsafe: undefined,
+              }),
+            });
+            const { kernel } = makeKernel(facade, {
+              transactionView: true,
+              definitionVersioning: method === "$executeRaw",
+            });
+            const command = {
+              type: "run.create",
+              workflowId: workflow.id,
+              idempotencyKey: "facade-wake",
+              input: { value: "test" },
+            } as const;
+            const { workflowRunId } = await kernel.dispatch(command);
+            expect(await kernel.dispatch(command)).toMatchObject({
+              workflowRunId,
+            });
+            expect(received).toEqual([]);
+            return workflowRunId;
+          },
+        );
+        await flush();
+        expect(received).toEqual(
+          method === "delegate-only" ? [] : [workflowRunId],
+        );
+        expect(await prisma.workflowRun.count()).toBe(1);
+      });
     });
 
     it("replaces the old overload and reports a validation error for an invalid seven-argument call", async () => {
@@ -313,16 +409,19 @@ if (!DATABASE_URL) {
         const db = fixture.createPostgresDb(DATABASE_URL, {
           statusEnumName: "WorkflowStatus",
         });
+        const standard = fixture.createPostgresDb(DATABASE_URL);
         try {
+          expect(db.contract.storage.storageHash).not.toBe(
+            standard.contract.storage.storageHash,
+          );
           await prisma.$executeRawUnsafe(
             'ALTER TYPE "Status" RENAME TO "WorkflowStatus"',
           );
           try {
             const renamed = fromPrisma8(db);
-            const { kernel, jobTransport } = makeKernel(
-              renamed,
-              "WorkflowStatus",
-            );
+            const { kernel, jobTransport } = makeKernel(renamed, {
+              statusEnumName: "WorkflowStatus",
+            });
             const { workflowRunId } = await kernel.dispatch({
               type: "run.create",
               workflowId: workflow.id,
@@ -367,7 +466,7 @@ if (!DATABASE_URL) {
             );
           }
         } finally {
-          await db.close();
+          await Promise.all([db.close(), standard.close()]);
         }
       },
     );

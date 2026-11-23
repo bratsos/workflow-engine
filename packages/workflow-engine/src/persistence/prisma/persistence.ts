@@ -504,9 +504,17 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     const raw = rawFor(this.prisma, { sent: "int" });
     if (raw.$queryRaw) {
       await raw.$queryRaw`SELECT 1 AS sent FROM pg_notify('workflow_engine_runs', ${workflowRunId})`;
-    } else {
-      await raw.$queryRawUnsafe?.(
+    } else if (raw.$queryRawUnsafe) {
+      await raw.$queryRawUnsafe(
         "SELECT 1 AS sent FROM pg_notify('workflow_engine_runs', $1)",
+        workflowRunId,
+      );
+    } else if (this.prisma.$executeRaw) {
+      await this.prisma
+        .$executeRaw`SELECT pg_notify('workflow_engine_runs', ${workflowRunId})`;
+    } else {
+      await this.prisma.$executeRawUnsafe?.(
+        "SELECT pg_notify('workflow_engine_runs', $1)",
         workflowRunId,
       );
     }

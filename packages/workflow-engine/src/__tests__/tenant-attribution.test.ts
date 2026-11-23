@@ -40,14 +40,14 @@ describe.skipIf(!realDatabase)("tenant and run attribution", () => {
   beforeEach(() => db.reset());
   afterAll(() => db?.close());
 
-  const createRun = () =>
+  const createRun = (labels: unknown = { queue: "batch", priority: "low" }) =>
     kernel.dispatch({
       type: "run.create",
       workflowId: workflow.id,
       idempotencyKey: "tenant-test",
       input: {},
       tenantId: "tenant-a",
-      labels: { queue: "batch", priority: "low" },
+      labels: labels as Record<string, string>,
     });
 
   async function enterSignalWait() {
@@ -82,6 +82,55 @@ describe.skipIf(!realDatabase)("tenant and run attribution", () => {
       where: { key: "tenant-test", commandType: "run.create" },
     });
     expect(key?.workflowRunId).toBe(workflowRunId);
+  });
+
+  it("rejects labels outside the portable flat string-map contract before creating a run", async () => {
+    const invalid = [
+      null,
+      ["value"],
+      "value",
+      1,
+      true,
+      new Date(0),
+      { queue: null },
+      { queue: 1 },
+      { queue: {} },
+      { queue: [] },
+      { queue: ["value"] },
+      { queue: undefined },
+      {
+        get queue() {
+          return "value";
+        },
+      },
+      { [Symbol("queue")]: "value" },
+      JSON.parse('{"__proto__":"value"}'),
+      { ["\0"]: "value" },
+      { ["\uD800"]: "value" },
+      { queue: "\0" },
+      { queue: "\uD800" },
+    ];
+    for (const labels of invalid) {
+      await expect(createRun(labels)).rejects.toThrow(/labels.*string values/i);
+    }
+    expect(await db.client.workflowRun.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+
+    const labels = Object.assign(Object.create(null), {
+      $type: "ordinary",
+      constructor: "ordinary",
+      set: "value",
+      toJSON: "also ordinary",
+      "queue-🔔": "ready-🔔",
+    });
+    const { workflowRunId } = await createRun(labels);
+    expect(
+      await db.client.workflowRun.findUnique({
+        where: { id: workflowRunId },
+      }),
+    ).toMatchObject({ labels });
+    // Replaying a completed key observes the original run.
+    expect(await createRun({ queue: [] })).toMatchObject({ workflowRunId });
   });
 
   it("attributes the worker's job.execute attempt key to its run", async () => {

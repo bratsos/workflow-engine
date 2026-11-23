@@ -1113,7 +1113,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueue` and `enqueueParallel` throw. To enqueue inside the transaction, use `workflow_engine_enqueue` (apply `sql/enqueue.sql` with `psql`; it works unchanged on Prisma 8) through the transaction's raw lane, which takes strings, numbers and booleans and rejects a `Date` or an array, so the input goes in as JSON text:
+Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueue` and `enqueueParallel` throw. To enqueue inside the transaction, use `workflow_engine_enqueue` (see [installation and upgrade](#transactional-enqueue-from-sql-postgresql)) through the transaction's raw lane, which takes strings, numbers and booleans and rejects a `Date` or an array, so the input goes in as JSON text:
 
 ```ts
 await db.transaction(async (tx) => {
@@ -1486,11 +1486,30 @@ work atomically with the rows that justify it. It ships as SQL in the package
 (`sql/enqueue.sql`), not as something the engine creates at runtime, so the
 consumer's migration owns it.
 
+### Fresh install
+
+Run the standalone command after creating the engine tables and confirm that
+the database's default function ACL gives the intended access. For a
+restricted fresh install, add a final `-f` with the application's `REVOKE` and
+`GRANT` statements so they commit with the function.
+
 ```bash
-psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+# Fresh install with the intended default function ACL.
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
 ```
 
-It works unchanged against a Prisma 8 database; the call from a Prisma 8 transaction is under [Prisma 8](#prisma-8).
+### Upgrade an existing function
+
+Follow the [migration guide](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
+for the separate table steps and atomic replacement. Prepare the dependent
+wrapper and ACL files before running the upgrade command. A PostgreSQL
+`2BP01` error identifies a tracked dependency that must be recreated in the
+same transaction. Valid seven-argument calls still use the two trailing
+defaults.
+
+The same function works on Prisma 8. The call through a Prisma 8 transaction
+is under [Prisma 8](#prisma-8).
 
 ```sql
 workflow_engine_enqueue(
@@ -1509,14 +1528,17 @@ workflow_engine_enqueue(
 It writes exactly what `run.create` writes, in the same order — the idempotency
 key, the run, the `workflow:created` outbox event — and leaves the run `PENDING`
 for `run.claimPending`. Both paths store optional `tenantId` and `labels`
-(the SQL parameters default to NULL), attribute the key to the run, and send
+(the SQL parameters default to NULL). Labels form a flat string map whose
+keys may use ordinary strings such as `constructor`. Both paths reject
+`__proto__` because some Prisma versions discard it. Label keys and values
+use well-formed Unicode without null characters. Both attribute the key
+to the run and send
 its ID to `workflow_engine_runs` when the transaction commits. Replaying one
 key returns the same run ID without a new notification. Rollback discards
-the notification.
-
-The migration replaces the old seven-argument signature in a transaction. Its
-callers can keep omitting the two trailing arguments. Re-grant `EXECUTE` on
-the nine-argument signature before committing if the old one had role grants.
+the notification. A caller-owned PostgreSQL transaction view can forward
+either a raw query or a raw execute method. A view with only model delegates
+can create runs with definition versioning disabled. Hosts discover these
+runs through polling.
 
 `sql-enqueue.test.ts` (gated on `DATABASE_URL`) creates one run each way and
 asserts the rows, idempotency results and outbox events agree, and that both

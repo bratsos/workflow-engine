@@ -357,38 +357,57 @@ On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/cont
 
 ### Tenant attribution and SQL enqueue
 
-Add the nullable attribution columns and indexes before deploying the new
-clients. Existing rows have NULL in the new columns. Keep `ai_calls.prompt`
-and `ai_calls.response` required so older clients can still read every row.
-Use an empty string when a text value is omitted or cleared on expiry.
-`labels` has its own column, leaving the legacy metadata shim intact.
+Add the nullable attribution columns and indexes before deploying clients
+that write them. Existing rows keep NULL in the new columns. Keep
+`ai_calls.prompt` and `ai_calls.response` required. Store an empty string when
+text is omitted or expires. `labels` has its own column alongside metadata.
 
-The additive schema is rolling-safe with fresh connections or with prepared
-statement caching disabled. For PostgreSQL Prisma 6, stop old hosts first
-and close their cached connections before the migration, or roll them onto
-`statement_cache_size=0` ahead of it. The old run claim uses `RETURNING *`.
-A cached claim across the schema change fails with PostgreSQL `0A000`
-(`cached plan must not change result type`) until the connection is recycled.
+#### PostgreSQL column and index upgrade
 
-Use the updated schema or contract for your Prisma major. The SQL below
-adds the columns in a hand-written PostgreSQL migration.
+The additive upgrade is rolling-safe for old clients with compatible prepared
+statements. The online procedure can briefly delay traffic on the table being
+altered. It commits each table's metadata-only `ALTER TABLE` before touching
+the next table and builds indexes concurrently so ordinary reads and writes
+can continue. PostgreSQL waits at most 500 ms per lock attempt for each
+`ALTER TABLE`. A long transaction on one table can cause that step to fail
+with SQLSTATE `55P03`.
 
-```sql
-ALTER TABLE "workflow_runs"
-  ADD COLUMN IF NOT EXISTS "tenantId" TEXT,
-  ADD COLUMN IF NOT EXISTS "labels" JSONB;
-ALTER TABLE "ai_calls"
-  ADD COLUMN IF NOT EXISTS "workflowRunId" TEXT,
-  ADD COLUMN IF NOT EXISTS "tenantId" TEXT,
-  ADD COLUMN IF NOT EXISTS "labels" JSONB,
-  ADD COLUMN IF NOT EXISTS "textExpiresAt" TIMESTAMP(3);
-ALTER TABLE "idempotency_keys"
-  ADD COLUMN IF NOT EXISTS "workflowRunId" TEXT;
+On Prisma 6 with the default statement cache, **stop old hosts first** and
+close their cached connections. Keep them stopped across the schema change.
+For a rolling upgrade, roll those hosts onto `statement_cache_size=0` before
+running any DDL. An old claim uses `RETURNING *`. If it warms a cached plan
+before the column change, subsequent claims on that connection fail with
+`0A000` until it is recycled. Prisma 7 and Prisma 8 use fresh statements for
+this claim.
+
+Run the shipped PostgreSQL upgrade against the engine schema. Each `ALTER`
+has its own transaction. The six `CREATE INDEX CONCURRENTLY` statements follow
+outside any transaction block.
+
+```bash
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+  -f node_modules/@bratsos/workflow-engine/sql/tenant-attribution.sql
 ```
 
-On SQLite, add each column in its own statement. Use the declared types from
-your major's schema. Prisma 6 and 7 use `JSONB` for labels and `DATETIME` for
-`textExpiresAt`. Prisma 8 uses `TEXT` for both through its SQLite codecs.
+Use the same transaction boundaries if you incorporate these statements into
+your own migration. Configure your migration runner to stop on errors and
+allow concurrent index builds to run outside transaction blocks.
+
+If the command exits on `55P03`, let the blocking transaction finish and
+rerun the script. Completed table steps and indexes are reusable. A failed
+or canceled concurrent build can leave an invalid index. The script checks
+all six indexes before returning success. If it reports an invalid index,
+inspect its state in `pg_index` or `\d` in psql. Drop only the invalid index
+with `DROP INDEX CONCURRENTLY` outside a transaction, then rerun. Deploy the
+updated schema or contract and clients after the script succeeds and the
+optional enqueue upgrade below is complete.
+
+#### SQLite column and index upgrade
+
+Use the updated schema or contract for your Prisma major. For hand-written
+SQL, add each column in its own statement. Prisma 6 and 7 use `JSONB` for
+labels and `DATETIME` for `textExpiresAt`. For Prisma 8 substitute `TEXT` for
+both types.
 
 ```sql
 ALTER TABLE "workflow_runs" ADD COLUMN "tenantId" TEXT;
@@ -400,12 +419,9 @@ ALTER TABLE "ai_calls" ADD COLUMN "textExpiresAt" DATETIME;
 ALTER TABLE "idempotency_keys" ADD COLUMN "workflowRunId" TEXT;
 ```
 
-Create the following indexes on either database. Prisma 8 PostgreSQL users
-who generate a migration can set the sort directions for the new run index
-the same way as the other indexes in `mixed-order-indexes.sql`. On Prisma 8
-SQLite, the contract emits an ascending index. Scanning it backwards serves
-the same descending order within one tenant. To declare the directions in a
-hand-written migration, use the definition below.
+Create the six indexes below in your SQLite migration. The Prisma 8 contract
+emits an ascending tenant index. A reverse scan serves descending order
+within one tenant.
 
 ```sql
 CREATE INDEX IF NOT EXISTS "workflow_runs_tenantId_createdAt_id_idx"
@@ -419,27 +435,59 @@ CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
 CREATE INDEX IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys" ("createdAt");
 ```
 
-If you installed PostgreSQL's `workflow_engine_enqueue`, include the body of
-the new `sql/enqueue.sql` after the schema changes in the same migration. Use
-one transaction for the upgrade. If your migration already wraps its SQL in
-a transaction, omit the script's outer `BEGIN` and `COMMIT`. The new script
-drops the seven-argument function and creates the nine-argument function
-with two trailing defaults. Existing calls that omit the new parameters
-still work. Update any application wrapper that supplies the new parameters
-in the same migration.
+#### Replace an existing PostgreSQL enqueue function
 
-`DROP FUNCTION` drops the old signature's privileges. Restore your
-`EXECUTE` grants on the new signature before committing. This example grants
-execution to an application role named `app_role`.
+After the column and index script succeeds, replace the optional enqueue
+function in a separate transaction. Its trailing defaults preserve valid
+seven-argument calls. PostgreSQL reports SQLSTATE `2BP01` when an object
+has a catalog dependency on the old signature. This includes views and
+SQL-language functions defined with a `RETURN` or `BEGIN ATOMIC` body.
+Check for direct dependents in the same schema search path you use to
+install the function.
 
 ```sql
+SELECT pg_describe_object(classid, objid, objsubid) AS dependent
+FROM pg_depend
+WHERE refclassid = 'pg_proc'::regclass
+  AND refobjid = to_regprocedure(
+    'workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)'
+  );
+```
+
+Save definitions, owners and ACLs. Inspect dependents of the listed objects
+as well. Put explicit drops in `before-enqueue.sql` in dependent-first order.
+Put recreation in `after-enqueue.sql` in dependency-first order. Use
+non-cascading drops so any dependency you missed aborts the upgrade. Recreate
+tracked wrappers even when their call text still passes seven arguments.
+
+Add the old function's `EXECUTE` grants and any `PUBLIC` revocation to
+`after-enqueue.sql`. Check the intended ACL before committing the replacement.
+For a function restricted to `app_role`, those statements are as follows.
+
+```sql
+REVOKE EXECUTE ON FUNCTION
+  workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)
+  FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION
   workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)
   TO app_role;
 ```
 
-If your previous ACL revoked execution from `PUBLIC`, apply that revocation to
-the new signature in the same transaction.
+Prepare both companion files for your database before running this command.
+Use an empty file for a phase where your database needs no changes.
+
+```bash
+# Upgrade only after writing the dependency and ACL statements for this database.
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+  -c "SET LOCAL lock_timeout = '500ms'" \
+  -f before-enqueue.sql \
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  -f after-enqueue.sql
+```
+
+On error, psql exits nonzero and the previous function and its ACL remain
+in place. Resolve a reported dependency or lock conflict before retrying.
+Use the same atomic sequence in a migration runner that stops on SQL errors.
 
 Custom persistence adapters receive the run ID as the fourth argument to
 `completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument
