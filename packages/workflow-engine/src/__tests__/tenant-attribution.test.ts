@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { APICallError } from "@ai-sdk/provider";
 import { stepCountIs } from "ai";
@@ -295,16 +296,28 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
   let db: KernelDatabase;
   beforeAll(async () => {
     db = await kernelDatabase();
+    // The retention indexes and eligibility a production installation adds.
+    const dialect = sqlite ? "sqlite" : "postgresql";
+    for (const [file, separator] of [
+      ["retention-indexes", ";"],
+      ["retention-eligibility", "-- statement-breakpoint"],
+    ] as const) {
+      const ddl = await readFile(
+        new URL(`../../sql/${file}.${dialect}.sql`, import.meta.url),
+        "utf8",
+      );
+      for (const statement of ddl.split(separator)) {
+        if (statement.trim()) await db.client.$executeRawUnsafe(statement);
+      }
+    }
   }, 120_000);
   beforeEach(() => db.reset());
   afterAll(() => db?.close());
 
-  it.each([
-    "none",
-    "full",
-  ] as const)("attributes every call and applies the %s text policy", async (store) => {
+  // One call through every path that writes a row, with text in each.
+  const everyPathModel = () => {
     let requests = 0;
-    const model = new MockLanguageModelV4({
+    return new MockLanguageModelV4({
       async doGenerate() {
         if (requests++ > 0) throw new Error("error body marker");
         return {
@@ -330,19 +343,8 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         };
       },
     });
-    const ttlMs = 60_000;
-    const before = Date.now();
-    const ai = createAIHelper(
-      "accounting",
-      db.aiLogger,
-      undefined,
-      () => model,
-      {
-        adapter,
-        attribution,
-        text: { store, ttlMs },
-      },
-    );
+  };
+  const writeEveryPath = async (ai: AIHelper) => {
     await ai.generateText(modelKey, "request marker", {
       tools: {
         inspect: {
@@ -391,6 +393,27 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       },
     ]);
     ai.recordCall(manual);
+  };
+
+  it.each([
+    "none",
+    "full",
+  ] as const)("attributes every call and applies the %s text policy", async (store) => {
+    const model = everyPathModel();
+    const ttlMs = 60_000;
+    const before = Date.now();
+    const ai = createAIHelper(
+      "accounting",
+      db.aiLogger,
+      undefined,
+      () => model,
+      {
+        adapter,
+        attribution,
+        text: { store, ttlMs },
+      },
+    );
+    await writeEveryPath(ai);
     expect(await ai.flush()).toEqual({ failed: 0, pending: 0 });
     const rows = await db.client.aICall.findMany({
       where: { tenantId: attribution.tenantId },
@@ -451,6 +474,116 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       estimatedCost: null,
       costSource: "reported",
     });
+  });
+
+  const markers = [
+    "request marker",
+    "response marker",
+    "tool input marker",
+    "tool output marker",
+    "instructions marker",
+    "error body marker",
+  ];
+
+  it("clears every text field a TTL covers when engine.prune runs", async () => {
+    const model = everyPathModel();
+    const ai = createAIHelper(
+      "accounting",
+      db.aiLogger,
+      undefined,
+      () => model,
+      { adapter, attribution, text: { store: "full", ttlMs: 60_000 } },
+    );
+    await writeEveryPath(ai);
+    expect(await ai.flush()).toEqual({ failed: 0, pending: 0 });
+    const where = { tenantId: attribution.tenantId };
+    const kernel = db.makeKernel({ services: { aiLogger: db.aiLogger } });
+    expect(
+      await kernel.dispatch({
+        type: "engine.prune",
+        aiCallText: { now: new Date() },
+      }),
+    ).toMatchObject({ aiCallText: 0 });
+    expect(
+      await kernel.dispatch({
+        type: "engine.prune",
+        aiCallText: { now: new Date(Date.now() + 120_000) },
+      }),
+    ).toMatchObject({ aiCallText: 11 });
+    const rows = await db.client.aICall.findMany({ where });
+    expect(rows).toHaveLength(11);
+    for (const row of rows) {
+      expect(row).toMatchObject({
+        prompt: "",
+        response: "",
+        textExpiresAt: null,
+      });
+      expect(row.metadata ?? {}).not.toHaveProperty("instructions");
+      for (const marker of markers) {
+        expect(JSON.stringify(row)).not.toContain(marker);
+      }
+    }
+  });
+
+  it("erases every row a run's stage helpers wrote when the run is purged", async () => {
+    const model = everyPathModel();
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await writeEveryPath(ctx.ai);
+        // A library given the stage logger, and a direct write.
+        await createAIHelper("library", ctx.aiLogger, undefined, () => model)
+          .batch(modelKey, "openrouter")
+          .recordResults("batch-2", [
+            {
+              id: "item-3",
+              status: "succeeded",
+              prompt: "request marker",
+              result: "response marker",
+              inputTokens: 1,
+              outputTokens: 1,
+            },
+          ]);
+        await ctx.aiLogger.logCall({
+          ...manual,
+          modelId: manual.modelKey,
+          topic: "direct",
+        });
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, {
+            ...options,
+            adapter,
+            text: { store: "full", ttlMs: 60_000 },
+          }),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    await kernel.flush();
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
+    expect(await db.client.aICall.count({ where: { workflowRunId } })).toBe(13);
+    const purged = await kernel.dispatch({
+      type: "run.purge",
+      workflowRunIds: [workflowRunId],
+    });
+    expect(purged).toMatchObject({
+      removed: { runs: 1, aiCalls: 13 },
+      skipped: [],
+      incomplete: [],
+    });
+    expect(await db.client.aICall.count()).toBe(0);
   });
 
   it("totals a half-open tenant period and groups by opaque label values", async () => {
