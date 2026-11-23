@@ -653,7 +653,7 @@ where present. For older `job.execute` keys, the original job ID binds a
 
   `services.ai` is optional; the default builds `createAIHelper` per stage. Pass your own factory to install an `AIAdapter` (local CLI, proxy, recorded fixtures) — it is the *only* way an adapter reaches `ctx.step.ai`. `createKernel` also takes `spillThresholdBytes` (default 64 KiB) for the step-result claim check; see `15-large-payloads.md`.
 
-- [ ] **Update the AI SDK peer range.** 1.0 targets AI SDK 7. `ai@^7`, `@ai-sdk/google@^4` and `@openrouter/ai-sdk-provider@^3` are regular dependencies of the package, so they come with it — but any `ai` your own code imports (an `Output.object(...)`, a hand-built `streamText`) must be on `^7` too, or two copies coexist. The optional peers are `@ai-sdk/anthropic@>=4.0.46` / `@ai-sdk/openai@>=4.0.53` for native batching, and `zod@^4.1.12` / `@prisma/client@>=6` are unchanged. Automatic fallback without the vendor SDK uses the default OpenRouter URL and `OPENROUTER_API_KEY`. Select `openrouter` explicitly to supply its URL or key.
+- [ ] **Update the AI SDK peer range.** 1.0 targets AI SDK 7. `ai@^7`, `@ai-sdk/google@^4` and `@openrouter/ai-sdk-provider@^3` are regular dependencies of the package, so they come with it — but any `ai` your own code imports (an `Output.object(...)`, a hand-built `streamText`) must be on `^7` too, or two copies coexist. The optional peers are `@ai-sdk/anthropic@>=4.0.46` / `@ai-sdk/openai@>=4.0.53` for native batching, and `zod@^4.1.12` / `@prisma/client@>=6` are unchanged. Automatic fallback without the vendor SDK carries the client's batch options. With a provider policy, fallback requires an unset `baseURL` or the canonical OpenRouter base URL.
 
   ```bash
   npm install ai@^7 zod@^4

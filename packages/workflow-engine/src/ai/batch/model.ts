@@ -2,6 +2,13 @@ import { z } from "zod";
 import type { OpenRouterRoutingOptions } from "../shared";
 import type { AIBatchProvider } from "../types";
 
+export const batchBaseURLs = {
+  anthropic: "https://api.anthropic.com/v1",
+  google: "https://generativelanguage.googleapis.com/v1beta",
+  openai: "https://api.openai.com/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+} as const satisfies Record<AIBatchProvider, string>;
+
 /** Versioned, JSON-serializable handle. Safe to persist in suspendedState. */
 export interface EngineBatchRef {
   readonly version: 1;

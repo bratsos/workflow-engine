@@ -511,9 +511,9 @@ import type { EngineBatchRef } from "./batch/model";
 export type AIBatchProvider = "google" | "anthropic" | "openai" | "openrouter";
 
 export interface BatchOptions {
-  /** Credential for the configured provider. */
+  /** Credential supplied to the batch transport. */
   apiKey?: string;
-  /** Base URL for the configured provider. */
+  /** Batch API URL. Fallback and saved-ref operations check it under a provider policy. */
   baseURL?: string;
   fetch?: typeof globalThis.fetch;
   endpoint?:

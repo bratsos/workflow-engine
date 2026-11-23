@@ -723,7 +723,7 @@ interface BatchOptions {
 }
 ```
 
-`apiKey` and `baseURL` apply to the configured provider. If a saved ref names another provider, polling, collecting and cancelling use that provider's default URL and environment credential. Create a client configured for the saved provider to use its custom URL or injected key. The injected `fetch` applies across transports.
+Polling, collecting and cancelling use the provider named by the saved refs and carry the current client options. With a provider policy, a noncanonical `baseURL` for that provider makes these operations use its default URL and environment credential. A matching or unset URL preserves the inline key. The injected `fetch` applies in every case.
 
 ### Batch Request Configuration (`AIBatchRequest`)
 
@@ -785,7 +785,7 @@ const batch = ai.batch("gemini-2.5-flash", "google");
 const openrouterBatch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: myKey });
 ```
 
-Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` throws. If the native SDK is absent or exposes neither batch interface and OpenRouter supports the model, automatic fallback logs a WARN and uses the default OpenRouter URL and `OPENROUTER_API_KEY`. A native client's explicit `baseURL` or `apiKey` causes fallback to fail before fetch. Select `"openrouter"` explicitly to supply its settings.
+Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` throws. If the native SDK is absent or exposes neither batch interface and OpenRouter supports the model, automatic fallback logs a WARN and carries the client options. With a provider policy, fallback accepts an unset `baseURL` or `https://openrouter.ai/api/v1`. Other URLs cause refusal before fetch. The canonical URL checks ignore host case and trailing slashes.
 
 **Idempotent submits.** A `submit()` replayed after a crash (a durable `run` step whose lease expired) can create and bill a second batch. Inside `ctx.step.ai.map` the OpenAI and Google adapters stamp the step's external key into the batch (`metadata` / `displayName`) and a reclaimed submit adopts the batch it finds; Anthropic and OpenRouter carry no such field, so a reclaimed submit there throws `BatchNotAdoptableError` unless `batch: { onReclaim: "resubmit" }` accepts the duplicate cost. See 12-durable-steps.md.
 

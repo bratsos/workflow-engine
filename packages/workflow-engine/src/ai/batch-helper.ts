@@ -13,6 +13,7 @@ import {
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
+  batchBaseURLs,
   batchProviderFromRefProvider,
   type EngineBatchItemResult,
   type EngineBatchModel,
@@ -137,6 +138,18 @@ function toEpochMs(value: unknown): number | undefined {
   return undefined;
 }
 
+function matchesBatchBaseURL(
+  baseURL: string,
+  provider: AIBatchProvider | undefined,
+): boolean {
+  return (
+    provider !== undefined &&
+    baseURL
+      .replace(/^https:\/\/[^/]+/, (origin) => origin.toLowerCase())
+      .replace(/\/+$/, "") === batchBaseURLs[provider]
+  );
+}
+
 export class AIBatchImpl<T = string> implements AIBatch<T> {
   /**
    * Schemas keyed by batchId -> requestId, populated at submit() time.
@@ -176,13 +189,24 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     private readonly backend?: EngineBatchModel,
   ) {}
 
-  private transportOptions(provider: AIBatchProvider | undefined) {
-    const { apiKey, baseURL, fetch, endpoint } = this.options ?? {};
-    return {
-      fetch,
-      endpoint,
-      ...(provider === this.configuredProvider ? { apiKey, baseURL } : {}),
-    };
+  private optionsForRef(ref: EngineBatchRef) {
+    if (
+      this.ctx.routing?.provider === undefined ||
+      this.options === undefined
+    ) {
+      return this.options;
+    }
+    const options = { ...this.options };
+    if (
+      options.baseURL !== undefined &&
+      !matchesBatchBaseURL(
+        options.baseURL,
+        batchProviderFromRefProvider(ref.provider),
+      )
+    ) {
+      return { fetch: options.fetch, endpoint: options.endpoint };
+    }
+    return options;
   }
 
   /** A submission owns its transport, including its provider's request state. */
@@ -193,7 +217,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const provider = this.configuredProvider;
     if (provider === "openrouter") return this.createOpenRouterModel(forSubmit);
 
-    const { apiKey, baseURL, fetch } = this.transportOptions(provider);
+    const { apiKey, baseURL, fetch } = this.options ?? {};
     const nativeModelId = resolveModelForProvider(this.modelKey, provider);
     const warn = (message: string) => {
       if (this.batchLogFn) this.batchLogFn("WARN", message);
@@ -217,12 +241,20 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         getProviderModelId(this.modelKey, "openrouter") ??
         (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
       if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
-      if (baseURL !== undefined || apiKey !== undefined) {
+      const fallbackOptions = { ...this.options };
+      if (
+        this.ctx.routing?.provider !== undefined &&
+        fallbackOptions.baseURL !== undefined &&
+        !matchesBatchBaseURL(fallbackOptions.baseURL, "openrouter")
+      ) {
         throw new Error(
-          'Cannot fall back to OpenRouter when the native batch client sets baseURL or apiKey. Configure the OpenRouter batch transport explicitly with ai.batch(modelKey, "openrouter", options) or batch.provider: "openrouter".',
+          'Provider policy requires the canonical OpenRouter base URL for automatic fallback. Configure the OpenRouter batch transport explicitly with ai.batch(modelKey, "openrouter", options) or batch.provider: "openrouter".',
         );
       }
-      const openRouterModel = this.createOpenRouterModel(forSubmit);
+      const openRouterModel = this.createOpenRouterModel(
+        forSubmit,
+        fallbackOptions,
+      );
       const derived = modelConfig.batchModelId === undefined;
       warn(
         `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
@@ -235,13 +267,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
   }
 
-  private createOpenRouterModel(forSubmit: boolean): EngineBatchModel {
-    const options = this.transportOptions("openrouter");
+  private createOpenRouterModel(
+    forSubmit: boolean,
+    options = this.options,
+  ): EngineBatchModel {
+    const { apiKey: optionKey, baseURL, endpoint, fetch } = options ?? {};
     if (forSubmit)
-      openRouterBatchProvider(this.ctx.routing?.provider, options.endpoint);
+      openRouterBatchProvider(this.ctx.routing?.provider, endpoint);
     const modelConfig = getModel(this.modelKey);
     const apiKey =
-      options.apiKey ??
+      optionKey ??
       (typeof process !== "undefined"
         ? process.env?.OPENROUTER_API_KEY
         : undefined);
@@ -254,8 +289,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     return createOpenRouterBatchModel({
-      ...options,
       apiKey,
+      baseURL,
+      endpoint,
+      fetch,
       modelId: modelConfig.id,
       routing: this.ctx.routing,
     });
@@ -305,10 +342,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const batchModel =
       this.backend ??
       (first
-        ? await resolveBatchModelForRef(
-            first,
-            this.transportOptions(batchProviderFromRefProvider(first.provider)),
-          )
+        ? await resolveBatchModelForRef(first, this.optionsForRef(first))
         : await this.resolveDefaultModel());
     const provider =
       batchProviderFromRefProvider(batchModel.provider) ??

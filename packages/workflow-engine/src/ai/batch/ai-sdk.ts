@@ -24,6 +24,7 @@ import {
   toGoogleResponseSchema,
 } from "./google-json-schema";
 import {
+  batchBaseURLs,
   batchProviderFromRefProvider,
   type EngineBatchCancelResult,
   type EngineBatchItemResult,
@@ -641,7 +642,7 @@ async function resolveGoogleBatchModel(
     "google.generative-ai";
   const inner = fromAiSdkProvider(provider, { provider: providerId, modelId });
   const apiKey = resolveVendorApiKey("google", options);
-  const baseURL = options.baseURL ?? GOOGLE_BATCH_BASE_URL;
+  const baseURL = options.baseURL ?? batchBaseURLs.google;
   return {
     ...inner,
     // Gemini batch creation is explicitly not idempotent ("if you send the
@@ -686,10 +687,6 @@ async function resolveGoogleBatchModel(
   };
 }
 
-const GOOGLE_BATCH_BASE_URL =
-  "https://generativelanguage.googleapis.com/v1beta";
-const OPENAI_BATCH_BASE_URL = "https://api.openai.com/v1";
-
 /**
  * The key the vendor SDK would resolve for itself. Needed separately because
  * adoption lists batches over plain `fetch` rather than through the SDK.
@@ -731,7 +728,7 @@ async function resolveOpenAIBatchModel(
     (provider(modelId) as { provider?: string }).provider ?? "openai.responses";
   const inner = fromAiSdkProvider(provider, { provider: providerId, modelId });
   const apiKey = resolveVendorApiKey("openai", options);
-  const baseURL = options.baseURL ?? OPENAI_BATCH_BASE_URL;
+  const baseURL = options.baseURL ?? batchBaseURLs.openai;
   return {
     ...inner,
     recovery: "metadata" as const,

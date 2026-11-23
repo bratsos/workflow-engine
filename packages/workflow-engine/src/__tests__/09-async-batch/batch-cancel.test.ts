@@ -180,7 +180,10 @@ describe.each(vendors)("$vendor batch cancel", (v) => {
     });
   }
 
-  it("uses the saved provider's destination and credentials on cross-provider cancellation", async () => {
+  it.each([
+    false,
+    true,
+  ])("selects cross-provider cancellation options with a policy set to %s", async (withPolicy) => {
     const [key, host, credential] = (
       {
         openai: [
@@ -205,10 +208,24 @@ describe.each(vendors)("$vendor batch cancel", (v) => {
       current: () => v.body(v.active),
       cancelBody: v.cancelBody,
     });
+    const modelKey = `saved-${v.vendor}-batch`;
+    registerModels({
+      [modelKey]: {
+        id: `${v.vendor}/${v.modelId}`,
+        name: "Saved batch",
+        inputCostPerMillion: 1,
+        outputCostPerMillion: 2,
+        provider: "openrouter",
+        supportsAsyncBatch: true,
+      },
+    });
     const batch = createAIHelper(
       "batch-cancel",
       new InMemoryAICallLogger(),
-    ).batch("cancel-test-model", "openrouter", {
+      undefined,
+      undefined,
+      { routing: { provider: withPolicy ? { only: ["azure"] } : undefined } },
+    ).batch(modelKey, "openrouter", {
       baseURL: "https://router.example.test/api/v1",
       apiKey: "test-router-option",
       fetch: provider.fetchFn,
@@ -216,11 +233,20 @@ describe.each(vendors)("$vendor batch cancel", (v) => {
     await expect(
       batch.cancel!(v.ref.id, { batchRefs: [v.ref] }),
     ).resolves.toEqual([{ ref: v.ref, outcome: "cancelled" }]);
-    expect(provider.seen.map((call) => call.host)).toEqual([host, host]);
+    const expectedHost = withPolicy ? host : "router.example.test";
+    const expectedCredential = withPolicy
+      ? credential
+      : v.vendor === "openai"
+        ? "Bearer test-router-option"
+        : "test-router-option";
+    expect(provider.seen.map((call) => call.host)).toEqual([
+      expectedHost,
+      expectedHost,
+    ]);
     expect(
       provider.seen.map((call) => call.headers.get(v.authHeader[0])),
-    ).toEqual([credential, credential]);
-    expect(provider.calls()[1]).toBe(v.cancelCall);
+    ).toEqual([expectedCredential, expectedCredential]);
+    expect(provider.calls()[1]).toMatch(/(?:\/cancel|:cancel)$/);
   });
 
   it("reads the batch, then sends the documented cancel call", async () => {

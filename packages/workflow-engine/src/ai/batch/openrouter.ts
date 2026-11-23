@@ -9,6 +9,7 @@ import {
   sameProviderSlug,
 } from "../shared";
 import {
+  batchBaseURLs,
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -296,10 +297,7 @@ export function createOpenRouterBatchModel(
   // GET /api/v1/batches/{id} (https://openrouter.ai/docs/projects/docs/batch-quickstart).
   // The earlier default, /api/beta, is no longer in the documentation; pass
   // `baseURL` to keep using it.
-  const baseURL = (cfg.baseURL ?? "https://openrouter.ai/api/v1").replace(
-    /\/+$/,
-    "",
-  );
+  const baseURL = (cfg.baseURL ?? batchBaseURLs.openrouter).replace(/\/+$/, "");
   const fetchFn = cfg.fetch ?? globalThis.fetch;
   const endpoint = cfg.endpoint ?? "/v1/chat/completions";
 
