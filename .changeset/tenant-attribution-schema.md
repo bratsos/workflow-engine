@@ -1,0 +1,9 @@
+---
+"@bratsos/workflow-engine": minor
+---
+
+`run.create` accepts optional `tenantId` and `labels` and stores them on the run. The run schema indexes newest-first lookups within a tenant. The AI-call schema adds nullable `workflowRunId`, `tenantId`, `labels` and `textExpiresAt` with indexes for attribution and expiry. `prompt` and `response` stay required.
+
+Both create paths validate a flat map of string labels and reject the `__proto__` key consistently across Postgres and SQLite. SQL enqueue adds a nine-argument `workflow_engine_enqueue(..., p_tenant_id text, p_labels jsonb)` with no defaults. After the table upgrade, apply the new `sql/enqueue.sql`. It drops nothing: it creates the new overload, then replaces the released seven-argument function in place, keeping its signature, owner, ACL and dependent views or wrappers; its existing callers need no new `EXECUTE` grant. The new overload gets the database's default function ACL: grant `EXECUTE` on it to the roles that pass a tenant or labels. A role that writes engine tables through column-level grants also needs `INSERT ("tenantId", labels)` on `workflow_runs` and `UPDATE ("workflowRunId")` on `idempotency_keys` before the new function or engine is deployed; table-wide grants need nothing.
+
+**Rolling-safe with compatible prepared statements.** The PostgreSQL table upgrade uses separate 500 ms lock attempts and concurrent index builds. Old traffic may briefly wait on the table being altered. Apply the column and index steps before the optional enqueue function. Existing seven-argument calls, wrappers and grants keep working. On PostgreSQL Prisma 6, stop old hosts first and keep their cached connections closed across the schema change, or roll them onto `statement_cache_size=0` beforehand. A warmed `RETURNING *` plan otherwise fails after the result shape changes.

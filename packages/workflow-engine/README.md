@@ -170,6 +170,8 @@ model WorkflowRun {
   totalCost     Float          @default(0)
   totalTokens   Int            @default(0)
   priority      Int            @default(5)
+  tenantId      String?
+  labels        Json?
   metadata      Json?
 
   // Definition versioning. NULL means the run predates it and stays
@@ -183,7 +185,7 @@ model WorkflowRun {
   annotations   WorkflowAnnotation[]
 
   // List orderings. Every "recent runs" view -- the console's included --
-  // is newest-first, optionally narrowed by status or workflow, and pages
+  // is newest-first, optionally narrowed by status, workflow or tenant, and pages
   // on the keyset (createdAt, id), so the tiebreaker travels in the index
   // and a page is one index range scan with no sort node. These replace
   // the bare @@index([status]) / @@index([workflowId]): a composite whose
@@ -192,6 +194,7 @@ model WorkflowRun {
   @@index([createdAt(sort: Desc), id(sort: Desc)])
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
   @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
   // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
   // per host. The same shape job_queue already indexes, and it needs its
@@ -343,6 +346,10 @@ model AICall {
   inputTokens   Int
   outputTokens  Int
   cost          Float
+  workflowRunId String?
+  tenantId      String?
+  labels        Json?
+  textExpiresAt DateTime?
   metadata      Json?
 
   batchId      String?
@@ -351,6 +358,9 @@ model AICall {
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([tenantId, createdAt])
+  @@index([workflowRunId])
+  @@index([textExpiresAt])
   @@map("ai_calls")
 }
 
@@ -464,9 +474,12 @@ model IdempotencyKey {
   createdAt   DateTime @default(now())
   key         String
   commandType String
+  workflowRunId String?
   result      Json
 
   @@unique([key, commandType])
+  @@index([workflowRunId])
+  @@index([createdAt])
   @@map("idempotency_keys")
 }
 
@@ -497,7 +510,7 @@ Prisma 7 sets the URL in `prisma.config.ts` (`defineConfig({ schema: "prisma/sch
 
 #### Prisma 8 database setup
 
-Prisma 8 has no `schema.prisma`, `generate`, `migrate dev` or `db push`. Copy the shipped contract, emit it, create the tables, then give five indexes their descending order, which a contract cannot express:
+Prisma 8 has no `schema.prisma`, `generate`, `migrate dev` or `db push`. Copy the shipped contract, emit it, create the tables, then give six indexes their descending order, which a contract cannot express:
 
 ```bash
 mkdir -p prisma
@@ -524,7 +537,7 @@ psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order
 npx prisma db verify --strict
 ```
 
-Keep the contract's `TimestampString(3)` timestamps and its native `Status` enum: the engine's raw SQL depends on both, and `fromPrisma8` throws at construction when they are missing. The SQL file needs `psql` installed where you run it. Prisma 8 cannot see sort direction, so `db verify --strict` passes without the descending indexes (check with `\d` in `psql`), and you re-apply `mixed-order-indexes.sql` after anything that recreates one of the five indexes (renaming one, or dropping and recreating it). Without them, with every pending row at the default priority, a job claim took 51.6 ms at 100,000 pending jobs against 0.03 ms. A PostgreSQL database created with Prisma 6 or 7 needs `prisma db sign` instead of `db init` and not the SQL file: its tables do not change. The full guide, including PostgreSQL adoption, migrations and the console, is [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8).
+Keep `TimestampString(3)` timestamps and a native PostgreSQL status enum in the contract. If you rename the enum, pass its name as `statusEnumName` to `createPrismaWorkflowPersistence`. The SQL file needs `psql` installed where you run it. Prisma 8 cannot see sort direction, so `db verify --strict` passes without the descending indexes (check with `\d` in `psql`), and you re-apply `mixed-order-indexes.sql` after anything that recreates one of the six indexes (renaming one, or dropping and recreating it). Without them, with every pending row at the default priority, a job claim took 51.6 ms at 100,000 pending jobs against 0.03 ms. A PostgreSQL database created with Prisma 6 or 7 needs `prisma db sign` instead of `db init` and not the SQL file: its tables do not change. The full guide, including PostgreSQL adoption, migrations and the console, is [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8).
 
 For SQLite on Prisma 6 or 7, convert the complete shipped `prisma/schema.prisma` for SQLite: remove the native `Status` enum and `@db.Text`, convert the three status fields to `String`, and change `WorkflowRun.config` to `@default(dbgenerated("'{}'"))`. Prisma 6 uses its native client with `connection_limit=1`; Prisma 7 uses `@prisma/adapter-better-sqlite3@7.10.1`. The [full clean-room setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8) includes the conversion script and cross-platform absolute SQLite URL handling that preserves spaces and Unicode in file paths.
 
@@ -1166,7 +1179,7 @@ With a registry built by `createWorkflowRegistry`, a host claims and polls only 
 
 ### Enqueue from SQL
 
-`sql/enqueue.sql` (shipped in the package; apply it in your own migration after the engine's tables exist) defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)`, so a trigger or a non-TypeScript service creates a run inside its own transaction:
+`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)` and a nine-argument form that adds `tenant_id` and `labels` and takes all nine. Install it after creating the engine tables; the same file upgrades the released function in place and keeps its grants. Existing callers need no new `EXECUTE` grant; grant it on the nine-argument form to the roles that pass a tenant or labels. A role limited to column-level table grants also needs the two column grants in the migration guide. A trigger or a non-TypeScript service can then create a run in its own transaction.
 
 ```sql
 PERFORM workflow_engine_enqueue(

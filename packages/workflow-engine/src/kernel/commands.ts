@@ -43,6 +43,8 @@ export interface RunCreateCommand {
   readonly input: Record<string, unknown>;
   readonly config?: Record<string, unknown>;
   readonly priority?: number;
+  readonly tenantId?: string;
+  readonly labels?: Record<string, string>;
   /**
    * Annotations to attach at run creation time. Each entry becomes one
    * row per attribute, sharing the supplied envelope (actor / payload /

@@ -109,11 +109,12 @@ async function deliverSignal(
       await tx.appendOutboxEvents(
         toOutboxEvents(command.workflowRunId, [event]),
       );
-      await tx.completeIdempotencyKey(key, SIGNAL_WAKE, {
-        signalled: true,
-        delivery,
-        row,
-      });
+      await tx.completeIdempotencyKey(
+        key,
+        SIGNAL_WAKE,
+        { signalled: true, delivery, row },
+        command.workflowRunId,
+      );
     });
     return {
       signalled: true as const,

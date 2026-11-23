@@ -91,7 +91,7 @@ const result = await kernel.dispatch({
 ```
 
 The key kernel commands are:
-* **`run.create`**: Creates a pending run record, pinned to the workflow's current definition version.
+* **`run.create`** creates a pending run pinned to the workflow's current definition version. Pass optional `tenantId` and `labels` to store an opaque tenant ID and a map of string labels on the run.
 * **`run.claimPending`**: Scans for and claims pending runs this build serves, then enqueues their first-stage jobs (after the claim commits).
 * **`job.execute`**: Executes a single stage (runs `execute()`). Takes the job's `attempt`/`maxAttempts` to decide `willRetry`, and an optional `abortSignal` that becomes `ctx.abortSignal`.
 * **`job.heartbeat`**: One beat of a host's job lease heartbeat: renews the lease and reports the run's status and whether the worker still holds the job, which is what the host aborts `ctx.abortSignal` from.

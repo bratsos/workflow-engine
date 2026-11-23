@@ -13,10 +13,50 @@ import { recordDefinitionVersion } from "../helpers/definition-pinning.js";
 import { buildAnnotationEvents } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
+// PostgreSQL jsonb requires well-formed Unicode and cannot store U+0000.
+const isLabelText = (value: string) =>
+  value.isWellFormed() && !value.includes("\0");
+
+function validateLabels(labels: unknown): Record<string, string> | undefined {
+  if (labels === undefined) return undefined;
+  const error = () =>
+    new TypeError(
+      "labels must be a plain object with string values, well-formed Unicode, and no null characters or __proto__ key",
+    );
+  if (labels === null || typeof labels !== "object") throw error();
+  // Any realm's Object.prototype has a null prototype; arrays, dates and
+  // class instances do not.
+  const prototype = Object.getPrototypeOf(labels);
+  if (prototype !== null && Object.getPrototypeOf(prototype) !== null) {
+    throw error();
+  }
+
+  // Take a snapshot of the JSON data. Inherited properties and accessors
+  // cannot affect what the persistence adapter serializes after an await.
+  const validated: Record<string, string> = {};
+  for (const key of Reflect.ownKeys(labels)) {
+    const property = Object.getOwnPropertyDescriptor(labels, key);
+    if (
+      typeof key !== "string" ||
+      key === "__proto__" ||
+      !isLabelText(key) ||
+      !property?.enumerable ||
+      typeof property.value !== "string" ||
+      !isLabelText(property.value)
+    ) {
+      throw error();
+    }
+    validated[key] = property.value;
+  }
+  return validated;
+}
+
 export async function handleRunCreate(
   command: RunCreateCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<RunCreateResult>> {
+  const labels = validateLabels(command.labels);
+
   // 1. Get workflow from registry
   const workflow = deps.registry.getWorkflow(command.workflowId);
   if (!workflow) {
@@ -61,6 +101,8 @@ export async function handleRunCreate(
     config: mergedConfig,
     priority,
     definitionVersion,
+    tenantId: command.tenantId,
+    labels,
   });
 
   // 8. Attach run-creation annotations, if any (atomic with createRun

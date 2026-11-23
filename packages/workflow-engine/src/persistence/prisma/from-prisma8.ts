@@ -2474,7 +2474,7 @@ function validate(models: Record<string, Model>) {
       }
     } else if (model.cols.status?.codecId !== ENUM) {
       fail(
-        `${table}.status must be a native Postgres enum named "Status" (native_enum Status and pg.enum(Status), as in contract.prisma): the engine's raw SQL casts to ::"Status".`,
+        `${table}.status must be a native Postgres enum. Declare it with native_enum and reference it with pg.enum(...) as in contract.prisma. For a custom name, pass statusEnumName to createPrismaWorkflowPersistence.`,
       );
     }
   }

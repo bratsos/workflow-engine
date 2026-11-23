@@ -19,7 +19,7 @@ The first real-world runs of the 1.0 alphas also found and fixed behaviour that 
 
 Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13.0 and 1.0.0, plus every column the 1.0 Prisma adapters write. Apply in order; every statement is idempotent on Postgres (`IF NOT EXISTS`).
 
-On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the five descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the six descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
 
 - [ ] **Add the `workflow_steps` table** (new in 1.0; used by `createPrismaStepLedger`).
 
@@ -354,6 +354,150 @@ On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/cont
   CREATE INDEX CONCURRENTLY IF NOT EXISTS "outbox_events_dlqAt_idx"
     ON "outbox_events" ("dlqAt");
   ```
+
+### Tenant attribution and SQL enqueue
+
+Add the nullable attribution columns and indexes before deploying clients
+that write them. Existing rows keep NULL in the new columns. Keep
+`ai_calls.prompt` and `ai_calls.response` required. Store an empty string when
+text is omitted or expires. `labels` has its own column alongside metadata.
+
+#### PostgreSQL column and index upgrade
+
+The additive upgrade is rolling-safe for old clients with compatible prepared
+statements. The online procedure can briefly delay traffic on the table being
+altered. It commits each table's metadata-only `ALTER TABLE` before touching
+the next table and builds indexes concurrently so ordinary reads and writes
+can continue. PostgreSQL waits at most 500 ms per lock attempt for each
+`ALTER TABLE`. A long transaction on one table can cause that step to fail
+with SQLSTATE `55P03`.
+
+On Prisma 6 with the default statement cache, **stop old hosts first** and
+close their cached connections. Keep them stopped across the schema change.
+For a rolling upgrade, roll those hosts onto `statement_cache_size=0` before
+running any DDL. An old claim uses `RETURNING *`. If it warms a cached plan
+before the column change, subsequent claims on that connection fail with
+`0A000` until it is recycled. Prisma 7 and Prisma 8 use fresh statements for
+this claim.
+
+Run the shipped PostgreSQL upgrade against the engine schema. Each `ALTER`
+has its own transaction. The six `CREATE INDEX CONCURRENTLY` statements follow
+outside any transaction block.
+
+psql takes a libpq connection string, not the application's Prisma URL.
+Remove Prisma-only parameters such as `schema`, `connection_limit` and
+`statement_cache_size`. For a non-public engine schema, select it with
+`PGOPTIONS='-c search_path=<schema>'` on both psql commands in this section.
+
+```bash
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+  -f node_modules/@bratsos/workflow-engine/sql/tenant-attribution.sql
+```
+
+Use the same transaction boundaries if you incorporate these statements into
+your own migration. Configure your migration runner to stop on errors and
+allow concurrent index builds to run outside transaction blocks.
+
+If the command exits on `55P03`, let the blocking transaction finish and
+rerun the script. Completed table steps and indexes are reusable. Before
+returning success, the script checks that each of the six names is a valid
+index on the planned table. A failed or canceled concurrent build leaves an
+invalid index under the name. If the script reports an index, inspect it with
+`\d` in psql,
+drop it with `DROP INDEX CONCURRENTLY` outside a transaction, then rerun. Deploy the
+updated schema or contract and clients after the script succeeds and the
+optional enqueue upgrade below is complete.
+
+#### SQLite column and index upgrade
+
+Use the updated schema or contract for your Prisma major. For hand-written
+SQL, add each column in its own statement. Prisma 6 and 7 use `JSONB` for
+labels and `DATETIME` for `textExpiresAt`. For Prisma 8 substitute `TEXT` for
+both types.
+
+```sql
+ALTER TABLE "workflow_runs" ADD COLUMN "tenantId" TEXT;
+ALTER TABLE "workflow_runs" ADD COLUMN "labels" JSONB;
+ALTER TABLE "ai_calls" ADD COLUMN "workflowRunId" TEXT;
+ALTER TABLE "ai_calls" ADD COLUMN "tenantId" TEXT;
+ALTER TABLE "ai_calls" ADD COLUMN "labels" JSONB;
+ALTER TABLE "ai_calls" ADD COLUMN "textExpiresAt" DATETIME;
+ALTER TABLE "idempotency_keys" ADD COLUMN "workflowRunId" TEXT;
+```
+
+Create the six indexes below in your SQLite migration. The Prisma 8 contract
+emits an ascending tenant index. A reverse scan serves descending order
+within one tenant.
+
+```sql
+CREATE INDEX IF NOT EXISTS "workflow_runs_tenantId_createdAt_id_idx"
+  ON "workflow_runs" ("tenantId", "createdAt" DESC, "id" DESC);
+CREATE INDEX IF NOT EXISTS "ai_calls_tenantId_createdAt_idx"
+  ON "ai_calls" ("tenantId", "createdAt");
+CREATE INDEX IF NOT EXISTS "ai_calls_workflowRunId_idx" ON "ai_calls" ("workflowRunId");
+CREATE INDEX IF NOT EXISTS "ai_calls_textExpiresAt_idx" ON "ai_calls" ("textExpiresAt");
+CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
+  ON "idempotency_keys" ("workflowRunId");
+CREATE INDEX IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys" ("createdAt");
+```
+
+#### Upgrade the PostgreSQL enqueue function
+
+After the column and index script succeeds, apply the new `sql/enqueue.sql`.
+The same file installs and upgrades, and it drops nothing:
+
+- It creates `workflow_engine_enqueue(..., p_tenant_id text, p_labels jsonb)`,
+  which takes all nine arguments and has no defaults.
+- It then replaces the released seven-argument function in place with
+  `CREATE OR REPLACE`. Its signature, defaults, owner, ACL and the views or
+  wrappers that depend on it stay as they are. Its body stores NULL tenant
+  and labels and does not call the new overload.
+
+No call can match both overloads, so existing calls keep resolving. Table
+names resolve through the caller's search path as before, also for triggers
+on the engine tables and after a schema rename. If a statement fails, the
+seven-argument function still works, released or replaced, and with
+`--single-transaction` nothing changes.
+
+The new overload gets the database's default function ACL, which lets
+`PUBLIC` execute it. Existing callers of the seven-argument function keep
+their `EXECUTE` access; only roles that pass a tenant or labels need it on the
+new overload. If you restricted the released function, restrict the new one
+in the same transaction:
+
+```bash
+# Omit both -c lines to keep the default ACL.
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
+  -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
+```
+
+A role that writes the engine tables through column-level grants, rather
+than table-wide `INSERT` and `UPDATE`, also needs two column grants after the
+column and index script and before `sql/enqueue.sql` or the new engine is
+deployed.
+Both SQL signatures write these columns, even with NULL tenant and labels.
+The engine writes `workflowRunId` whenever it completes an idempotency key,
+and `tenantId` and `labels` when `run.create` receives them:
+
+```sql
+GRANT INSERT ("tenantId", labels) ON workflow_runs TO app_role;
+GRANT UPDATE ("workflowRunId") ON idempotency_keys TO app_role;
+```
+
+Without them, replays still succeed but a new key fails with SQLSTATE
+`42501`. Table-wide grants need nothing.
+
+Without `ON_ERROR_STOP`, psql prints an error but exits 0, so automation
+cannot see the failure. `sql/enqueue.sql` requires PostgreSQL 13 or newer.
+
+Custom persistence adapters receive the run ID as the fourth argument to
+`completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument
+is `null` when the caller has no run ID. Existing keys need no backfill. To
+identify older keys that lack the column value, use `result->>'workflowRunId'`
+where present. For older `job.execute` keys, the original job ID binds a
+`job:<jobId>:attempt:` prefix while the job rows still exist.
 
 ### Custom port implementations
 

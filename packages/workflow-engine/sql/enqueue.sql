@@ -14,7 +14,23 @@
 -- This file is part of the schema, not something the engine creates at
 -- runtime: run it in your own migration, next to the tables it writes, so
 -- your migration history owns it. Apply it AFTER the workflow engine tables
--- exist. It is idempotent (CREATE OR REPLACE) and safe to re-run.
+-- exist. It is idempotent (CREATE OR REPLACE) and safe to re-run. The same
+-- file installs and upgrades.
+--
+-- It defines two overloads and drops nothing:
+--
+--   * workflow_engine_enqueue(..., p_tenant_id, p_labels) takes all nine
+--     arguments; it has no defaults, so no call can match both overloads.
+--     A new function gets the database's default function ACL: grant
+--     EXECUTE on it to the roles that pass a tenant or labels, and revoke it
+--     from PUBLIC if you restrict the seven-argument one.
+--   * The released seven-argument signature, with its defaults, replaced in
+--     place. It keeps its owner, ACL and the views or functions that depend
+--     on it. Its body is its own copy of the nine-argument body with NULL
+--     tenant and labels, so its callers need no new EXECUTE grant and it works
+--     whether or not the nine-argument statement succeeded.
+--
+-- Table names resolve through the caller's search path, as before.
 --
 -- Requires PostgreSQL 13+ (for the built-in gen_random_uuid()).
 --
@@ -83,10 +99,15 @@ CREATE OR REPLACE FUNCTION workflow_engine_enqueue(
   -- `p_workflow_id`, as `run.create` sets it.
   p_workflow_name      text,
   p_input              jsonb,
-  p_config             jsonb   DEFAULT '{}'::jsonb,
-  p_priority           integer DEFAULT 5,
+  -- NULL stores '{}'::jsonb.
+  p_config             jsonb,
+  -- NULL stores 5.
+  p_priority           integer,
   -- NULL creates the run unpinned. See note 2 above.
-  p_definition_version text    DEFAULT NULL
+  p_definition_version text,
+  -- NULL stores no tenant or labels. Labels are a flat map of strings.
+  p_tenant_id          text,
+  p_labels             jsonb
 ) RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -138,6 +159,15 @@ BEGIN
     RETURN v_existing ->> 'workflowRunId';
   END IF;
 
+  IF p_labels IS NOT NULL AND (
+    jsonb_typeof(p_labels) <> 'object' OR
+    p_labels ? '__proto__' OR
+    jsonb_path_exists(p_labels, 'strict $.* ? (@.type() != "string")')
+  ) THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: labels must be a JSON object with string values and no __proto__ key'
+      USING ERRCODE = '22023';
+  END IF;
+
   -- 2. A pinned run must name a definition that exists, or it is pinned to
   --    nothing and no host will ever serve it.
   IF p_definition_version IS NOT NULL THEN
@@ -159,12 +189,12 @@ BEGIN
   INSERT INTO "workflow_runs" (
     "id", "createdAt", "updatedAt", "workflowId", "workflowName",
     "workflowType", "status", "input", "config", "priority",
-    "definitionVersion"
+    "definitionVersion", "tenantId", "labels"
   ) VALUES (
     v_run_id, v_now, v_now, p_workflow_id, p_workflow_name,
-    p_workflow_id, 'PENDING'::"Status", p_input,
+    p_workflow_id, 'PENDING', p_input,
     COALESCE(p_config, '{}'::jsonb), COALESCE(p_priority, 5),
-    p_definition_version
+    p_definition_version, p_tenant_id, p_labels
   );
 
   -- 4. The first outbox event for this newly created run.
@@ -192,13 +222,158 @@ BEGIN
   -- 5. Record the result under the key, so a replay returns this run
   --    instead of creating another. Same shape as RunCreateResult.
   UPDATE "idempotency_keys"
-     SET "result" = jsonb_build_object(
-       'workflowRunId', v_run_id,
-       'status', 'PENDING',
-       'definitionVersion', p_definition_version
-     )
+     SET "workflowRunId" = v_run_id,
+         "result" = jsonb_build_object(
+           'workflowRunId', v_run_id,
+           'status', 'PENDING',
+           'definitionVersion', p_definition_version
+         )
    WHERE "key" = p_idempotency_key AND "commandType" = 'run.create';
 
+  PERFORM pg_notify('workflow_engine_runs', v_run_id);
+  RETURN v_run_id;
+END;
+$$;
+
+COMMENT ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) IS
+  'Create a PENDING workflow run in the caller''s transaction. Accepts optional tenant attribution and notifies workflow_engine_runs on commit. Mirrors run.create; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).';
+
+-- The released signature, replaced in place. Its body is the body above
+-- with p_tenant_id and p_labels declared as NULL constants, so it needs
+-- nothing else from this file; a test fails if the two bodies drift apart.
+CREATE OR REPLACE FUNCTION workflow_engine_enqueue(
+  p_idempotency_key    text,
+  p_workflow_id        text,
+  p_workflow_name      text,
+  p_input              jsonb,
+  p_config             jsonb   DEFAULT '{}'::jsonb,
+  p_priority           integer DEFAULT 5,
+  p_definition_version text    DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  p_tenant_id CONSTANT text  := NULL;
+  p_labels    CONSTANT jsonb := NULL;
+  v_existing jsonb;
+  v_run_id   text;
+  v_now      timestamp(3);
+BEGIN
+  IF p_idempotency_key IS NULL OR p_idempotency_key = '' THEN
+    RAISE EXCEPTION
+      'workflow_engine_enqueue: an idempotency key is required (run.create takes one too)';
+  END IF;
+  IF p_workflow_id IS NULL OR p_workflow_id = '' THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: a workflow id is required';
+  END IF;
+  IF p_input IS NULL THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: input must not be NULL (use ''{}''::jsonb)';
+  END IF;
+
+  v_now := (now() AT TIME ZONE 'UTC');
+
+  -- 1. Claim the idempotency key. The unique index on (key, commandType) is
+  --    what makes two concurrent callers agree on one run.
+  INSERT INTO "idempotency_keys" ("id", "createdAt", "key", "commandType", "result")
+  VALUES (
+    gen_random_uuid()::text,
+    v_now,
+    p_idempotency_key,
+    'run.create',
+    '{"__workflowEngineState":"in_progress"}'::jsonb
+  )
+  ON CONFLICT ("key", "commandType") DO NOTHING;
+
+  IF NOT FOUND THEN
+    SELECT "result" INTO v_existing
+      FROM "idempotency_keys"
+     WHERE "key" = p_idempotency_key AND "commandType" = 'run.create';
+
+    -- A marker left behind by a TypeScript dispatch that has not settled.
+    -- Refusing matches the engine's IdempotencyInProgressError rather than
+    -- creating a second run under a key that already owns one.
+    IF v_existing ? '__workflowEngineState' THEN
+      RAISE EXCEPTION
+        'workflow_engine_enqueue: run.create for idempotency key % is already in progress',
+        p_idempotency_key
+        USING ERRCODE = '55006';
+    END IF;
+
+    RETURN v_existing ->> 'workflowRunId';
+  END IF;
+
+  IF p_labels IS NOT NULL AND (
+    jsonb_typeof(p_labels) <> 'object' OR
+    p_labels ? '__proto__' OR
+    jsonb_path_exists(p_labels, 'strict $.* ? (@.type() != "string")')
+  ) THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: labels must be a JSON object with string values and no __proto__ key'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- 2. A pinned run must name a definition that exists, or it is pinned to
+  --    nothing and no host will ever serve it.
+  IF p_definition_version IS NOT NULL THEN
+    PERFORM 1
+       FROM "workflow_definitions"
+      WHERE "workflowId" = p_workflow_id
+        AND "version" = p_definition_version;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION
+        'workflow_engine_enqueue: no workflow_definitions row for (%, %); a version is registered by the TypeScript definition that computed it, so create one run from TypeScript first or pass NULL to create this run unpinned',
+        p_workflow_id, p_definition_version;
+    END IF;
+  END IF;
+
+  -- 3. The run itself. PENDING, for run.claimPending — this function
+  --    enqueues no job, exactly as run.create enqueues none.
+  v_run_id := gen_random_uuid()::text;
+
+  INSERT INTO "workflow_runs" (
+    "id", "createdAt", "updatedAt", "workflowId", "workflowName",
+    "workflowType", "status", "input", "config", "priority",
+    "definitionVersion", "tenantId", "labels"
+  ) VALUES (
+    v_run_id, v_now, v_now, p_workflow_id, p_workflow_name,
+    p_workflow_id, 'PENDING', p_input,
+    COALESCE(p_config, '{}'::jsonb), COALESCE(p_priority, 5),
+    p_definition_version, p_tenant_id, p_labels
+  );
+
+  -- 4. The first outbox event for this newly created run.
+  INSERT INTO "outbox_events" (
+    "id", "createdAt", "workflowRunId", "sequence", "eventType",
+    "payload", "causationId", "occurredAt"
+  ) VALUES (
+    gen_random_uuid()::text,
+    v_now,
+    v_run_id,
+    1,
+    'workflow:created',
+    jsonb_build_object(
+      'type', 'workflow:created',
+      -- The TypeScript payload carries a Date, which reaches jsonb as an
+      -- ISO-8601 string; this is that same encoding.
+      'timestamp', to_char(v_now, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'workflowRunId', v_run_id,
+      'workflowId', p_workflow_id
+    ),
+    p_idempotency_key,
+    v_now
+  );
+
+  -- 5. Record the result under the key, so a replay returns this run
+  --    instead of creating another. Same shape as RunCreateResult.
+  UPDATE "idempotency_keys"
+     SET "workflowRunId" = v_run_id,
+         "result" = jsonb_build_object(
+           'workflowRunId', v_run_id,
+           'status', 'PENDING',
+           'definitionVersion', p_definition_version
+         )
+   WHERE "key" = p_idempotency_key AND "commandType" = 'run.create';
+
+  PERFORM pg_notify('workflow_engine_runs', v_run_id);
   RETURN v_run_id;
 END;
 $$;

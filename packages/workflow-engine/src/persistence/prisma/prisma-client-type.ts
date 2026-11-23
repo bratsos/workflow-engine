@@ -119,7 +119,7 @@ export interface EnginePrismaClient {
   $queryRawUnsafe?<T = unknown>(query: string, ...values: any[]): Promise<T>;
   /**
    * Raw parameterized statement (tagged template). Optional.
-   * Used to configure the local planner in an outbox claim transaction.
+   * Used for transactional writes and PostgreSQL run notifications.
    */
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
   /** Raw SQL execution with positional parameters. */

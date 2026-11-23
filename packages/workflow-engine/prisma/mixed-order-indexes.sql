@@ -1,4 +1,4 @@
--- Companion to contract.prisma: the five indexes whose columns have a sort
+-- Companion to contract.prisma: the six indexes whose columns have a sort
 -- direction. A Prisma 8 contract cannot express one (the planner creates every
 -- column ascending), but the engine's queries need them:
 --   workflow_runs / job_queue claim: ORDER BY priority DESC, "createdAt" ASC
@@ -26,6 +26,9 @@ CREATE INDEX "workflow_runs_status_createdAt_id_idx" ON "workflow_runs" ("status
 
 DROP INDEX IF EXISTS "workflow_runs_workflowId_createdAt_id_idx";
 CREATE INDEX "workflow_runs_workflowId_createdAt_id_idx" ON "workflow_runs" ("workflowId", "createdAt" DESC, "id" DESC);
+
+DROP INDEX IF EXISTS "workflow_runs_tenantId_createdAt_id_idx";
+CREATE INDEX "workflow_runs_tenantId_createdAt_id_idx" ON "workflow_runs" ("tenantId", "createdAt" DESC, "id" DESC);
 
 DROP INDEX IF EXISTS "workflow_runs_status_priority_createdAt_idx";
 CREATE INDEX "workflow_runs_status_priority_createdAt_idx" ON "workflow_runs" ("status", "priority" DESC, "createdAt");
