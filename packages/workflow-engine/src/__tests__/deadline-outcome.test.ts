@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { JobRetry } from "../core/job-runtime.js";
 import { defineStage } from "../core/stage-factory.js";
 import { type StepApi, StepTimeoutError } from "../core/steps.js";
 import { WorkflowBuilder } from "../core/workflow.js";
@@ -64,11 +65,13 @@ describe.skipIf(!realDatabase)(
     async function start(
       execute: (step: StepApi) => Promise<string>,
       overrides: Partial<KernelConfig> = {},
+      jobRetry?: JobRetry,
     ) {
       const stage = defineStage({
         id: "try",
         name: "Try",
         schemas: { input, output, config: input },
+        jobRetry,
         async execute({ step }) {
           return { output: { branch: await execute(step) } };
         },
@@ -1330,6 +1333,43 @@ describe.skipIf(!realDatabase)(
       await t.execute();
       expect(await t.status()).toBe("COMPLETED");
       expect(await storedOutput(t)).toBe(stored);
+    });
+
+    it("bounds a configured poll retry backoff by the next opted-in deadline", async () => {
+      let failReplay = false;
+      const t = await start(
+        async (step) => {
+          if (failReplay) throw new Error("temporary replay failure");
+          const answer = await step.waitFor("answer", {
+            every: 100,
+            timeout: 10_000,
+            onTimeout: "return",
+            poll: async () => false,
+            ready: (value) => value,
+          });
+          return outcome(answer);
+        },
+        {},
+        { maxAttempts: 2, backoff: { initialDelayMs: 30_000 } },
+      );
+      const started = clock.now().getTime();
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      failReplay = true;
+      clock.set(new Date(started + 100));
+      await t.tick();
+      expect(await t.getStage()).toMatchObject({
+        status: "SUSPENDED",
+        errorMessage: "temporary replay failure",
+        nextPollAt: new Date(started + 10_000),
+      });
+
+      failReplay = false;
+      clock.set(new Date(started + 10_000));
+      await t.tick();
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe("timeout");
     });
 
     it("replays within the claim lease when a worker dies after opening a wait", async () => {

@@ -11,6 +11,11 @@
  */
 
 import { z } from "zod";
+import {
+  type JobRetryBackoff,
+  jobRetryBackoffSchema,
+  retryBackoffMs,
+} from "../../core/job-runtime.js";
 import { parseStepDuration, StageAbortedError } from "../../core/steps.js";
 import type {
   PurgeableRunStatus,
@@ -144,6 +149,7 @@ export interface HostJobMessage {
   stageId: string;
   attempt: number;
   maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp from `DequeueResult`, forwarded as the acknowledgement
@@ -217,14 +223,12 @@ const JobMessageSchema = z.object({
   stageId: z.string().min(1),
   attempt: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().optional(),
+  retryPolicy: jobRetryBackoffSchema.optional(),
   payload: z.record(z.string(), z.unknown()),
   startedAt: z.date().optional(),
 });
 
-/** The backoff the built-in transports apply before redelivering a retry. */
-export function retryBackoffMs(attempt: number): number {
-  return 2 ** Math.max(0, attempt) * 1000;
-}
+export { retryBackoffMs };
 
 /**
  * Dispatches `job.execute` for one job, holding a lease heartbeat for its
@@ -494,7 +498,9 @@ export async function executeJobWithHeartbeat(
     willRetry: canRetry,
     attempt: job.attempt,
     maxAttempts,
-    ...(canRetry ? { retryDelayMs: retryBackoffMs(job.attempt) } : {}),
+    ...(canRetry
+      ? { retryDelayMs: retryBackoffMs(job.attempt, job.retryPolicy) }
+      : {}),
   };
 }
 

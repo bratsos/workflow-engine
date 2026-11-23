@@ -456,7 +456,10 @@ export interface JobTransport {
    * Get all job rows for a workflow run (any status). Used to detect
    * pending/in-flight retries for a stage and to find orphaned job rows.
    */
-  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+  getJobsByWorkflowRun(
+    workflowRunId: string,
+    options?: { includePayload?: boolean },
+  ): Promise<JobRecord[]>;
 
   /** Refresh a running job's lease without changing status. */
   touchJob(jobId: string): Promise<void>;

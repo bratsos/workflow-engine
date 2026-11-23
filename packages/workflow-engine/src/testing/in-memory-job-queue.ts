@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from "crypto";
+import { retryBackoffMs } from "../core/job-runtime.js";
 import {
   type DequeueOptions,
   type DequeueResult,
@@ -197,7 +198,8 @@ export class InMemoryJobQueue implements JobQueue {
       startedAt: null,
       completedAt: null,
       attempt: 0,
-      maxAttempts: this.defaultMaxAttempts,
+      maxAttempts: options.maxAttempts ?? this.defaultMaxAttempts,
+      ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {}),
       lastError: null,
       nextPollAt: options.scheduledFor ?? null,
       payload: {
@@ -344,6 +346,7 @@ export class InMemoryJobQueue implements JobQueue {
       priority: job.priority,
       attempt: newAttempt,
       maxAttempts: job.maxAttempts,
+      ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
       payload,
       startedAt: now,
     };
@@ -500,6 +503,13 @@ export class InMemoryJobQueue implements JobQueue {
         ...job,
         status: "PENDING",
         lastError: error,
+        ...(job.retryPolicy
+          ? {
+              nextPollAt: new Date(
+                now.getTime() + retryBackoffMs(job.attempt, job.retryPolicy),
+              ),
+            }
+          : {}),
         workerId: null,
         lockedAt: null,
         updatedAt: now,

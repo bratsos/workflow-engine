@@ -10,6 +10,7 @@
  * cron triggers) around these methods.
  */
 
+import type { JobRetryBackoff } from "@bratsos/workflow-engine";
 import {
   assertTimerMs,
   createLogger,
@@ -139,6 +140,7 @@ export interface JobMessage {
   stageId: string;
   attempt: number;
   maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
   payload: Record<string, unknown>;
 }
 
@@ -160,7 +162,7 @@ export interface JobResult {
   /** The job attempt that ran (1 on the first execution). */
   attempt?: number;
   maxAttempts?: number;
-  /** Backoff before the retry (`2^attempt` seconds), when `willRetry`. */
+  /** Backoff before the retry, when `willRetry`. */
   retryDelayMs?: number;
 }
 
@@ -395,15 +397,7 @@ class ServerlessHostImpl implements ServerlessHost {
 
       // Storage was checked above. A second check here could throw after the
       // dequeue counted an attempt and leave the job unrun.
-      const result = await this.runJob({
-        jobId: job.jobId,
-        workflowRunId: job.workflowRunId,
-        workflowId: job.workflowId,
-        stageId: job.stageId,
-        attempt: job.attempt,
-        maxAttempts: job.maxAttempts,
-        payload: job.payload,
-      });
+      const result = await this.runJob(job);
 
       processed++;
       if (result.outcome === "failed") {

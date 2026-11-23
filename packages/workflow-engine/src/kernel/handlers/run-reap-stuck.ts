@@ -2,7 +2,10 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
-import { enqueueForLiveRun } from "../helpers/prepare-execution-group.js";
+import {
+  enqueueForLiveRun,
+  stageJobOptions,
+} from "../helpers/prepare-execution-group.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -104,6 +107,10 @@ export async function handleRunReapStuck(
           // See prepare-execution-group.ts: the version travels with the
           // job so the dequeue can filter on it.
           definitionVersion: run.definitionVersion,
+          ...stageJobOptions(
+            pinnedWorkflow,
+            pinnedWorkflow?.getStage(stage.stageId),
+          ),
         }));
         postCommits.push(async (postDeps: KernelDeps) => {
           await enqueueForLiveRun(postDeps, run.id, jobsToEnqueue);

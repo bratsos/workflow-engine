@@ -1,3 +1,5 @@
+import type { JobRetryBackoff } from "../core/job-runtime";
+
 /**
  * Persistence Interfaces for Workflow Engine
  *
@@ -394,6 +396,7 @@ export interface JobRecord {
   completedAt: Date | null;
   attempt: number;
   maxAttempts: number;
+  retryPolicy?: JobRetryBackoff | null;
   lastError: string | null;
   nextPollAt: Date | null;
   payload: Record<string, unknown>;
@@ -638,6 +641,8 @@ export interface EnqueueJobInput {
   priority?: number;
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
+  maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
   /**
    * Fairness group this job belongs to — typically a tenant id. Stored on
    * the payload as `_groupKey`; a transport with fairness enabled presents
@@ -663,6 +668,7 @@ export interface DequeueResult {
   priority: number;
   attempt: number;
   maxAttempts: number;
+  retryPolicy?: JobRetryBackoff;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp this claim wrote to `startedAt`. Hand it back as a
@@ -1444,7 +1450,10 @@ export interface JobQueue {
    * treat a FAILED stage with a queued retry as terminal) and to find
    * orphaned SUSPENDED job rows or PENDING stages missing a queued job.
    */
-  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+  getJobsByWorkflowRun(
+    workflowRunId: string,
+    options?: { includePayload?: boolean },
+  ): Promise<JobRecord[]>;
 
   /**
    * Refresh a running job's lease (`lockedAt`) without changing status.

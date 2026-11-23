@@ -12,6 +12,7 @@ import type { z } from "zod";
 import type { AIHelper } from "../ai/types.js";
 import type { AnnotationActor } from "../persistence/interface";
 import type { AICallLogger } from "../persistence/interface.js";
+import type { JobRuntimeOptions } from "./job-runtime";
 import type { StepApi } from "./steps";
 
 export type { StepApi } from "./steps";
@@ -275,7 +276,7 @@ export interface Stage<
   TConfig extends z.ZodTypeAny,
   TWorkflowContext = Record<string, unknown>,
   TId extends string = string,
-> {
+> extends JobRuntimeOptions {
   // Metadata
   id: TId;
   name: string;

@@ -720,8 +720,9 @@ export function createSpillingJobTransport(
       return { ...job, payload: await resolvePayload(job.payload) };
     },
 
-    async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
-      const jobs = await transport.getJobsByWorkflowRun(workflowRunId);
+    async getJobsByWorkflowRun(workflowRunId, options): Promise<JobRecord[]> {
+      const jobs = await transport.getJobsByWorkflowRun(workflowRunId, options);
+      if (options?.includePayload === false) return jobs;
       return Promise.all(
         jobs.map(async (job) => ({
           ...job,

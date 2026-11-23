@@ -31,6 +31,7 @@
  *    execution are distinguishable from those the rerun left behind.
  */
 
+import type { JobRuntimeOptions } from "../../core/job-runtime.js";
 import type { Workflow } from "../../core/workflow.js";
 import type { EnqueueJobInput } from "../../persistence/interface.js";
 import type { KernelDeps } from "../kernel.js";
@@ -64,6 +65,16 @@ export interface PrepareExecutionGroupOptions {
   filterPending?: boolean;
   /** Attempt source for `attemptMode: "max+1"`; ignored otherwise. */
   attemptSourceStages?: ReadonlyArray<{ attempt: number }>;
+}
+
+export function stageJobOptions(
+  workflow?: JobRuntimeOptions,
+  stage?: JobRuntimeOptions,
+): Pick<EnqueueJobInput, "maxAttempts" | "retryPolicy"> {
+  const retry = stage?.jobRetry ?? workflow?.jobRetry;
+  return retry
+    ? { maxAttempts: retry.maxAttempts, retryPolicy: retry.backoff }
+    : {};
 }
 
 export async function prepareExecutionGroup(
@@ -124,6 +135,7 @@ export async function prepareExecutionGroup(
         // Carried on the payload so the dequeue can decline a job whose
         // run this build cannot serve, without joining to workflow_runs.
         definitionVersion: run.definitionVersion,
+        ...stageJobOptions(workflow, stage),
       })),
     );
   };

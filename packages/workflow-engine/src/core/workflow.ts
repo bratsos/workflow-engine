@@ -31,6 +31,7 @@ import {
   computeDefinitionVersion,
   type DefinitionSnapshot,
 } from "./definition-version.js";
+import { type JobRuntimeOptions, jobRuntimeSchema } from "./job-runtime";
 import type { NoInputSchema } from "./schema-helpers";
 import type { Stage } from "./stage";
 import {
@@ -148,7 +149,7 @@ function extractConfigDefaults(
 // ============================================================================
 
 /** Options carried from the builder onto a built {@link Workflow}. */
-export interface WorkflowDefinitionOptions {
+export interface WorkflowDefinitionOptions extends JobRuntimeOptions {
   /**
    * An explicit definition version, declared with
    * `defineWorkflow(...).version("2")`. When set it replaces the derived
@@ -175,6 +176,10 @@ export class Workflow<
     public readonly contextType?: TContext, // Type-only, for inference
     private readonly options?: WorkflowDefinitionOptions,
   ) {}
+
+  get jobRetry() {
+    return this.options?.jobRetry;
+  }
 
   private cachedSnapshot?: DefinitionSnapshot;
   private cachedVersion?: string;
@@ -646,6 +651,7 @@ export class WorkflowBuilder<
     private description: string,
     private inputSchema: TInput,
     private currentOutputSchema: TCurrentOutput,
+    private readonly jobRuntime?: JobRuntimeOptions,
   ) {}
 
   private assertUniqueStageId(stageId: string): void {
@@ -924,9 +930,7 @@ export class WorkflowBuilder<
       this.currentOutputSchema,
       this.stages,
       undefined as TContext | undefined,
-      this.explicitVersion !== undefined
-        ? { version: this.explicitVersion }
-        : undefined,
+      { ...this.jobRuntime, version: this.explicitVersion },
     );
   }
 }
@@ -938,7 +942,8 @@ export class WorkflowBuilder<
 /**
  * Options accepted by {@link defineWorkflow}'s object form.
  */
-export interface DefineWorkflowOptions<TInput extends z.ZodTypeAny> {
+export interface DefineWorkflowOptions<TInput extends z.ZodTypeAny>
+  extends JobRuntimeOptions {
   id: string;
   name: string;
   description?: string;
@@ -948,7 +953,8 @@ export interface DefineWorkflowOptions<TInput extends z.ZodTypeAny> {
 /**
  * Options accepted by {@link defineWorkflow}'s `(id, options?)` form.
  */
-export interface WorkflowOptions<TInput extends z.ZodTypeAny> {
+export interface WorkflowOptions<TInput extends z.ZodTypeAny>
+  extends JobRuntimeOptions {
   /** Human-readable name. Defaults to the id. */
   name?: string;
   description?: string;
@@ -1000,6 +1006,7 @@ export function defineWorkflow(
       options.description ?? "",
       input,
       input,
+      jobRuntimeSchema.parse(options),
     );
   }
   return new WorkflowBuilder(
@@ -1008,6 +1015,7 @@ export function defineWorkflow(
     idOrOptions.description ?? "",
     idOrOptions.input,
     idOrOptions.input,
+    jobRuntimeSchema.parse(idOrOptions),
   );
 }
 

@@ -20,6 +20,7 @@
  * batch provider APIs are slow to respond.
  */
 
+import type { JobRetryBackoff } from "../../core/job-runtime.js";
 import type { CheckCompletionContext, Stage } from "../../core/stage";
 import {
   DURABLE_SUSPEND_MARKER,
@@ -195,12 +196,20 @@ const REPLAY_FAILURES_KEY = "__replayFailures";
  * row's `maxAttempts`. A stage with no job row (no host loop ever ran it)
  * is on its first attempt with the host default budget.
  */
+interface ReplayAttemptBudget {
+  attempt: number;
+  maxAttempts: number;
+  failures: number;
+  retryPolicy?: JobRetryBackoff | null;
+}
+
 async function replayAttemptBudget(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
-): Promise<{ attempt: number; maxAttempts: number; failures: number }> {
+): Promise<ReplayAttemptBudget> {
   const jobs = await deps.jobTransport.getJobsByWorkflowRun(
     stageRecord.workflowRunId,
+    { includePayload: false },
   );
   // The SUSPENDED row, or the RUNNING one whose suspension the host has
   // not acknowledged yet: either carries the delivery's real budget.
@@ -213,6 +222,7 @@ async function replayAttemptBudget(
     attempt: (job?.attempt ?? 1) + failures,
     maxAttempts: job?.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
     failures,
+    retryPolicy: job?.retryPolicy,
   };
 }
 
@@ -246,7 +256,7 @@ async function recordStageRetry(
   stageRecord: WorkflowStageRecord,
   run: WorkflowRunRecord,
   message: string,
-  budget: { attempt: number; maxAttempts: number; failures: number },
+  budget: ReplayAttemptBudget,
   annotations: CreateAnnotationInput[],
   deps: KernelDeps,
 ): Promise<ClaimOutcome<void>> {
@@ -255,7 +265,9 @@ async function recordStageRetry(
       metadata?: Record<string, unknown>;
     } | null
   )?.metadata;
-  const retryAt = deps.clock.now().getTime() + retryBackoffMs(budget.attempt);
+  const retryAt =
+    deps.clock.now().getTime() +
+    retryBackoffMs(budget.attempt, budget.retryPolicy);
   const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
     () => undefined,
   );

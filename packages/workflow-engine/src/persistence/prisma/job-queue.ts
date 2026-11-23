@@ -11,6 +11,7 @@ import {
  * This is migrated from the original services/job-queue.server.ts
  */
 
+import { type JobRetryBackoff, retryBackoffMs } from "../../core/job-runtime";
 import type { Persistence } from "../../kernel/ports";
 import { createLogger, isTraceTextEnabled } from "../../utils/logger";
 import {
@@ -76,6 +77,7 @@ type DequeuedJobRow = {
   priority: number;
   attempt: number;
   maxAttempts: number;
+  retryPolicy: JobRetryBackoff | null;
   payload: unknown;
   startedAt: Date;
 };
@@ -88,6 +90,7 @@ const DEQUEUED_JOB_COLUMNS: RawColumns = {
   priority: "int",
   attempt: "int",
   maxAttempts: "int",
+  retryPolicy: "json",
   payload: "json",
   startedAt: "timestamp",
 };
@@ -218,6 +221,12 @@ export class PrismaJobQueue implements JobQueue {
       } as unknown,
       status: this.enums.status("PENDING"),
       nextPollAt: job.scheduledFor ?? null,
+      ...(job.maxAttempts !== undefined
+        ? { maxAttempts: job.maxAttempts }
+        : {}),
+      ...(job.retryPolicy !== undefined
+        ? { retryPolicy: job.retryPolicy }
+        : {}),
     };
   }
 
@@ -513,7 +522,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE OF j SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", payload, "startedAt"
       `
         : await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
             DequeuedJobRow[]
@@ -557,7 +566,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -620,6 +629,7 @@ export class PrismaJobQueue implements JobQueue {
         priority: job.priority,
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
+        ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
         payload: rest,
         startedAt: job.startedAt,
       };
@@ -743,6 +753,9 @@ export class PrismaJobQueue implements JobQueue {
         priority: claimedJob.priority,
         attempt: claimedJob.attempt,
         maxAttempts: claimedJob.maxAttempts,
+        ...(claimedJob.retryPolicy
+          ? { retryPolicy: claimedJob.retryPolicy }
+          : {}),
         payload: claimedRest,
         startedAt: now,
       };
@@ -885,12 +898,12 @@ export class PrismaJobQueue implements JobQueue {
   ): Promise<JobAckOutcome> {
     const job = await this.prisma.jobQueue.findUnique({
       where: { id: jobId },
-      select: { attempt: true, maxAttempts: true },
+      select: { attempt: true, maxAttempts: true, retryPolicy: true },
     });
 
     if (shouldRetry && job && job.attempt < job.maxAttempts) {
       // Re-queue for retry with exponential backoff
-      const backoffMs = 2 ** job.attempt * 1000; // 2s, 4s, 8s...
+      const backoffMs = retryBackoffMs(job.attempt, job.retryPolicy);
       const nextPollAt = new Date(Date.now() + backoffMs);
 
       if (fence) {
@@ -1037,6 +1050,7 @@ export class PrismaJobQueue implements JobQueue {
         completedAt: job.completedAt,
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
+        ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
         lastError: job.lastError,
         nextPollAt: job.nextPollAt,
         payload: rest,

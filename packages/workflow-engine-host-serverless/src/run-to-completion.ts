@@ -223,16 +223,7 @@ export async function runToCompletion(
 
     const outcome = await executeJobWithHeartbeat(kernel, {
       jobTransport,
-      job: {
-        jobId: job.jobId,
-        workflowRunId: job.workflowRunId,
-        workflowId: job.workflowId,
-        stageId: job.stageId,
-        attempt: job.attempt,
-        maxAttempts: job.maxAttempts,
-        payload: job.payload,
-        startedAt: job.startedAt,
-      },
+      job,
       jobHeartbeatIntervalMs,
       logPrefix,
     });
