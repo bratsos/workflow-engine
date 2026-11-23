@@ -146,9 +146,17 @@ export class InMemoryStepLedger implements StepLedger {
   }
 
   async clear(stageRecordId: string): Promise<void> {
+    await this.deleteForPurge(stageRecordId);
+  }
+
+  async deleteForPurge(stageRecordId: string): Promise<number> {
+    let count = 0;
     for (const [key, record] of this.records) {
-      if (record.stageRecordId === stageRecordId) this.records.delete(key);
+      if (record.stageRecordId !== stageRecordId) continue;
+      this.records.delete(key);
+      count++;
     }
+    return count;
   }
 
   async clearExcept(

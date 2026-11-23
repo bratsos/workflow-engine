@@ -247,6 +247,7 @@ model WorkflowArtifact {
 
   @@unique([workflowRunId, key])
   @@index([workflowRunId])
+  @@index([workflowStageId])
   @@map("workflow_artifacts")
 }
 
@@ -275,6 +276,7 @@ model AICall {
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([createdAt])
   @@index([tenantId, createdAt])
   @@index([workflowRunId])
   @@index([textExpiresAt])
@@ -305,6 +307,7 @@ model WorkflowAnnotation {
   @@index([workflowRunId, createdAt])
   @@index([workflowRunId, scope])
   @@index([workflowRunId, actorId])
+  @@index([workflowStageRecordId])
   @@map("workflow_annotations")
 }
 
@@ -364,6 +367,7 @@ model OutboxEvent {
   deliveryClaim   String?
   retryCount      Int       @default(0)
   dlqAt           DateTime?
+  pruneTerminal Boolean   @default(false)
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
@@ -391,6 +395,7 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@index([workflowRunId])
+  @@index([workflowRunId, commandType])
   @@index([createdAt])
   @@map("idempotency_keys")
 }
@@ -1272,7 +1277,7 @@ The adapters do not use Prisma 8's `db.prepare`. It relies on named statements, 
 
 Verify that your index declarations (`@@index`) are preserved. On Prisma 8 the six indexes with a descending column come from [`mixed-order-indexes.sql`](#the-mixed-order-indexes), not from the contract. The ones that matter operationally:
 * `workflow_runs`: `[status, priority DESC, createdAt]` serves the run claim; the four `(…, createdAt DESC, id DESC)` indexes serve every "newest first" listing (the console's included) as one index range scan; `[definitionVersion]` and `[status, workflowId, definitionVersion]` serve the version-filtered claim and `run.listVersions`.
-* For `ai_calls`, indexes on `[tenantId, createdAt]`, `[workflowRunId]` and `[textExpiresAt]` support attribution and expiry lookups. `prompt` and `response` remain required.
+* For `ai_calls`, indexes on `[tenantId, createdAt]`, `[workflowRunId]`, `[createdAt]` and `[textExpiresAt]` support attribution and retention lookups. `prompt` and `response` remain required.
 * The `idempotency_keys` indexes on `[workflowRunId]` and `[createdAt]` support lookups by run and by key age.
 * `job_queue`: `[status, priority DESC, createdAt]` serves the dequeue without a sort node whatever the queue depth; `[status, createdAt]` serves queue health; `[nextPollAt]` serves retries. `@@unique([workflowRunId, stageId])` is what makes the enqueue idempotent on a redrive.
 * `workflow_steps`: `@@unique([stageRecordId, stepId])` is the step ledger's claim; the foreign key to `workflow_stages` with `ON DELETE CASCADE` is what lets `run.purge` (and a hand-written `DELETE FROM workflow_runs`) take the ledger with the run.

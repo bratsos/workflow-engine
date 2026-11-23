@@ -1,4 +1,5 @@
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
 import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
@@ -161,9 +162,9 @@ export class PrismaAICallLogger implements AICallLogger {
 
   /**
    * Log a single AI call (fire and forget)
-   * Does not await - logs asynchronously to avoid blocking AI operations
+   * Returns the write for callers coordinating run erasure.
    */
-  logCall(call: CreateAICallInput): void {
+  logCall(call: CreateAICallInput): Promise<void> {
     // Not awaited by the caller, so the SQLite date check runs here (it is
     // `undefined` on PostgreSQL); a refusal is logged like any failed write.
     const check = sqliteCheckFor(this);
@@ -171,6 +172,9 @@ export class PrismaAICallLogger implements AICallLogger {
       this.prisma.aICall.create({
         data: {
           topic: call.topic,
+          ...(call.workflowRunId !== undefined
+            ? { workflowRunId: call.workflowRunId }
+            : {}),
           callType: call.callType,
           modelKey: call.modelKey,
           modelId: call.modelId,
@@ -187,8 +191,9 @@ export class PrismaAICallLogger implements AICallLogger {
             : {}),
         },
       });
-    (check ? check.then(write) : write()).catch((error: unknown) =>
-      logger.error("Failed to persist AI call:", error),
+    return Promise.resolve(check ? check.then(write) : write()).then(
+      () => {},
+      (error: unknown) => logger.error("Failed to persist AI call:", error),
     );
   }
 
@@ -212,6 +217,9 @@ export class PrismaAICallLogger implements AICallLogger {
 
       return {
         topic: call.topic,
+        ...(call.workflowRunId !== undefined
+          ? { workflowRunId: call.workflowRunId }
+          : {}),
         callType: call.callType,
         modelKey: call.modelKey,
         modelId: call.modelId,
@@ -410,6 +418,46 @@ export class PrismaAICallLogger implements AICallLogger {
           })) as AICallRow[]
         ).filter((row) => row.topic.startsWith(topicPrefix));
     return rows.map(toRecord);
+  }
+
+  async deleteForRuns(runIds: readonly string[]): Promise<number> {
+    const pg = this.databaseType === "postgresql";
+    const topic = pg ? '"topic" COLLATE "C"' : '"topic"';
+    // Calls logged before run attribution, by their topic. SQLite is held to
+    // the partial index: its statistics can prefer `workflowRunId`'s, which
+    // reads every unattributed call.
+    const legacy = pg
+      ? `"ai_calls"`
+      : `"ai_calls" INDEXED BY "ai_calls_legacy_topic_idx"`;
+    let removed = 0;
+    for (const id of new Set(runIds)) {
+      const run = (sql: string, args: unknown[]) =>
+        writeRetentionSql(this.prisma, this.databaseType, sql, args);
+      removed += await run(
+        `DELETE FROM "ai_calls" WHERE "workflowRunId" = $1`,
+        [id],
+      );
+      removed += await run(
+        `DELETE FROM ${legacy}
+          WHERE "workflowRunId" IS NULL AND ${topic} >= $1 AND ${topic} < $2`,
+        prefixRange(`workflow.${id}.`),
+      );
+    }
+    return removed;
+  }
+
+  async pruneCalls(olderThan: Date, limit: number): Promise<number> {
+    return pruneRows(
+      this.prisma,
+      this.databaseType,
+      "aiCalls",
+      olderThan,
+      limit,
+    );
+  }
+
+  async clearExpiredText(now: Date, limit: number): Promise<number> {
+    return pruneRows(this.prisma, this.databaseType, "aiCallText", now, limit);
   }
 }
 

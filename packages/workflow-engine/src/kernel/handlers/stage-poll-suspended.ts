@@ -70,6 +70,7 @@ import {
   willRetryStage,
   withClaimedRun,
 } from "../helpers/index.js";
+import { fenceRunWrites } from "../helpers/run-writes.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type {
   ActivityRunInput,
@@ -481,6 +482,9 @@ async function replayStage(
   postCommits: Array<() => Promise<void>>,
 ): Promise<ReplayOutcome> {
   let built: ReturnType<typeof buildStageExecutionContext> | undefined;
+  // What the body and its output write for the run is skipped once the run
+  // has ended.
+  const writes = fenceRunWrites(deps, run.id);
 
   try {
     const workflow = deps.registry.getWorkflow(run.workflowId);
@@ -512,7 +516,7 @@ async function replayStage(
       resumeState: stageRecord.suspendedState,
       workflowContext,
     };
-    built = buildStageExecutionContext(input, deps);
+    built = buildStageExecutionContext(input, writes);
     const result = await stageDef.execute(built.context);
     const moved = await superseded(stageRecord, deps);
     if (moved) {
@@ -624,7 +628,7 @@ async function replayStage(
       run.workflowType,
       stageRecord.stageId,
       validatedOutput,
-      deps,
+      writes,
       attemptKey,
     );
     const artifactKeys =
@@ -634,7 +638,7 @@ async function replayStage(
             run.workflowType,
             stageRecord.stageId,
             stageResult.artifacts,
-            deps,
+            writes,
             attemptKey,
           )
         : undefined;
@@ -697,7 +701,7 @@ async function replayStage(
       stageRecord.stageId,
       validatedOutput,
       stageResult.artifacts,
-      deps,
+      writes,
       stageRecord.id,
       outputKey,
     );
@@ -941,11 +945,13 @@ export async function handleStagePollSuspended(
       continue;
     }
 
-    // 3d. Create storage shim and log function (uses non-transactional deps)
+    // 3d. Create storage shim and log function (uses non-transactional deps).
+    // What checkCompletion writes for the run is skipped once it has ended.
+    const writes = fenceRunWrites(deps, run.id);
     const storage = createStorageShim(
       stageRecord.workflowRunId,
       run.workflowType,
-      deps,
+      writes,
     );
 
     const logFn = (
@@ -1009,12 +1015,12 @@ export async function handleStagePollSuspended(
         stageId: stageRecord.stageId,
         stageRecordId: stageRecord.id,
       },
-      deps,
+      writes,
     );
     const checkContext = Object.assign(checkContextBase, {
       step: createStepApi({
         stageRecordId: stageRecord.id,
-        stepLedger: deps.stepLedger,
+        stepLedger: writes.stepLedger,
         clock: deps.clock,
         onLog: (level, message) => void logFn(level, message),
         // A WARN naming a provider batch goes on the run: a redrive from
@@ -1133,7 +1139,7 @@ export async function handleStagePollSuspended(
             run.workflowType,
             stageRecord.stageId,
             validatedOutput,
-            deps,
+            writes,
           );
           outputRef = { _artifactKey: outputKey };
           committedOutput = validatedOutput;
@@ -1198,7 +1204,7 @@ export async function handleStagePollSuspended(
             stageRecord.stageId,
             committedOutput,
             undefined,
-            deps,
+            writes,
             stageRecord.id,
             outputRef._artifactKey,
           );

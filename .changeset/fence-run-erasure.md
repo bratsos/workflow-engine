@@ -1,0 +1,7 @@
+---
+"@bratsos/workflow-engine": patch
+---
+
+Targeted run erasure no longer lets a write land after it reports a run erased. Stage executions, suspended-stage polls and the provider batch sweep of `run.cancel` register as writers of their run while the run is live, and erasure reports `writers` until they end. A registration whose process stopped refreshing it stops counting after `RUN_WRITE_LEASE_MS` (one minute), and a writer that stalled past half of it checks its registration before writing again. Age-based `run.purge` skips runs with writers, and a targeted retry for a run that is already gone removes the AI calls, jobs, keys and outbox events left under its ID. Erasure finds the stage records a redrive archived through its `run.supersededAttempt` annotations, so runs redriven by earlier releases are erasable after an ordinary upgrade, and it skips records that another run names. A command that completes or fails after its key was erased with its run no longer touches a key another command acquired since: `completeIdempotencyKey` and `releaseIdempotencyKey` take the acquisition time. The spilling job transport now answers a failed payload spill only after the other spills of the batch settle.
+
+For targeted erasure, **stop old hosts first**: earlier hosts do not register their writes, so a write of theirs can land after erasure reported the run gone. A custom asynchronous `AICallLogger` must return from `logCall` a promise that settles once the call is stored.

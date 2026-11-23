@@ -16,7 +16,11 @@ import type {
   PurgeableRunStatus,
   ServedDefinition,
 } from "../../persistence/interface.js";
-import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
+import type {
+  EnginePruneResult,
+  EventSinkStatus,
+  OutboxFlushResult,
+} from "../commands.js";
 import { jobTargetMissingReason } from "../errors.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
@@ -495,6 +499,15 @@ export interface RetentionOptions {
   limit?: number;
 }
 
+/** Retention clauses to run on each maintenance tick. */
+export interface PruneOptions {
+  aiCalls?: { olderThanMs: number };
+  aiCallText?: boolean;
+  outbox?: { publishedOlderThanMs: number };
+  idempotencyKeys?: { olderThanMs: number };
+  limit?: number;
+}
+
 /**
  * Bound the caller's wait and stop the dispatch before it starts more work.
  * An already-started sink call can still settle and acknowledge its claim.
@@ -572,6 +585,7 @@ export interface RunMaintenanceTickOptions {
    * `run.purge` at the end of every tick. Omitted, nothing is deleted.
    */
   retention?: RetentionOptions;
+  prune?: PruneOptions;
   /**
    * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
@@ -596,6 +610,7 @@ export interface MaintenanceTickCounts {
   stuckReaped: number;
   /** Terminal runs `run.purge` deleted this tick; 0 unless `retention` is set. */
   purged: number;
+  pruned?: EnginePruneResult;
   /**
    * Events whose emit failed and whose claims were released for retry.
    * Later events remain pending and are not included. Disjoint from
@@ -693,6 +708,7 @@ export async function runMaintenanceTick(
     logPrefix = HOST_DEFAULTS.logPrefix,
     serves,
     retention,
+    prune,
   } = options;
   assertTimerMs("outboxFlushTimeoutMs", outboxFlushTimeoutMs);
 
@@ -704,6 +720,7 @@ export async function runMaintenanceTick(
   let outboxDeferred: true | undefined;
   let stuckReaped = 0;
   let purged = 0;
+  let pruned: EnginePruneResult | undefined;
   let eventsFailed = 0;
   let eventsDeadLettered = 0;
   let eventSinkStatus: EventSinkStatus = "healthy";
@@ -795,6 +812,34 @@ export async function runMaintenanceTick(
     console.error(`${logPrefix} run.reapStuck error:`, error);
   }
 
+  if (prune) {
+    const now = Date.now();
+    try {
+      pruned = await kernel.dispatch({
+        type: "engine.prune",
+        ...(prune.aiCalls && {
+          aiCalls: { olderThan: new Date(now - prune.aiCalls.olderThanMs) },
+        }),
+        ...(prune.aiCallText && { aiCallText: { now: new Date(now) } }),
+        ...(prune.outbox && {
+          outbox: {
+            publishedOlderThan: new Date(
+              now - prune.outbox.publishedOlderThanMs,
+            ),
+          },
+        }),
+        ...(prune.idempotencyKeys && {
+          idempotencyKeys: {
+            olderThan: new Date(now - prune.idempotencyKeys.olderThanMs),
+          },
+        }),
+        ...(prune.limit !== undefined && { limit: prune.limit }),
+      });
+    } catch (error) {
+      console.error(`${logPrefix} engine.prune error:`, error);
+    }
+  }
+
   // 6. Retention → delete terminal runs past their age. Opt-in only.
   if (retention) {
     try {
@@ -821,6 +866,7 @@ export async function runMaintenanceTick(
     ...(outboxDeferred ? { outboxDeferred } : {}),
     stuckReaped,
     purged,
+    ...(pruned && { pruned }),
     eventsFailed,
     eventsDeadLettered,
     eventSinkStatus,

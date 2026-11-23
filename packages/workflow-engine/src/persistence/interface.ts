@@ -101,6 +101,30 @@ export interface PurgeableRun {
   stageRecordIds: string[];
 }
 
+export interface RunPurgeFence {
+  id: string;
+  status: PurgeableRunStatus;
+  version: number;
+}
+
+export interface RunPurgePersistenceCounts {
+  stages: number;
+  steps: number;
+  logs: number;
+  artifacts: number;
+  annotations: number;
+  outboxEvents: number;
+  idempotencyKeys: number;
+}
+
+/**
+ * How long a run writer registration (`beginRunWrite`) counts as live after
+ * its last refresh. A process refreshes its registrations at a third of this
+ * while it holds them, so a registration whose process died stops blocking
+ * erasure after this long.
+ */
+export const RUN_WRITE_LEASE_MS = 60_000;
+
 export interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
@@ -576,6 +600,7 @@ export interface AnnotationFilters {
 }
 
 export interface CreateAICallInput {
+  workflowRunId?: string;
   topic: string;
   callType: string;
   modelKey: string;
@@ -793,6 +818,46 @@ export interface PersistenceCore {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
+
+  /** Terminal runs are listed first, then live runs, up to the batch limit. */
+  listTenantRunsForPurge?(tenantId: string, limit: number): Promise<string[]>;
+  /**
+   * Stage record ids the run's `run.supersededAttempt` annotations name
+   * (`run.redrive` writes one per record it deletes), without the ids that
+   * another run names as a current record or in its own archive: callers can
+   * write annotations too.
+   */
+  listArchivedStageRecordIds?(workflowRunId: string): Promise<string[]>;
+  /** Delete idempotency keys of these jobs (`job:<id>:attempt:<n>`). */
+  purgeJobKeys?(jobIds: readonly string[]): Promise<number>;
+  /**
+   * In a transaction: count and delete the run's rows, then the run row
+   * under `fence`, throwing when that matches no row so the transaction
+   * rolls back. With no fence (the run is already gone), only the rows
+   * that outlive a run (idempotency keys, outbox events) are deleted.
+   */
+  purgeRun?(
+    workflowRunId: string,
+    fence: RunPurgeFence | null,
+    stageRecordIds: readonly string[],
+  ): Promise<RunPurgePersistenceCounts>;
+  /**
+   * Register a writer of the run's data, or refuse when the run is gone or
+   * has ended. `unchecked` registers whatever the status, for a caller whose
+   * own transaction is ending the run.
+   */
+  beginRunWrite?(
+    workflowRunId: string,
+    token: string,
+    options?: { unchecked?: boolean },
+  ): Promise<boolean>;
+  /** Renew the registration's lease; `false` when it no longer exists. */
+  refreshRunWrite?(token: string): Promise<boolean>;
+  endRunWrite?(token: string): Promise<void>;
+  /** Whether a registration refreshed within `RUN_WRITE_LEASE_MS` exists. */
+  hasRunWriters?(workflowRunId: string): Promise<boolean>;
+  pruneOutbox?(publishedOlderThan: Date, limit: number): Promise<number>;
+  pruneIdempotencyKeys?(olderThan: Date, limit: number): Promise<number>;
 
   /**
    * Terminal runs eligible for retention deletion, oldest first: runs whose
@@ -1106,26 +1171,41 @@ export interface PersistenceCore {
   acquireIdempotencyKey(
     key: string,
     commandType: string,
-    options?: { now?: Date; staleInProgressAfterMs?: number },
+    options?: {
+      now?: Date;
+      staleInProgressAfterMs?: number;
+      workflowRunId?: string;
+    },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
   >;
 
-  /** Cache the completed result and stamp the run id when known. */
+  /**
+   * Cache the completed result and stamp the run id when known. A key that
+   * no longer exists is not recreated; with `acquiredAt`, only that
+   * acquisition is completed.
+   */
   completeIdempotencyKey(
     key: string,
     commandType: string,
     result: unknown,
     workflowRunId: string | null,
+    acquiredAt?: Date,
   ): Promise<void>;
 
   /**
    * Delete an idempotency key whatever its state: an in-progress key after a
-   * command failed, or a completed one nothing will replay any more.
+   * command failed, or a completed one nothing will replay any more. With
+   * `acquiredAt` (the `now` it was acquired with), only that acquisition is
+   * deleted: an erasure can remove the key and another command acquire it.
    */
-  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
+  releaseIdempotencyKey(
+    key: string,
+    commandType: string,
+    acquiredAt?: Date,
+  ): Promise<void>;
 }
 
 // ============================================================================
@@ -1166,10 +1246,16 @@ export interface AIHelperStats {
 }
 
 export interface AICallLogger {
+  /** Delete calls attributed to runs, including legacy workflow topics. */
+  deleteForRuns?(runIds: readonly string[]): Promise<number>;
+  pruneCalls?(olderThan: Date, limit: number): Promise<number>;
+  clearExpiredText?(now: Date, limit: number): Promise<number>;
+
   /**
-   * Log a single AI call (fire and forget)
+   * Log a single call. An asynchronous logger must return its write promise
+   * when used with targeted erasure, so the kernel can drain the operation.
    */
-  logCall(call: CreateAICallInput): void;
+  logCall(call: CreateAICallInput): void | Promise<void>;
 
   /**
    * Log batch results (for recording batch API results)
@@ -1222,6 +1308,11 @@ export interface JobQueue {
    */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
 
+  /** Read job identifiers without resolving job payloads for erasure. */
+  getJobsForPurge?(
+    workflowRunId: string,
+  ): Promise<{ id: string; stageId: string }[]>;
+  deleteForRun?(workflowRunId: string): Promise<number>;
   /**
    * Remove every job row for the given stages of a run, whatever their
    * status. Returns the number of rows removed.

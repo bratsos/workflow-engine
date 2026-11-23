@@ -202,11 +202,9 @@ row does not keep per-execution timings.
 ### What the page relies on
 
 Every history is built from the events the run's outbox still holds, and
-the page says so in one line wherever it shows one. Nothing in the engine
-deletes outbox rows: `run.purge` removes the run and leaves its rows, and a
-purged run has no page. Rows of a run that still exists are removed only by
-SQL, such as a pruning job of your own. What the page finds of such a
-removal:
+the page says so wherever it shows one. `engine.prune` can remove published
+events from a terminal run. Targeted `run.purge` deletes the run and its
+outbox events together. The page detects removed events as follows.
 
 - **Rows removed from the start or the middle are always found.** A run's
   outbox starts at sequence 1 with its `workflow:created`, and the page uses

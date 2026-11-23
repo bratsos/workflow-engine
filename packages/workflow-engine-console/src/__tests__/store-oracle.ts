@@ -600,13 +600,15 @@ export async function readStoredRows(w: World) {
   walk(join(storedRows, "snapshots"));
   const rows = (snapshot: any, model: string) => {
     const allowed = new Set<string>(shapes[model].columns);
-    return (snapshot.tables[model] ?? []).map((encoded: unknown) =>
-      Object.fromEntries(
-        Object.entries(decodeValue(encoded) as Record<string, unknown>).filter(
-          ([column]) => allowed.has(column),
-        ),
-      ),
-    );
+    return (snapshot.tables[model] ?? []).map((encoded: unknown) => {
+      const decoded = decodeValue(encoded) as Record<string, unknown>;
+      // The database derives eligibility from the event and its run; the
+      // column is a boolean here and an integer on the SQLite contract.
+      if (model === "OutboxEvent") delete decoded.pruneTerminal;
+      return Object.fromEntries(
+        Object.entries(decoded).filter(([column]) => allowed.has(column)),
+      );
+    });
   };
   const lines: {
     file: string;

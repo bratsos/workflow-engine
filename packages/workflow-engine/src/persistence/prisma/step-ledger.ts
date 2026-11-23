@@ -5,6 +5,7 @@ import type {
   StepRecordExpectation,
   StepRecordPatch,
 } from "../../kernel/ports.js";
+import { PrismaWorkflowPersistence } from "./persistence.js";
 import {
   type EnginePrismaClient,
   validateDatabaseType,
@@ -217,6 +218,21 @@ export class PrismaStepLedger implements StepLedger {
       shareSqliteGuard(reader, this);
       return { get: reader.get.bind(reader), list: reader.list.bind(reader) };
     });
+  }
+
+  async deleteForPurge(
+    stageRecordId: string,
+    persistence: Persistence,
+  ): Promise<number> {
+    if (
+      persistence instanceof PrismaWorkflowPersistence &&
+      persistence.ownsStepLedger(this.prisma)
+    ) {
+      return 0;
+    }
+    return (
+      await this.prisma.workflowStep.deleteMany({ where: { stageRecordId } })
+    ).count;
   }
 
   async clear(stageRecordId: string): Promise<void> {

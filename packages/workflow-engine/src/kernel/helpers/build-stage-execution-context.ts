@@ -39,6 +39,26 @@ export function defineLazyAIContext<T extends object>(
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
+  // The stage's calls name its run, so erasing the run finds them.
+  let scopedLogger: AICallLogger | undefined;
+  const loggerForRun = (logger: AICallLogger): AICallLogger => {
+    return (scopedLogger ??= {
+      logCall: (call) =>
+        logger.logCall({ ...call, workflowRunId: params.workflowRunId }),
+      logBatchResults: (batchId, calls) =>
+        logger.logBatchResults(
+          batchId,
+          calls.map((call) => ({
+            ...call,
+            workflowRunId: params.workflowRunId,
+          })),
+        ),
+      getStats: logger.getStats.bind(logger),
+      isRecorded: logger.isRecorded.bind(logger),
+      ...(logger.listCalls && { listCalls: logger.listCalls.bind(logger) }),
+    });
+  };
+
   const configured = () => {
     const services = deps.services;
     if (!services?.aiLogger || !services.ai) {
@@ -46,7 +66,7 @@ export function defineLazyAIContext<T extends object>(
     }
     return {
       ai: services.ai,
-      aiLogger: services.aiLogger,
+      aiLogger: loggerForRun(services.aiLogger),
     };
   };
 

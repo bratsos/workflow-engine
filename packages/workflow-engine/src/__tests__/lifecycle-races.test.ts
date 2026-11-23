@@ -174,7 +174,7 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     expect((await wake(current, "ready")).status).toBe("acquired");
   });
 
-  it("removes a first-stage job whose delayed enqueue lands after the run was purged", async () => {
+  it("purges a run whose first-stage enqueue was in flight once the enqueue lands", async () => {
     const send = kernel();
     const spilling = createSpillingJobTransport(ports.jobTransport, {
       blobStore: ports.blobStore,
@@ -198,17 +198,28 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     const claim = claimant({ type: "run.claimPending", workerId: "w" });
     await held.reached;
     await send({ type: "run.cancel", workflowRunId: runId });
+    // Prisma registers the enqueue as a writer of the run, so the age sweep
+    // leaves the run until it ends; the in-memory store registers nothing.
+    const purged = { purged: 1, workflowRunIds: [runId] };
+    const none = { purged: 0, workflowRunIds: [] };
     await expect(
       send({ type: "run.purge", olderThan: later() }),
-    ).resolves.toEqual({
-      purged: 1,
-      workflowRunIds: [runId],
-    });
+    ).resolves.toEqual(realDatabase ? none : purged);
     held.open();
 
+    // The job lands for a run that still exists only when the sweep waited.
     await expect(claim).resolves.toMatchObject({
-      claimed: [{ workflowRunId: runId, jobIds: [] }],
+      claimed: [
+        {
+          workflowRunId: runId,
+          jobIds: realDatabase ? [expect.any(String)] : [],
+        },
+      ],
     });
+    await expect(
+      send({ type: "run.purge", olderThan: later() }),
+    ).resolves.toEqual(realDatabase ? purged : none);
+
     expect(await ports.jobTransport.getJobsByWorkflowRun(runId)).toEqual([]);
     expect(await ports.blobStore.list(jobSpillPrefix(runId))).toEqual([]);
   });

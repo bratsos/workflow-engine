@@ -32,6 +32,11 @@ exports.createSqliteClient = (file, options = {}, adapterOptions) => {
   );
   // Prisma 7's db push no longer generates, so it cannot touch the shared client.
   prisma("db", "push");
+  return exports.openSqliteClient(file, options, adapterOptions);
+};
+
+exports.openSqliteClient = (file, options = {}, adapterOptions) => {
+  const url = `file:${file}`;
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
   return new PrismaClient({

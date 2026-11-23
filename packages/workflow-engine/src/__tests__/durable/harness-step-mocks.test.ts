@@ -3,6 +3,7 @@ import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import type { StepLedger, StepRecord } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import {
   createMockStepLedger,
   createTestHarness,
@@ -272,6 +273,7 @@ describe("createMockStepLedger forwarding", () => {
     list: true,
     clear: true,
     clearExcept: true,
+    deleteForPurge: true,
   };
 
   it("forwards every method of the port to the wrapped ledger", async () => {
@@ -316,6 +318,10 @@ describe("createMockStepLedger forwarding", () => {
       async clear(_stageRecordId) {
         calls.push("clear");
       },
+      async deleteForPurge() {
+        calls.push("deleteForPurge");
+        return 0;
+      },
       async clearExcept(_stageRecordId, _keepStepIds) {
         calls.push("clearExcept");
       },
@@ -339,6 +345,11 @@ describe("createMockStepLedger forwarding", () => {
     await wrapper.list("stage-1");
     await wrapper.clear("stage-1");
     await wrapper.clearExcept?.("stage-1", ["step-1"]);
+
+    await wrapper.deleteForPurge?.(
+      "stage-1",
+      new InMemoryWorkflowPersistence(),
+    );
 
     const surface = Object.keys(STEP_LEDGER_SURFACE);
     for (const method of surface) {

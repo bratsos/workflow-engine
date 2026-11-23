@@ -499,6 +499,69 @@ identify older keys that lack the column value, use `result->>'workflowRunId'`
 where present. For older `job.execute` keys, the original job ID binds a
 `job:<jobId>:attempt:` prefix while the job rows still exist.
 
+#### Retention and erasure schema
+
+Put these changes in the same release's migration as the column and index
+upgrade above. Prisma's generated migration from the updated schema or
+contract creates the columns and the four plain indexes; for hand-written
+SQL, the indexes are:
+
+```sql
+CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_commandType_idx"
+  ON "idempotency_keys" ("workflowRunId", "commandType");
+CREATE INDEX IF NOT EXISTS "workflow_artifacts_workflowStageId_idx"
+  ON "workflow_artifacts" ("workflowStageId");
+CREATE INDEX IF NOT EXISTS "workflow_annotations_workflowStageRecordId_idx"
+  ON "workflow_annotations" ("workflowStageRecordId");
+CREATE INDEX IF NOT EXISTS "ai_calls_createdAt_idx" ON "ai_calls" ("createdAt");
+```
+
+Include `sql/retention-indexes.postgresql.sql` or
+`sql/retention-indexes.sqlite.sql` from the engine package in the same
+migration. These indexes serve literal AI topic and idempotency key prefixes,
+the legacy idempotency result's JSON run ID and the stage records that
+`run.redrive` archived. Keep them in the migration SQL since the Prisma schemas
+cannot express their expressions and collations. Targeted erasure on SQLite
+requires them.
+
+The indexes are rolling-safe. Upgrade or stop all older hosts before using
+targeted `run.purge` with run IDs or a tenant ID: older hosts do not register
+the stage executions and cancellation sweeps that erasure waits for, so their
+writes can land after a run was reported erased.
+
+For table retention, also add this column to the same migration:
+
+| Table | Column | PostgreSQL | SQLite |
+| --- | --- | --- | --- |
+| `outbox_events` | `pruneTerminal` | `BOOLEAN NOT NULL DEFAULT FALSE` | `INTEGER NOT NULL DEFAULT 0` |
+
+Run the matching `sql/retention-eligibility.postgresql.sql` or
+`sql/retention-eligibility.sqlite.sql` after adding the column. The script
+installs the outbox triggers, backfills existing events and creates the
+eligible-only pruning indexes. Include these statements alongside Prisma's
+generated migration. The triggers track event publication, dead letters,
+and run transitions and deletion. The indexes exclude live or orphaned events,
+dead letters, unpublished events and in-progress idempotency keys. A run
+status change between live and terminal updates that run's published events,
+so its cost grows with the run's published history.
+
+Runs created and redriven before this release need nothing more: erasure finds
+the stage records a redrive archived through its `run.supersededAttempt`
+annotations. Stage executions and cancellation sweeps register as writers of
+their run in `idempotency_keys` (command type `run.write`); erasure reports
+`writers` while one is registered and refreshed. A registration whose process
+stopped refreshing it stops counting after one minute (`RUN_WRITE_LEASE_MS`).
+A custom asynchronous `AICallLogger` that buffers calls must return, from
+`logCall`, a promise that settles once the call is stored: erasure waits for
+that promise, not for the buffer.
+
+Custom persistence adapters receive the run ID in
+`acquireIdempotencyKey`'s `options.workflowRunId` and the acquisition time as
+the optional last argument of `completeIdempotencyKey` and
+`releaseIdempotencyKey`. When it is given, complete or delete only the
+in-progress row whose `createdAt` equals it. `completeIdempotencyKey` must not
+create a row: a key erased with its run stays erased.
+
 ### Custom port implementations
 
 - [ ] **Custom `JobQueue` / `JobTransport` implementation?** The port changed in

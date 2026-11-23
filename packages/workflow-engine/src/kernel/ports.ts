@@ -183,6 +183,12 @@ export interface StepLedger {
   ): Promise<{ applied: boolean; record: StepRecord | null }>;
   list(stageRecordId: string): Promise<StepRecord[]>;
   clear(stageRecordId: string): Promise<void>;
+  /** Delete externally owned steps. A shared reference ledger defers to persistence. */
+  deleteForPurge?(
+    stageRecordId: string,
+    persistence: Persistence,
+  ): Promise<number>;
+
   /**
    * Delete every row of a stage record except the named steps.
    *
@@ -288,6 +294,8 @@ export interface BlobStore {
   get(key: string): Promise<unknown>;
   has(key: string): Promise<boolean>;
   delete(key: string): Promise<void>;
+  /** Atomically delete and report whether this call removed a blob. */
+  deleteForPurge?(key: string): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
 }
 
@@ -326,6 +334,11 @@ export interface JobTransport {
    * fails the insert.
    */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
+
+  getJobsForPurge?(
+    workflowRunId: string,
+  ): Promise<{ id: string; stageId: string }[]>;
+  deleteForRun?(workflowRunId: string): Promise<number>;
 
   /**
    * Remove every job row for the given stages of a run, whatever their

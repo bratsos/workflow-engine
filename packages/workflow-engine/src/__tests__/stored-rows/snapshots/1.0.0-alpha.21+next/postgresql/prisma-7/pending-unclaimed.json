@@ -13,7 +13,7 @@
       }
     },
     "skippedScenarios": [],
-    "captureTime": "2026-11-23T00:38:58.636Z"
+    "captureTime": "2026-11-23T03:21:59.226Z"
   },
   "columns": {
     "WorkflowRun": [
@@ -181,6 +181,7 @@
       "id",
       "occurredAt",
       "payload",
+      "pruneTerminal",
       "publishedAt",
       "retryCount",
       "sequence",
@@ -221,14 +222,14 @@
   "tables": {
     "WorkflowRun": [
       {
-        "id": "cmwsjflv10001ju3by9i1pqzu",
+        "id": "cmwsp98m600018j3b1p4rqijl",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.669Z"
+          "value": "2026-11-23T03:21:59.262Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.669Z"
+          "value": "2026-11-23T03:21:59.262Z"
         },
         "version": 1,
         "workflowId": "stored-rows-pending-unclaimed",
@@ -261,7 +262,7 @@
         "version": "sha256-b6075b2114aa2ba286d542979d346efa",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.648Z"
+          "value": "2026-11-23T03:21:59.238Z"
         },
         "snapshot": {
           "format": 1,
@@ -320,44 +321,45 @@
     "JobQueue": [],
     "OutboxEvent": [
       {
-        "id": "cmwsjflva0002ju3bugpb5w2p",
+        "id": "cmwsp98mc00028j3bvw38le2j",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.678Z"
+          "value": "2026-11-23T03:21:59.268Z"
         },
-        "workflowRunId": "cmwsjflv10001ju3by9i1pqzu",
+        "workflowRunId": "cmwsp98m600018j3b1p4rqijl",
         "sequence": 1,
         "eventType": "workflow:created",
         "payload": {
           "type": "workflow:created",
-          "timestamp": "2026-11-23T00:38:58.636Z",
+          "timestamp": "2026-11-23T03:21:59.226Z",
           "workflowId": "stored-rows-pending-unclaimed",
-          "workflowRunId": "cmwsjflv10001ju3by9i1pqzu"
+          "workflowRunId": "cmwsp98m600018j3b1p4rqijl"
         },
         "causationId": "stored-rows:pending-unclaimed",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.636Z"
+          "value": "2026-11-23T03:21:59.226Z"
         },
         "publishedAt": null,
         "deliveryClaim": null,
         "retryCount": 0,
-        "dlqAt": null
+        "dlqAt": null,
+        "pruneTerminal": false
       }
     ],
     "IdempotencyKey": [
       {
-        "id": "cmwsjflud0000ju3bwomnmz3i",
+        "id": "cmwsp98lf00008j3bys2p6wyp",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T00:38:58.636Z"
+          "value": "2026-11-23T03:21:59.226Z"
         },
         "key": "stored-rows:pending-unclaimed",
         "commandType": "run.create",
-        "workflowRunId": "cmwsjflv10001ju3by9i1pqzu",
+        "workflowRunId": "cmwsp98m600018j3b1p4rqijl",
         "result": {
           "status": "PENDING",
-          "workflowRunId": "cmwsjflv10001ju3by9i1pqzu",
+          "workflowRunId": "cmwsp98m600018j3b1p4rqijl",
           "definitionVersion": "sha256-b6075b2114aa2ba286d542979d346efa"
         }
       }

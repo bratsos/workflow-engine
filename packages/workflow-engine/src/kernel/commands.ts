@@ -506,33 +506,80 @@ export interface RunReapStuckResult {
 // run.purge
 // ---------------------------------------------------------------------------
 
-/**
- * Retention: deletes terminal runs that finished at or before `olderThan`.
- *
- * The kernel deletes each run through `PersistenceCore.deleteRun`, which
- * takes stages, logs, artifacts and annotations with it. After commit it
- * clears the `StepLedger` for every stage record, removes the job rows and
- * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
- * and step results under the engine's own key prefixes). The run's
- * `outbox_events` and `ai_calls` rows stay: they have no foreign key to the
- * run and nothing in the engine deletes them. A run reopened during the
- * sweep is kept. Emits no events. Bounded by `limit` so a tick
- * stays short; repeat until `purged` is 0.
- */
-export interface RunPurgeCommand {
+/** Delete terminal runs that finished at or before the cutoff. */
+export interface RunPurgeByAgeCommand {
   readonly type: "run.purge";
-  /** Runs whose `completedAt` (or, lacking one, `updatedAt`) is at or before this are eligible. */
   readonly olderThan: Date;
-  /** Defaults to all three terminal statuses. */
   readonly statuses?: readonly PurgeableRunStatus[];
   /** Maximum runs deleted per call. Defaults to 100. */
   readonly limit?: number;
 }
 
-/** Result of a `run.purge` command. Names only the runs actually deleted. */
-export interface RunPurgeResult {
+/** Erase specific runs or a bounded batch of terminal runs owned by a tenant. */
+export type RunPurgeByTargetCommand = { readonly type: "run.purge" } & (
+  | { readonly workflowRunIds: readonly string[] }
+  | { readonly tenantId: string; readonly limit?: number }
+);
+
+export type RunPurgeCommand = RunPurgeByAgeCommand | RunPurgeByTargetCommand;
+
+export interface RunPurgeByAgeResult {
   readonly purged: number;
   readonly workflowRunIds: string[];
+}
+
+export interface RunPurgeCounts {
+  runs: number;
+  stages: number;
+  steps: number;
+  jobs: number;
+  logs: number;
+  artifacts: number;
+  annotations: number;
+  outboxEvents: number;
+  idempotencyKeys: number;
+  aiCalls: number;
+  blobs: number;
+}
+
+export interface RunPurgeByTargetResult {
+  readonly removed: RunPurgeCounts;
+  readonly skipped: { workflowRunId: string; status: Status }[];
+  /**
+   * Runs to request again. `writers`: a stage execution or cancel sweep was
+   * still writing for the run. `persistence`: a redrive changed the run since
+   * it was read, or its rows could not be deleted.
+   */
+  readonly incomplete: {
+    workflowRunId: string;
+    failed: (
+      | "blobs"
+      | "aiCalls"
+      | "jobs"
+      | "steps"
+      | "persistence"
+      | "writers"
+    )[];
+  }[];
+}
+
+export type RunPurgeResult = RunPurgeByAgeResult | RunPurgeByTargetResult;
+
+export interface EnginePruneCommand {
+  readonly type: "engine.prune";
+  readonly aiCalls?: { readonly olderThan: Date };
+  readonly aiCallText?: { readonly now: Date };
+  readonly outbox?: { readonly publishedOlderThan: Date };
+  readonly idempotencyKeys?: { readonly olderThan: Date };
+  /** Maximum rows affected by each clause. Defaults to 100. */
+  readonly limit?: number;
+}
+
+export interface EnginePruneResult {
+  readonly aiCalls: number;
+  readonly aiCallText: number;
+  readonly outbox: number;
+  readonly idempotencyKeys: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +806,8 @@ export type KernelCommand =
   | OutboxFlushCommand
   | PluginReplayDLQCommand
   | RunReapStuckCommand
-  | RunPurgeCommand;
+  | RunPurgeCommand
+  | EnginePruneCommand;
 
 /** String literal union of all kernel command type discriminants. */
 export type KernelCommandType = KernelCommand["type"];
@@ -797,6 +845,10 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
                               ? PluginReplayDLQResult
                               : T extends RunReapStuckCommand
                                 ? RunReapStuckResult
-                                : T extends RunPurgeCommand
-                                  ? RunPurgeResult
-                                  : never;
+                                : T extends RunPurgeByAgeCommand
+                                  ? RunPurgeByAgeResult
+                                  : T extends RunPurgeByTargetCommand
+                                    ? RunPurgeByTargetResult
+                                    : T extends EnginePruneCommand
+                                      ? EnginePruneResult
+                                      : never;

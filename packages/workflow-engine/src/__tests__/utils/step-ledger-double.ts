@@ -31,6 +31,7 @@ export const STEP_LEDGER_METHODS = [
   "list",
   "clear",
   "clearExcept",
+  "deleteForPurge",
 ] as const satisfies readonly (keyof StepLedger)[];
 
 /** Fails to compile while a `StepLedger` method is missing from the list. */

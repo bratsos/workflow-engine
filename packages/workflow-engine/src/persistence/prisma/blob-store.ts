@@ -80,6 +80,12 @@ export class PrismaBlobStore implements BlobStore {
     await this.prisma.workflowBlob.deleteMany({ where: { key } });
   }
 
+  async deleteForPurge(key: string): Promise<boolean> {
+    return (
+      (await this.prisma.workflowBlob.deleteMany({ where: { key } })).count > 0
+    );
+  }
+
   async list(prefix: string): Promise<string[]> {
     const literal = literalPrefixQuery<{ key: string }>(
       this.prisma,

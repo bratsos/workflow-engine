@@ -26,6 +26,10 @@ export class InMemoryBlobStore implements BlobStore {
     this.store.delete(key);
   }
 
+  async deleteForPurge(key: string): Promise<boolean> {
+    return this.store.delete(key);
+  }
+
   async list(prefix: string): Promise<string[]> {
     return [...this.store.keys()].filter((k) => k.startsWith(prefix));
   }

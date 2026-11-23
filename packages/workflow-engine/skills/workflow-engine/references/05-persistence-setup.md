@@ -150,17 +150,21 @@ interface PersistenceCore {
   // been in progress for at least that long, measured against
   // `options.now`. The kernel passes this automatically -- see
   // `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes).
+  // `options.workflowRunId` stamps the key with the run it acts on, so
+  // erasure removes it with that run.
   acquireIdempotencyKey(
     key: string,
     commandType: string,
-    options?: { now?: Date; staleInProgressAfterMs?: number },
+    options?: { now?: Date; staleInProgressAfterMs?: number; workflowRunId?: string },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
   >;
-  completeIdempotencyKey(key: string, commandType: string, result: unknown, workflowRunId: string | null): Promise<void>;
-  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
+  // `acquiredAt` is the `now` the key was acquired with: complete or delete
+  // only the in-progress row created then. Completion never creates a row.
+  completeIdempotencyKey(key: string, commandType: string, result: unknown, workflowRunId: string | null, acquiredAt?: Date): Promise<void>;
+  releaseIdempotencyKey(key: string, commandType: string, acquiredAt?: Date): Promise<void>;
 }
 ```
 
@@ -696,6 +700,7 @@ model WorkflowArtifact {
 
   @@unique([workflowRunId, key])
   @@index([workflowRunId])
+  @@index([workflowStageId])
   @@map("workflow_artifacts")
 }
 ```
@@ -732,6 +737,7 @@ model WorkflowAnnotation {
   @@index([workflowRunId, createdAt])
   @@index([workflowRunId, scope])
   @@index([workflowRunId, actorId])
+  @@index([workflowStageRecordId])
   @@map("workflow_annotations")
 }
 ```
@@ -805,6 +811,7 @@ model OutboxEvent {
   deliveryClaim   String?
   retryCount      Int       @default(0)
   dlqAt           DateTime?
+  pruneTerminal Boolean   @default(false)
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
@@ -824,7 +831,7 @@ model OutboxEvent {
 
 The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds a rotation rank (`r`, 19 digits, `|`) and, during a live claim, an expiry and owner token after it. The rank persists after delivery or a retry so a fresh flusher can resume the rotation with one index lookup. One statement reads the rotation position, claims one head per available run and then each claimed run's next live events, up to an equal share of the page. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event. On PostgreSQL the claim needs a raw read (`$queryRaw` or `$queryRawUnsafe`); `createPrismaWorkflowPersistence` refuses a root without one with `OutboxClaimUnsupportedError` (`OUTBOX_CLAIM_UNSUPPORTED`). A database without the schema step (the column, or on SQLite any of the three indexes) makes `outbox.flush` reject with `OutboxSchemaMissingError` (`OUTBOX_SCHEMA_MISSING`), which names the migration; nothing is claimed and the events stay.
 
-Events commit with their state changes. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. Claim via a bounded page of run heads, return each acquired row with its persisted retry count, and mark uncommitted transaction views with `outboxDeliveryDeferred: true` for a later root flush. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
+Events commit with their state changes. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Age-based purge leaves outbox rows. Targeted purge deletes them and `engine.prune` removes old published events of terminal runs. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. Claim via a bounded page of run heads, return each acquired row with its persisted retry count, and mark uncommitted transaction views with `outboxDeliveryDeferred: true` for a later root flush. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
 
 ### IdempotencyKey Model
 
@@ -839,6 +846,7 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@index([workflowRunId])
+  @@index([workflowRunId, commandType])
   @@index([createdAt])
   @@map("idempotency_keys")
 }
@@ -873,6 +881,7 @@ model AICall {
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([createdAt])
   @@index([tenantId, createdAt])
   @@index([workflowRunId])
   @@index([textExpiresAt])
@@ -1602,7 +1611,7 @@ Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
 The schema includes indexes for common query patterns (on Prisma 8 the six with a `DESC` column come from `mixed-order-indexes.sql`, not the contract):
 - `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` - the run claim and the dequeue, `FOR UPDATE SKIP LOCKED`, flat with depth
 - `(createdAt DESC, id DESC)` and its `status`, `workflowId` and `tenantId` prefixes on `workflow_runs` - newest-first listings, keyset paginated
-- `(tenantId, createdAt)`, `(workflowRunId)` and `(textExpiresAt)` on `ai_calls` - nullable attribution and expiry fields
+- `(tenantId, createdAt)`, `(workflowRunId)`, `(createdAt)` and `(textExpiresAt)` on `ai_calls` support attribution and retention
 - `(workflowRunId)` and `(createdAt)` on `idempotency_keys` - run attribution and key age
 - `(definitionVersion)` and `(status, workflowId, definitionVersion)` on `workflow_runs` - version lookups and the version-filtered claim
 - `nextPollAt` - for suspended stage polling (`stage.pollSuspended` reads `SUSPENDED` rows with `nextPollAt <= now`, then claims each by moving `nextPollAt` forward with `expectedVersion`; a custom adapter needs the version guard on `updateStage` for two orchestrators to poll safely)

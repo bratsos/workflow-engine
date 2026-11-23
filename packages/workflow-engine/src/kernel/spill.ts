@@ -436,6 +436,10 @@ export function withStepResultSpill(
       await spill.deleteUnder(stepWriteSpillPrefix(stageRecordId));
     },
 
+    ...(ledger.deleteForPurge && {
+      deleteForPurge: ledger.deleteForPurge.bind(ledger),
+    }),
+
     // `clearExcept` is optional on the port and the kernel branches on its
     // presence: a ledger without it gets the whole-ledger clear that
     // destroys the external keys of effects still in flight. So the
@@ -634,7 +638,10 @@ export function createSpillingJobTransport(
     },
 
     async enqueueParallel(jobs: EnqueueJobInput[]) {
-      const packed = await Promise.all(
+      // Every put settles before this answers, even after one failed: a put
+      // still running once the caller moved on would land outside its run
+      // writer registration.
+      const settled = await Promise.allSettled(
         jobs.map(async (job) => {
           if (job.payload === undefined) return job;
           const originalGroupValue =
@@ -666,7 +673,27 @@ export function createSpillingJobTransport(
           };
         }),
       );
-      return transport.enqueueParallel(packed);
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+      return transport.enqueueParallel(
+        settled.map(
+          (result) => (result as PromiseFulfilledResult<EnqueueJobInput>).value,
+        ),
+      );
+    },
+
+    async getJobsForPurge(workflowRunId) {
+      return transport.getJobsForPurge
+        ? transport.getJobsForPurge(workflowRunId)
+        : transport.getJobsByWorkflowRun(workflowRunId);
+    },
+
+    async deleteForRun(workflowRunId) {
+      if (transport.deleteForRun) return transport.deleteForRun(workflowRunId);
+      const jobs = await transport.getJobsByWorkflowRun(workflowRunId);
+      return transport.deleteByRunAndStages(workflowRunId, [
+        ...new Set(jobs.map((job) => job.stageId)),
+      ]);
     },
 
     async deleteByRunAndStages(workflowRunId: string, stageIds: string[]) {

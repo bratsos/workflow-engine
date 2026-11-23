@@ -203,6 +203,7 @@ model WorkflowArtifact {
 
   @@index([workflowRunId, key], map: "workflow_artifacts_workflowRunId_key_key", unique: true)
   @@index([workflowRunId], map: "workflow_artifacts_workflowRunId_idx")
+  @@index([workflowStageId], map: "workflow_artifacts_workflowStageId_idx")
   @@map("workflow_artifacts")
 }
 
@@ -235,6 +236,7 @@ model AICall {
   @@index([batchId, requestId], map: "ai_calls_batch_request_unique", unique: true)
   @@index([batchId], map: "ai_calls_batchId_idx")
   @@index([topic], map: "ai_calls_topic_idx")
+  @@index([createdAt], map: "ai_calls_createdAt_idx")
   @@index([tenantId, createdAt], map: "ai_calls_tenantId_createdAt_idx")
   @@index([workflowRunId], map: "ai_calls_workflowRunId_idx")
   @@index([textExpiresAt], map: "ai_calls_textExpiresAt_idx")
@@ -270,6 +272,7 @@ model WorkflowAnnotation {
   @@index([workflowRunId, createdAt], map: "workflow_annotations_workflowRunId_createdAt_idx")
   @@index([workflowRunId, scope], map: "workflow_annotations_workflowRunId_scope_idx")
   @@index([workflowRunId, actorId], map: "workflow_annotations_workflowRunId_actorId_idx")
+  @@index([workflowStageRecordId], map: "workflow_annotations_workflowStageRecordId_idx")
   @@map("workflow_annotations")
 }
 
@@ -317,6 +320,7 @@ model OutboxEvent {
   deliveryClaim String?
   retryCount    Int                @default(0)
   dlqAt         TimestampString(3)?
+  pruneTerminal Boolean   @default(false)
 
   @@index([workflowRunId, sequence], map: "outbox_events_workflowRunId_sequence_key", unique: true)
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
@@ -340,6 +344,7 @@ model IdempotencyKey {
 
   @@index([key, commandType], map: "idempotency_keys_key_commandType_key", unique: true)
   @@index([workflowRunId], map: "idempotency_keys_workflowRunId_idx")
+  @@index([workflowRunId, commandType], map: "idempotency_keys_workflowRunId_commandType_idx")
   @@index([createdAt], map: "idempotency_keys_createdAt_idx")
   @@map("idempotency_keys")
 }
