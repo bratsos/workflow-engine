@@ -48,7 +48,7 @@ The engine follows a **kernel + host** pattern:
 
 - **Core library** provides the command kernel, stage/workflow definitions, durable steps (`ctx.step.*`, backed by a step ledger), and persistence adapters.
 - **Host packages** wrap the kernel with environment-specific process management (polling loops, signal handling, request lifecycles, job lease heartbeats that abort a cancelled stage).
-- The **kernel** is a pure command dispatcher -- no timers, no signals, no global state -- making it portable across any runtime.
+- The **kernel** is a pure command dispatcher -- no timers, no signals, no global state apart from the process-wide logger you can set with `setLogger` -- making it portable across any runtime.
 - The **console** is optional and nothing in the engine depends on it.
 
 ## Development

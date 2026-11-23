@@ -187,10 +187,8 @@ export class PrismaAICallLogger implements AICallLogger {
       done();
       const message = "Failed to persist AI call";
       const includeError = isTraceTextEnabled();
-      logger.warn(
-        message,
-        includeError ? { ...fields, error } : fields,
-        () => includeError ? [message, error] : [message],
+      logger.warn(message, includeError ? { ...fields, error } : fields, () =>
+        includeError ? [message, error] : [message],
       );
     });
     return result;
@@ -201,35 +199,38 @@ export class PrismaAICallLogger implements AICallLogger {
    * callers, so callers coordinating run erasure can wait for it.
    */
   logCall(call: CreateAICallInput): Promise<void> {
-    return this.#trackWrite(async () => {
-      await sqliteCheckFor(this);
-      await this.prisma.aICall.create({
-        data: {
-          topic: call.topic,
-          callType: call.callType,
-          modelKey: call.modelKey,
-          modelId: call.modelId,
-          prompt: call.prompt,
-          response: call.response,
-          inputTokens: call.inputTokens,
-          outputTokens: call.outputTokens,
-          cost: call.cost,
-          ...costColumns(call),
-          ...attributionColumns(call),
-          metadata: call.metadata,
-          ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
-          ...(call.requestId !== undefined
-            ? { requestId: call.requestId }
-            : {}),
-        },
-      });
-    }, {
-      workflowRunId: call.workflowRunId,
-      topic: call.topic,
-      batchId: call.batchId,
-      requestId: call.requestId,
-      model: call.modelKey,
-    });
+    return this.#trackWrite(
+      async () => {
+        await sqliteCheckFor(this);
+        await this.prisma.aICall.create({
+          data: {
+            topic: call.topic,
+            callType: call.callType,
+            modelKey: call.modelKey,
+            modelId: call.modelId,
+            prompt: call.prompt,
+            response: call.response,
+            inputTokens: call.inputTokens,
+            outputTokens: call.outputTokens,
+            cost: call.cost,
+            ...costColumns(call),
+            ...attributionColumns(call),
+            metadata: call.metadata,
+            ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
+            ...(call.requestId !== undefined
+              ? { requestId: call.requestId }
+              : {}),
+          },
+        });
+      },
+      {
+        workflowRunId: call.workflowRunId,
+        topic: call.topic,
+        batchId: call.batchId,
+        requestId: call.requestId,
+        model: call.modelKey,
+      },
+    );
   }
 
   flush(options?: AICallFlushOptions) {
@@ -243,10 +244,13 @@ export class PrismaAICallLogger implements AICallLogger {
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
-    return this.#trackWrite(async () => {
-      await sqliteCheckFor(this);
-      await this.#insertBatchResults(batchId, results);
-    }, { batchId });
+    return this.#trackWrite(
+      async () => {
+        await sqliteCheckFor(this);
+        await this.#insertBatchResults(batchId, results);
+      },
+      { batchId },
+    );
   }
 
   async #insertBatchResults(

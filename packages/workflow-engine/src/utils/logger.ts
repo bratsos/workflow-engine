@@ -45,7 +45,10 @@ function withoutPreviews(fields: Fields): Fields {
     : fields;
 }
 
-/** Create a logger with an optional namespace. Existing instances use the current sink. */
+/**
+ * Create a logger with an optional namespace. Existing instances use the current sink.
+ * @internal Used by the host packages; applications use `setLogger`.
+ */
 export function createLogger(
   prefix?: string,
   consoleFields: (fields: Fields) => Fields = (fields) => fields,

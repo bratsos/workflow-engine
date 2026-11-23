@@ -69,8 +69,8 @@ const worker = createActivityWorker({
   // Optional (v0.11+):
   onError: (error, { consecutiveFailures }) => {
     // Called whenever processOne() throws (e.g. a permanent lease/version
-    // mismatch). Defaults to console.error so failures are never silently
-    // swallowed.
+    // mismatch). Defaults to the engine logger's error level (see setLogger),
+    // so failures are never silently swallowed.
     logger.error("activity worker error", { error, consecutiveFailures });
   },
   maxBackoffMs: 30_000, // caps the exponential backoff applied between consecutive failures (default 30_000)
