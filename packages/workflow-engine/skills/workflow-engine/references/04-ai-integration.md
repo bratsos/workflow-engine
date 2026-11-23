@@ -197,14 +197,17 @@ uses the supplied `modelKey` as the recorded model ID. It defaults to
 `costSource: "reported"`; set `"estimated"` for a supplied estimate.
 
 Text capture controls the AI call row and trace output only. Under
-`store: "none"` or a TTL, a failed call's row records the error's name and
-HTTP status instead of its message, and a failed batch item's row records
-`Batch request failed`. A provider error message can contain text the
-provider echoed from the request. Outside the row, provider errors are
-stored and passed on as in earlier releases: values thrown to callers and
-the SDK, stage and step error columns, events, outbox payloads, workflow logs
-and console reads. The engine's console lines include provider warnings and
-error text only with both trace flags.
+`store: "none"` or a TTL, a row's `metadata.error` is stored as
+`AI call failed`, whichever helper or direct `ctx.aiLogger` write produced
+it; a TTL row never stores the message, because text expiry does not clear
+metadata. A provider error message can contain text the provider echoed from
+the request. Outside the row, provider errors are stored and passed on as in
+earlier releases: values thrown to callers and the SDK, stage and step error
+columns, events, outbox payloads, workflow logs and console reads. The
+engine's own console lines print provider error text only with both trace
+flags. Provider warnings reach the SDK, step callbacks and `rawResult`
+unchanged, and the SDK prints them as process warnings unless you set
+`globalThis.AI_SDK_LOG_WARNINGS = false`.
 Use those flags only for data you intend to send to process diagnostics.
 
 The accounting policy covers the prompt, response and top-level instructions.
@@ -218,7 +221,8 @@ use the policy and you have addressed historical rows.
 At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
 `{ failed, pending }`. Failed writes are cumulative for that helper and its
 children. Pending includes open streams and writes still in progress when
-the timeout expires. A write the database refuses reaches `onLogError`. A
+the timeout expires. A stream is pending from the call until its row is
+written or it ends without one, including after an error part. A write the database refuses reaches `onLogError`. A
 caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
 message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
 rejects if that write fails; `recordResults` retries it.
