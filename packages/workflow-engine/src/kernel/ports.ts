@@ -208,11 +208,7 @@ export interface StepLedger {
 /** Services made available lazily to stage execution contexts. */
 export interface KernelServices {
   aiLogger?: AICallLogger;
-  /**
-   * Custom factories must forward options to createAIHelper, including run
-   * attribution. A returned wrapper should spread the helper or wrap it in a
-   * Proxy or Object.create, so ctx.aiLogger keeps the helper's labels.
-   */
+  /** Custom factories must forward options to createAIHelper, including run attribution. */
   ai?: AIHelperFactory;
   /**
    * Finds the transport for a stored batch ref when `run.cancel` cancels the

@@ -38,10 +38,7 @@ import {
   generateText as generateTextImpl,
 } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import {
-  forwardingProxy,
-  traceProviderDiagnostic,
-} from "./provider-diagnostics.js";
+import { forwardingProxy } from "./provider-diagnostics.js";
 import { calculateCostWithDiscount, logger } from "./shared";
 import { streamText as streamTextImpl } from "./stream";
 import { transcribe as transcribeImpl } from "./transcribe";
@@ -53,7 +50,6 @@ import type {
   AIHelper,
   AIHelperChildOptions,
   AIHelperContext,
-  AIHelperOptions,
   AIHelperStats,
   AIObjectResult,
   AIStreamResult,
@@ -77,42 +73,13 @@ import type {
   TranscribeOptions,
   TranscriptionAudio,
 } from "./types";
-import { AICallWriteTracker } from "./write-tracker";
+import { AICallWriteTracker, trackedWrite } from "./write-tracker";
 
 // ============================================================================
 // AIHelper Implementation
 // ============================================================================
 
-// Symbol.for, so a second copy of this module resolves the same key.
-const CALL_LOGGER: unique symbol = Symbol.for("workflow-engine.callLogger");
-
-/**
- * The policy-applying logger of a helper made here, including children. Spread,
- * Proxy and Object.create wrappers of such a helper resolve to it as well.
- */
-export function callLoggerOf(helper: AIHelper): AICallLogger | undefined {
-  return (helper as { [CALL_LOGGER]?: AICallLogger })[CALL_LOGGER];
-}
-
-type TextPolicy = AIHelperOptions["text"];
-// Lower is stricter: no text, then the shortest expiry, then text kept without expiry.
-const strictness = (text: TextPolicy) =>
-  text?.store === "none" ? -1 : (text?.ttlMs ?? Number.POSITIVE_INFINITY);
-
-/**
- * For a helper the engine cannot resolve: a logger with the attribution of the
- * first of `helpers` and the strictest text policy among them, counted by the
- * helper that has that policy. Undefined when none of them was made here.
- */
-export function failSafeCallLogger(
-  helpers: readonly AIHelper[],
-): AICallLogger | undefined {
-  return AIHelperImpl.failSafeLogger(helpers);
-}
-
 class AIHelperImpl implements AIHelper {
-  /** Own and enumerable, so spread copies it; Proxy and Object.create reach it. */
-  readonly [CALL_LOGGER]: AICallLogger;
   readonly topic: string;
   private readonly aiCallLogger: AICallLogger;
   private readonly logContext?: LogContext;
@@ -161,7 +128,6 @@ class AIHelperImpl implements AIHelper {
     this.trackedLogger = forwardingProxy(aiCallLogger, (key, value) =>
       Object.hasOwn(writes, key) ? writes[key as keyof AICallLogger] : value,
     );
-    this[CALL_LOGGER] = this.trackedLogger;
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -189,7 +155,6 @@ class AIHelperImpl implements AIHelper {
         );
       };
     }
-    options?.onHelper?.(this);
   }
 
   private prepareCall(input: CreateAICallInput): CreateAICallInput {
@@ -235,9 +200,7 @@ class AIHelperImpl implements AIHelper {
     calls: CreateAICallInput[],
     write: () => void | Promise<void>,
   ): Promise<void> {
-    const done = this.writes.begin();
-    const onFailure = (error: unknown) => {
-      this.writes.fail();
+    return trackedWrite(this.writes, write, (error) => {
       for (const call of calls) {
         try {
           void Promise.resolve(this.options?.onLogError?.(error, call)).catch(
@@ -247,47 +210,7 @@ class AIHelperImpl implements AIHelper {
           // A reporting callback cannot change the model result or block flush.
         }
       }
-      done();
-    };
-    let result: void | Promise<void>;
-    try {
-      result = write();
-    } catch (error) {
-      // A synchronous throw still reaches the caller, as in earlier releases.
-      onFailure(error);
-      throw error;
-    }
-    if (!result) {
-      done();
-      return Promise.resolve();
-    }
-    // A database error can quote the row it refused; callers get a safe one.
-    const tracked = Promise.resolve(result).then(done, (error: unknown) => {
-      onFailure(error);
-      traceProviderDiagnostic("AI call accounting write failed", error);
-      throw new Error("AI call accounting write failed");
     });
-    void tracked.catch(() => {});
-    return tracked;
-  }
-
-  static failSafeLogger(
-    helpers: readonly AIHelper[],
-  ): AICallLogger | undefined {
-    const made = helpers.filter((h) => h instanceof AIHelperImpl);
-    const root = made[0];
-    if (!root) return undefined;
-    const strictest = made.reduce((a, b) =>
-      strictness(b.options?.text) < strictness(a.options?.text) ? b : a,
-    );
-    return new AIHelperImpl(
-      root.topic,
-      root.aiCallLogger,
-      root.logContext,
-      root.providerResolver,
-      { ...root.options, text: strictest.options?.text },
-      strictest.writes,
-    ).trackedLogger;
   }
 
   /** Bundle the state generateText/generateObject/embed/streamText/batch need. */

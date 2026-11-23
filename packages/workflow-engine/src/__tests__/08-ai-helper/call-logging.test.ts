@@ -4,9 +4,7 @@ import { MockLanguageModelV4 } from "ai/test";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
-  callLoggerOf,
   createAIHelper,
-  failSafeCallLogger,
   registerEvaluationProvider,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
@@ -463,89 +461,30 @@ it("works with frozen loggers and providers", async () => {
   expect(base.getAllCalls()).toHaveLength(2);
 });
 
-it("rejects an awaited failed write safely, reports every failure and forwards logger members", async () => {
+it("counts and reports every failed write and keeps a synchronous throw", async () => {
   const onLogError = vi.fn<(error: unknown, call: CreateAICallInput) => void>();
   const refusal = new Error(`constraint refused ${marker}`);
-  const base = new InMemoryAICallLogger();
-  const logger = Object.assign(base, {
+  const logger = Object.assign(new InMemoryAICallLogger(), {
     async logCall() {
       throw refusal;
     },
-    custom: () => "forwarded",
   });
   const ai = createAIHelper("accounting", logger, undefined, undefined, {
     onLogError,
   });
-  const bound = callLoggerOf(ai);
-  const call = { ...externalCall, topic: "accounting", modelId: "m" };
-  const awaited = await Promise.resolve(bound!.logCall(call)).catch(
-    (error: unknown) => error,
-  );
-  expect(awaited).toBeInstanceOf(Error);
-  expect(String((awaited as Error).message)).toBe(
-    "AI call accounting write failed",
-  );
   // Ignored: handled, counted and reported.
-  void bound!.logCall(call);
   ai.recordCall(externalCall);
-  expect(await ai.flush()).toEqual({ failed: 3, pending: 0 });
-  expect(onLogError).toHaveBeenCalledTimes(3);
+  ai.recordCall(externalCall);
+  expect(await ai.flush()).toEqual({ failed: 2, pending: 0 });
+  expect(onLogError).toHaveBeenCalledTimes(2);
   expect(onLogError).toHaveBeenCalledWith(refusal, expect.any(Object));
-  expect((bound as unknown as { custom(): string }).custom()).toBe("forwarded");
 
   // A synchronous throw reaches the caller, as in earlier releases.
   logger.logCall = (() => {
     throw refusal;
   }) as unknown as typeof logger.logCall;
   expect(() => ai.recordCall(externalCall)).toThrow(refusal);
-  expect(await ai.flush()).toEqual({ failed: 4, pending: 0 });
-});
-
-it("gives an unresolved helper the root's attribution and the strictest text policy", async () => {
-  const written: CreateAICallInput[] = [];
-  const base = Object.assign(new InMemoryAICallLogger(), {
-    logCall(call: CreateAICallInput) {
-      written.push(call);
-    },
-  });
-  const root = createAIHelper("stage", base, undefined, undefined, {
-    attribution: { tenantId: "tenant-a", labels: { task: "classify" } },
-  });
-  const child = (text: { store: "full" | "none"; ttlMs?: number }) =>
-    root.createChild("private", undefined, {
-      text,
-      attribution: { labels: { scope: "private" } },
-    });
-  const call = { ...externalCall, topic: "stage", modelId: "m" };
-  const before = Date.now();
-  await failSafeCallLogger([
-    root,
-    child({ store: "full", ttlMs: 60_000 }),
-    child({ store: "full", ttlMs: 1_000 }),
-  ])!.logCall(call);
-  await failSafeCallLogger([
-    root,
-    child({ store: "full", ttlMs: 1_000 }),
-    child({ store: "none" }),
-  ])!.logCall(call);
-  const [shortest, none] = written;
-  expect(shortest).toMatchObject({
-    tenantId: "tenant-a",
-    labels: { task: "classify" },
-    response: "response marker",
-  });
-  expect(shortest!.textExpiresAt!.getTime()).toBeLessThanOrEqual(
-    Date.now() + 1_000,
-  );
-  expect(shortest!.textExpiresAt!.getTime()).toBeGreaterThanOrEqual(
-    before + 1_000,
-  );
-  expect(none).toMatchObject({
-    labels: { task: "classify" },
-    prompt: "",
-    response: "",
-  });
-  expect(failSafeCallLogger([])).toBeUndefined();
+  expect(await ai.flush()).toEqual({ failed: 3, pending: 0 });
 });
 
 it("traces how many evaluation questions there are, not their keys", async () => {

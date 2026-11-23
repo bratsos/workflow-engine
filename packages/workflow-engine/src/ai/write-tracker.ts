@@ -3,6 +3,7 @@ import type {
   AICallFlushOptions,
   AICallFlushResult,
 } from "../persistence/interface.js";
+import { traceProviderDiagnostic } from "./provider-diagnostics.js";
 
 export const DEFAULT_AI_FLUSH_TIMEOUT_MS = 5_000;
 
@@ -57,6 +58,48 @@ export class AICallWriteTracker {
     }
     return { failed: this.failed, pending: this.pending };
   }
+}
+
+/**
+ * Run a logger write that `writes` counts until it settles. A failure is
+ * counted and reported to `onFailure`; a rejection reaches the caller as a
+ * safe error, because a database error can quote the row it refused, and is
+ * handled when the caller ignores it. A synchronous throw still reaches the
+ * caller, as in earlier releases.
+ */
+export function trackedWrite(
+  writes: AICallWriteTracker,
+  write: () => void | Promise<void>,
+  onFailure: (error: unknown) => void = () => {},
+): Promise<void> {
+  const done = writes.begin();
+  const failed = (error: unknown) => {
+    writes.fail();
+    try {
+      onFailure(error);
+    } catch {
+      // A reporting callback cannot change the result or block flush.
+    }
+    done();
+  };
+  let result: void | Promise<void>;
+  try {
+    result = write();
+  } catch (error) {
+    failed(error);
+    throw error;
+  }
+  if (!result) {
+    done();
+    return Promise.resolve();
+  }
+  const tracked = Promise.resolve(result).then(done, (error: unknown) => {
+    failed(error);
+    traceProviderDiagnostic("AI call accounting write failed", error);
+    throw new Error("AI call accounting write failed");
+  });
+  void tracked.catch(() => {});
+  return tracked;
 }
 
 /** Apply the caller's own bound even if a custom flush ignores it or throws. */

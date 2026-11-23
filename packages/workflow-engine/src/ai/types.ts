@@ -38,8 +38,6 @@ export interface AIHelperOptions {
 /** Options forwarded by the kernel when binding a helper to a stage. */
 export type StageAIHelperOptions = AIHelperOptions & {
   attribution?: { workflowRunId?: string };
-  /** Called with each helper made from these options, including children. */
-  onHelper?: (helper: AIHelper) => void;
 };
 
 export type AIHelperChildOptions = Pick<

@@ -1,20 +1,17 @@
-import {
-  callLoggerOf,
-  createAIHelper,
-  failSafeCallLogger,
-} from "../../ai/ai-helper.js";
 import { forwardingProxy } from "../../ai/provider-diagnostics.js";
 import type {
   AIHelper,
   LogContext,
   StageAIHelperOptions,
 } from "../../ai/types.js";
+import { AICallWriteTracker, trackedWrite } from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
 import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
   AICallLogger,
+  CreateAICallInput,
   CreateAnnotationInput,
 } from "../../persistence/interface.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
@@ -48,32 +45,44 @@ export function defineLazyAIContext<T extends object>(
   deps: ExecutorDeps,
 ): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
   let helper: AIHelper | undefined;
-  let stageLogger: AICallLogger | undefined;
-  // Helpers made from the stage's options while the factory runs.
-  const made: AIHelper[] = [];
-  let inFactory = false;
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
-  // The stage's calls name its run, so erasing the run finds them. Every
-  // other member is the configured logger's own, bound to it.
+  // Rows keep the text policy and attribution of whatever built them. The
+  // stage fills only what they lack: its run, so erasing the run finds them,
+  // the run's tenant, and the run's labels under the row's own. Every other
+  // member is the configured logger's own, bound to it.
+  const stamp = (call: CreateAICallInput): CreateAICallInput => ({
+    ...call,
+    workflowRunId: call.workflowRunId ?? params.workflowRunId,
+    tenantId: call.tenantId ?? params.tenantId,
+    labels:
+      params.labels || call.labels
+        ? { ...params.labels, ...call.labels }
+        : undefined,
+  });
+  const overriding = (logger: AICallLogger, own: Partial<AICallLogger>) =>
+    forwardingProxy(logger, (key, value) =>
+      Object.hasOwn(own, key) ? own[key as keyof AICallLogger] : value,
+    );
   let scopedLogger: AICallLogger | undefined;
-  const loggerForRun = (logger: AICallLogger): AICallLogger => {
-    const stamped: Partial<AICallLogger> = {
-      logCall: (call) =>
-        logger.logCall({ ...call, workflowRunId: params.workflowRunId }),
+  const loggerForRun = (logger: AICallLogger): AICallLogger =>
+    (scopedLogger ??= overriding(logger, {
+      logCall: (call) => logger.logCall(stamp(call)),
       logBatchResults: (batchId, calls) =>
-        logger.logBatchResults(
-          batchId,
-          calls.map((call) => ({
-            ...call,
-            workflowRunId: params.workflowRunId,
-          })),
-        ),
-    };
-    return (scopedLogger ??= forwardingProxy(logger, (key, value) =>
-      Object.hasOwn(stamped, key) ? stamped[key as keyof AICallLogger] : value,
-    ));
+        logger.logBatchResults(batchId, calls.map(stamp)),
+    }));
+  // ctx.aiLogger stores direct writes as given, and its flush covers them
+  // from the call until they settle.
+  let stageLogger: AICallLogger | undefined;
+  const directLogger = (logger: AICallLogger): AICallLogger => {
+    const writes = new AICallWriteTracker();
+    return overriding(logger, {
+      logCall: (call) => trackedWrite(writes, () => logger.logCall(call)),
+      logBatchResults: (batchId, calls) =>
+        trackedWrite(writes, () => logger.logBatchResults(batchId, calls)),
+      flush: (options) => writes.flush(options),
+    });
   };
 
   const configured = () => {
@@ -99,25 +108,17 @@ export function defineLazyAIContext<T extends object>(
       labels: params.labels,
       workflowRunId: params.workflowRunId,
     },
-    onHelper: (created) => {
-      if (inFactory) made.push(created);
-    },
   };
   const getHelper = (): AIHelper => {
     if (!helper) {
       const services = configured();
-      inFactory = true;
-      try {
-        helper = services.ai(
-          topic,
-          services.aiLogger,
-          logContext,
-          undefined,
-          options,
-        );
-      } finally {
-        inFactory = false;
-      }
+      helper = services.ai(
+        topic,
+        services.aiLogger,
+        logContext,
+        undefined,
+        options,
+      );
     }
     return helper;
   };
@@ -131,27 +132,7 @@ export function defineLazyAIContext<T extends object>(
     aiLogger: {
       enumerable: true,
       configurable: true,
-      get: () => {
-        // A returned wrapper that hides the helper it delegates to gets the
-        // strictest text policy made during the factory call; a custom
-        // implementation that made none gets no text.
-        stageLogger ??=
-          callLoggerOf(getHelper()) ??
-          failSafeCallLogger(made) ??
-          callLoggerOf(
-            createAIHelper(
-              topic,
-              configured().aiLogger,
-              logContext,
-              undefined,
-              {
-                ...options,
-                text: { store: "none" },
-              },
-            ),
-          );
-        return stageLogger!;
-      },
+      get: () => (stageLogger ??= directLogger(configured().aiLogger)),
     },
   });
 
