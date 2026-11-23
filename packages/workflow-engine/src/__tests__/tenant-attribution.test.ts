@@ -1909,24 +1909,23 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       },
     });
     const configured = freshLogger();
-    const { kernel, job } = await queueJob(stage, {
-      services: {
-        aiLogger: {
-          async logCall(call: CreateAICallInput) {
-            entered.resolve();
-            await release.promise;
-            if (result === "refused") throw new Error(`refused ${sensitive}`);
-            await configured.logCall(call);
-          },
-          logBatchResults: (batchId, calls) =>
-            configured.logBatchResults(batchId, calls),
-          getStats: (topic) => configured.getStats(topic),
-          isRecorded: (batchId) => configured.isRecorded(batchId),
-          transactionReads: (persistence) =>
-            configured.transactionReads(persistence),
+    const aiLogger: AICallLogger & Pick<typeof configured, "transactionReads"> =
+      {
+        async logCall(call: CreateAICallInput) {
+          entered.resolve();
+          await release.promise;
+          if (result === "refused") throw new Error(`refused ${sensitive}`);
+          await configured.logCall(call);
         },
-        ai: createAIHelper,
-      },
+        logBatchResults: (batchId, calls) =>
+          configured.logBatchResults(batchId, calls),
+        getStats: (topic) => configured.getStats(topic),
+        isRecorded: (batchId) => configured.isRecorded(batchId),
+        transactionReads: (persistence) =>
+          configured.transactionReads(persistence),
+      };
+    const { kernel, job } = await queueJob(stage, {
+      services: { aiLogger, ai: createAIHelper },
     });
     expect(
       (
@@ -2241,7 +2240,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     "a class instance",
   ] as const)("keeps every member of a configured logger that is %s when a stage spreads ctx.aiLogger into a decorator", async (shape) => {
     const configured = freshLogger();
-    const aiLogger: AICallLogger =
+    const aiLogger: AICallLogger & Pick<typeof configured, "transactionReads"> =
       shape === "a class instance"
         ? configured
         : {
