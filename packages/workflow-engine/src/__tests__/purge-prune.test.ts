@@ -1585,6 +1585,32 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       expect(await leftovers()).toEqual(before);
     });
 
+    it("gives a late signal to an ended run the refusal of a wait past its deadline and leaves the wait as it was", async () => {
+      const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
+      await db.stepLedger.claim({
+        stageRecordId: stage.id,
+        stepId: "answer",
+        seq: 1,
+        kind: "signal",
+        status: "pending",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: new Date(Date.now() - 60_000),
+        waitState: { onTimeout: "return" },
+      });
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(await kernel().dispatch(signal(id))).toEqual({
+        ok: true,
+        signalled: false,
+        alreadyCompleted: true,
+        timedOut: true,
+      });
+      expect(await db.stepLedger.get(stage.id, "answer")).toMatchObject({
+        status: "pending",
+      });
+      expect(await db.client.workflowBlob.count()).toBe(0);
+    });
+
     it("writes nothing once the run it read has been erased", async () => {
       const { id } = await db.seed("RUNNING", "SUSPENDED");
       const gate = hold();
