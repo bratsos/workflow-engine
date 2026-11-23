@@ -206,6 +206,19 @@ async function dequeueAsMessage(
 // ============================================================================
 
 describe("ServerlessHost", () => {
+  it("flushes at the end of maintenance and job processing invocations", async () => {
+    const { kernel, jobTransport } = createTestEnv();
+    const flush = vi.spyOn(kernel, "flush");
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await host.runMaintenanceTick();
+    await host.processAvailableJobs();
+    expect(flush).toHaveBeenCalledTimes(2);
+  });
+
   it("processes a single-stage workflow end-to-end", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);

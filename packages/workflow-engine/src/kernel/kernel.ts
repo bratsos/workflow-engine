@@ -22,8 +22,14 @@
  */
 
 import { createAIHelper } from "../ai/ai-helper.js";
+import {
+  boundedAIFlush,
+  DEFAULT_AI_FLUSH_TIMEOUT_MS,
+} from "../ai/write-tracker.js";
 import type { Workflow } from "../core/workflow";
 import type {
+  AICallFlushOptions,
+  AICallFlushResult,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -76,6 +82,7 @@ import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleStepSignal } from "./handlers/step-signal.js";
 import { servedDefinitions } from "./helpers/definition-pinning.js";
+import { assertTimerMs } from "./helpers/host-support.js";
 import {
   buildAnnotationEvents,
   filterCouldMatchLegacy,
@@ -230,6 +237,8 @@ export interface KernelAnnotations {
 export interface Kernel {
   dispatch<T extends KernelCommand>(command: T): Promise<CommandResult<T>>;
   annotations: KernelAnnotations;
+  /** Wait for buffered writes in the configured AI logger. */
+  flush(options?: AICallFlushOptions): Promise<AICallFlushResult>;
   /**
    * The `(workflowId, version)` pairs this kernel's registry presents, or
    * `undefined` when the registry cannot enumerate (in which case nothing
@@ -861,6 +870,16 @@ export function createKernel(config: KernelConfig): Kernel {
   return {
     dispatch,
     annotations,
+    async flush(options) {
+      const timeoutMs = assertTimerMs(
+        "timeoutMs",
+        options?.timeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
+        { allowZero: true },
+      );
+      const logger = services?.aiLogger;
+      if (!logger) return { failed: 0, pending: 0 };
+      return boundedAIFlush(async (opts) => logger.flush?.(opts), timeoutMs);
+    },
     servedDefinitions: () => servedDefinitions(config.registry),
   };
 }

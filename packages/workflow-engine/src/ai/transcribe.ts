@@ -277,7 +277,7 @@ export async function transcribe(
       costSource,
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "transcribe",
       modelKey,

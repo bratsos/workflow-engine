@@ -23,8 +23,13 @@
 import type { ToolSet } from "ai";
 import type { z } from "zod";
 import { assertTimerMs } from "../kernel/helpers/host-support";
-import type { AICallLogger } from "../persistence";
+import type {
+  AICallFlushOptions,
+  AICallLogger,
+  CreateAICallInput,
+} from "../persistence/interface";
 import { getBestProviderForModel } from "../utils/batch/model-mapping";
+import { isTraceTextEnabled } from "../utils/logger";
 import { AIBatchImpl } from "./batch-helper";
 import { embed as embedImpl } from "./embeddings";
 import { evaluate as evaluateImpl } from "./evaluate";
@@ -33,6 +38,7 @@ import {
   generateText as generateTextImpl,
 } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
+import { forwardingProxy } from "./provider-diagnostics.js";
 import { calculateCostWithDiscount, logger } from "./shared";
 import { streamText as streamTextImpl } from "./stream";
 import { transcribe as transcribeImpl } from "./transcribe";
@@ -42,8 +48,8 @@ import type {
   AIEmbedResult,
   AIEvaluateResult,
   AIHelper,
+  AIHelperChildOptions,
   AIHelperContext,
-  AIHelperOptions,
   AIHelperStats,
   AIObjectResult,
   AIStreamResult,
@@ -59,6 +65,7 @@ import type {
   ObjectOptions,
   ProviderResolver,
   RecordCallParams,
+  StageAIHelperOptions,
   StreamOptions,
   StreamTextInput,
   TextInput,
@@ -66,6 +73,7 @@ import type {
   TranscribeOptions,
   TranscriptionAudio,
 } from "./types";
+import { AICallWriteTracker, trackedWrite } from "./write-tracker";
 
 // ============================================================================
 // AIHelper Implementation
@@ -77,14 +85,17 @@ class AIHelperImpl implements AIHelper {
   private readonly logContext?: LogContext;
   private readonly batchLogFn?: BatchLogFn;
   private readonly providerResolver?: ProviderResolver;
-  private readonly options?: AIHelperOptions;
+  private readonly options?: StageAIHelperOptions;
+  private readonly writes: AICallWriteTracker;
+  private readonly trackedLogger: AICallLogger;
 
   constructor(
     topic: string,
     aiCallLogger: AICallLogger,
     logContext?: LogContext,
     providerResolver?: ProviderResolver,
-    options?: AIHelperOptions,
+    options?: StageAIHelperOptions,
+    parentWrites?: AICallWriteTracker,
   ) {
     if (!aiCallLogger) {
       throw new Error(
@@ -99,6 +110,24 @@ class AIHelperImpl implements AIHelper {
     this.logContext = logContext;
     this.providerResolver = providerResolver;
     this.options = options;
+    this.writes = new AICallWriteTracker(parentWrites);
+    const writes: Partial<AICallLogger> = {
+      logCall: (input) => {
+        const call = this.prepareCall(input);
+        return this.trackWrite([call], () => aiCallLogger.logCall(call));
+      },
+      logBatchResults: (batchId, inputs) => {
+        const calls = inputs.map((input) => this.prepareCall(input));
+        return this.trackWrite(calls, () =>
+          aiCallLogger.logBatchResults(batchId, calls),
+        );
+      },
+      flush: (config) => this.flush(config),
+    };
+    // Reads and any logger-specific members are those of the configured logger.
+    this.trackedLogger = forwardingProxy(aiCallLogger, (key, value) =>
+      Object.hasOwn(writes, key) ? writes[key as keyof AICallLogger] : value,
+    );
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -112,18 +141,85 @@ class AIHelperImpl implements AIHelper {
             message,
             metadata: meta,
           })
-          .catch((err) => logger.error("Failed to persist log:", err));
-        // Also log to console for immediate visibility
-        logger.debug(`[${level}] ${message}`, meta ? JSON.stringify(meta) : "");
+          .catch((err) =>
+            logger.error(
+              "Failed to persist log",
+              ...(isTraceTextEnabled() ? [err] : []),
+            ),
+          );
+        // Also log to console for immediate visibility. Workflow log messages
+        // can quote provider responses.
+        logger.debug(
+          `[${level}] ${isTraceTextEnabled() ? message : "workflow log written"}`,
+          meta ? JSON.stringify(meta) : "",
+        );
       };
     }
+  }
+
+  private prepareCall(input: CreateAICallInput): CreateAICallInput {
+    const { attribution, text } = this.options ?? {};
+    const call: CreateAICallInput = {
+      ...input,
+      tenantId: attribution?.tenantId,
+      labels: attribution?.labels,
+      workflowRunId:
+        attribution?.workflowRunId ?? this.logContext?.workflowRunId,
+    };
+    if (
+      (text?.store === "none" || text?.ttlMs !== undefined) &&
+      call.metadata &&
+      typeof call.metadata === "object" &&
+      Object.hasOwn(call.metadata, "error")
+    ) {
+      // A provider can quote the request in its error, and text retention
+      // does not clear metadata.
+      call.metadata = { ...call.metadata, error: "AI call failed" };
+    }
+    if (text?.store === "none") {
+      call.prompt = "";
+      call.response = "";
+      if (
+        call.metadata &&
+        typeof call.metadata === "object" &&
+        Object.hasOwn(call.metadata, "instructions")
+      ) {
+        const { instructions: _, ...metadata } = call.metadata as Record<
+          string,
+          unknown
+        >;
+        call.metadata = metadata;
+      }
+    } else if (text?.ttlMs !== undefined) {
+      call.textExpiresAt = new Date(Date.now() + text.ttlMs);
+    }
+    return call;
+  }
+
+  private trackWrite(
+    calls: CreateAICallInput[],
+    write: () => void | Promise<void>,
+  ): Promise<void> {
+    return trackedWrite(this.writes, write, (error) => {
+      for (const call of calls) {
+        try {
+          void Promise.resolve(this.options?.onLogError?.(error, call)).catch(
+            () => {},
+          );
+        } catch {
+          // A reporting callback cannot change the model result or block flush.
+        }
+      }
+    });
   }
 
   /** Bundle the state generateText/generateObject/embed/streamText/batch need. */
   private context(): AIHelperContext {
     return {
       topic: this.topic,
-      aiCallLogger: this.aiCallLogger,
+      aiCallLogger: this.trackedLogger,
+      track: (work) => this.writes.track(work),
+      onAccountingError: () => this.writes.fail(),
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
       adapter: this.options?.adapter,
@@ -136,7 +232,9 @@ class AIHelperImpl implements AIHelper {
     prompt: TextInput,
     options?: TextOptions<TTools>,
   ): Promise<AITextResult> {
-    return generateTextImpl(this.context(), modelKey, prompt, options);
+    return this.writes.track(
+      generateTextImpl(this.context(), modelKey, prompt, options),
+    );
   }
 
   generateObject<TSchema extends z.ZodTypeAny>(
@@ -145,12 +243,8 @@ class AIHelperImpl implements AIHelper {
     schema: TSchema,
     options?: ObjectOptions,
   ): Promise<AIObjectResult<z.infer<TSchema>>> {
-    return generateObjectImpl(
-      this.context(),
-      modelKey,
-      prompt,
-      schema,
-      options,
+    return this.writes.track(
+      generateObjectImpl(this.context(), modelKey, prompt, schema, options),
     );
   }
 
@@ -159,7 +253,9 @@ class AIHelperImpl implements AIHelper {
     text: string | string[],
     options?: EmbedOptions,
   ): Promise<AIEmbedResult> {
-    return embedImpl(this.context(), modelKey, text, options);
+    return this.writes.track(
+      embedImpl(this.context(), modelKey, text, options),
+    );
   }
 
   streamText(
@@ -175,7 +271,9 @@ class AIHelperImpl implements AIHelper {
     spec: EvaluationSpec<Q>,
     options?: EvaluateOptions,
   ): Promise<AIEvaluateResult<Q>> {
-    return evaluateImpl(this.context(), modelKey, spec, options);
+    return this.writes.track(
+      evaluateImpl(this.context(), modelKey, spec, options),
+    );
   }
 
   transcribe(
@@ -183,7 +281,9 @@ class AIHelperImpl implements AIHelper {
     audio: TranscriptionAudio,
     options?: TranscribeOptions,
   ): Promise<AITranscribeResult> {
-    return transcribeImpl(this.context(), modelKey, audio, options);
+    return this.writes.track(
+      transcribeImpl(this.context(), modelKey, audio, options),
+    );
   }
 
   batch<T = string>(
@@ -208,53 +308,91 @@ class AIHelperImpl implements AIHelper {
     );
   }
 
-  createChild(segment: string, id?: string): AIHelper {
+  createChild(
+    segment: string,
+    id?: string,
+    options?: AIHelperChildOptions,
+  ): AIHelper {
     const newTopic = id
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
-    // Preserve logContext, providerResolver, and options for child helpers (same workflow context)
+    const parent = this.options;
+    const attribution = options?.attribution;
+    const childOptions: StageAIHelperOptions = {
+      ...parent,
+      attribution: {
+        ...parent?.attribution,
+        ...attribution,
+        labels: attribution?.labels
+          ? { ...parent?.attribution?.labels, ...attribution.labels }
+          : parent?.attribution?.labels,
+      },
+      text: options?.text ? { ...parent?.text, ...options.text } : parent?.text,
+    };
     return new AIHelperImpl(
       newTopic,
       this.aiCallLogger,
       this.logContext,
       this.providerResolver,
-      this.options,
+      childOptions,
+      this.writes,
     );
   }
 
   recordCall(params: RecordCallParams): void {
-    const modelKey = params.modelKey;
-    const actualPrompt = params.prompt;
-    const actualResponse = params.response;
-    const inputTokens = params.inputTokens;
-    const outputTokens = params.outputTokens;
-    const callType = params.callType;
-    const isBatch = callType === "batch";
-    const metadata = params.metadata;
-
-    const modelConfig = getModel(modelKey);
-    const cost = calculateCostWithDiscount(
+    const {
       modelKey,
+      callType,
+      prompt,
+      response,
       inputTokens,
       outputTokens,
-      isBatch,
-    );
+      cachedInputTokens,
+      reasoningTokens,
+      servedBy,
+      metadata,
+    } = params;
+    const isBatch = callType === "batch";
+    const modelId =
+      params.cost === undefined ? getModel(modelKey).id : modelKey;
+    const cost =
+      params.cost ??
+      calculateCostWithDiscount(
+        modelKey,
+        inputTokens,
+        outputTokens,
+        isBatch,
+        undefined,
+        cachedInputTokens,
+      );
+    const costSource =
+      params.cost === undefined
+        ? "estimated"
+        : (params.costSource ?? "reported");
 
-    // Persist to DB (fire and forget)
-    this.aiCallLogger.logCall({
+    this.trackedLogger.logCall({
       topic: this.topic,
       callType,
       modelKey,
-      modelId: modelConfig.id,
-      prompt: actualPrompt,
-      response: actualResponse,
+      modelId,
+      prompt,
+      response,
       inputTokens,
       outputTokens,
+      cachedInputTokens,
+      reasoningTokens,
+      servedBy,
       cost,
-      estimatedCost: cost,
-      costSource: "estimated",
+      costSource,
+      ...(costSource === "estimated"
+        ? { estimatedCost: cost }
+        : { reportedCost: cost }),
       metadata: isBatch ? { ...metadata, isBatch: true } : metadata,
     });
+  }
+
+  flush(options?: AICallFlushOptions) {
+    return this.writes.flush(options);
   }
 
   async getStats(): Promise<AIHelperStats> {
@@ -291,7 +429,7 @@ export function createAIHelper(
   logger: AICallLogger,
   logContext?: LogContext,
   providerResolver?: ProviderResolver,
-  options?: AIHelperOptions,
+  options?: StageAIHelperOptions,
 ): AIHelper {
   return new AIHelperImpl(topic, logger, logContext, providerResolver, options);
 }

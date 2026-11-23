@@ -54,6 +54,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createKernel } from "../../kernel/index.js";
 import { InMemoryBlobStore } from "../../kernel/testing/index.js";
 import {
+  createPrismaAICallLogger,
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
   fromPrisma8,
@@ -692,6 +693,83 @@ describe.skipIf(!sqlite && !databaseUrl)(
       }
       await client?.$disconnect();
       if (directory) await rm(directory, { recursive: true, force: true });
+    });
+
+    it("plans tenant totals and label grouping using the tenant and period index at 0, 10k and 100k rows", async () => {
+      const logger = createPrismaAICallLogger(client, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+      const from = new Date("2026-01-01T00:00:00Z");
+      const to = new Date("2026-02-01T00:00:00Z");
+      const query = { tenantId: "tenant-a", from, to };
+      try {
+        for (const size of [0, 10_000, 100_000]) {
+          if (size === 10_000) {
+            await client.aICall.create({
+              data: {
+                id: "cost-plan-anchor",
+                topic: "cost-plan",
+                callType: "realtime",
+                modelKey: "fixture",
+                modelId: "fixture",
+                prompt: "",
+                response: "",
+                inputTokens: 0,
+                outputTokens: 0,
+                cost: 1,
+                tenantId: query.tenantId,
+                createdAt: from,
+                labels: { group: "priority" },
+              },
+            });
+          }
+          if (size > 0) {
+            const first = size === 10_000 ? 2 : 10_001;
+            const sequence = sqlite
+              ? `WITH RECURSIVE seq(n) AS (SELECT ${first} UNION ALL SELECT n + 1 FROM seq WHERE n < ${size})`
+              : `WITH seq(n) AS (SELECT generate_series(${first}, ${size}))`;
+            await client.$executeRawUnsafe(`
+              ${sequence}
+              INSERT INTO "ai_calls" ("id", "createdAt", "topic", "callType", "modelKey", "modelId",
+                "prompt", "response", "inputTokens", "outputTokens", "cost", "tenantId")
+              SELECT 'cost-plan-' || n, "createdAt", 'cost-plan', 'realtime', 'fixture', 'fixture',
+                '', '', 0, 0, 1, 'tenant-' || n
+              FROM seq CROSS JOIN "ai_calls" WHERE "id" = 'cost-plan-anchor'
+            `);
+          }
+          await client.$executeRawUnsafe('ANALYZE "ai_calls"');
+          for (const groupBy of [undefined, "group"]) {
+            await quiet(100);
+            statements.length = 0;
+            const result = await logger.costByTenant({ ...query, groupBy });
+            expect(result.totalCost).toBe(size === 0 ? 0 : 1);
+            await quiet(100);
+            const queries = statements.filter(
+              (s) =>
+                /\bFROM\b/i.test(s.sql) &&
+                s.sql.includes("ai_calls") &&
+                s.sql.includes("tenantId") &&
+                s.params.includes(query.tenantId),
+            );
+            expect(queries).toHaveLength(1);
+            const explanation = await plan(queries[0]!, size === 0);
+            // An empty table gives the planner no reason to prefer the tenant
+            // index over the age index, and either bounds the read.
+            expect(explanation).toMatch(
+              size === 0
+                ? /ai_calls_(?:tenantId_)?createdAt_idx/
+                : /ai_calls_tenantId_createdAt_idx/,
+            );
+            expect(explanation).not.toMatch(
+              /Seq Scan on ai_calls|SCAN (?:main\.)?(?:ai_calls|t0)\b/i,
+            );
+          }
+        }
+      } finally {
+        await client.$executeRawUnsafe(
+          `DELETE FROM "ai_calls" WHERE "topic" = 'cost-plan'`,
+        );
+      }
     });
 
     describe(sqlite ? "without statistics" : "before ANALYZE", () => {

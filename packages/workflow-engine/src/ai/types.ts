@@ -10,13 +10,22 @@
 import type { generateText, streamText, ToolSet } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
-import type { AIHelperStats } from "../persistence/interface";
+import type {
+  AICallFlushOptions,
+  AICallFlushResult,
+  AIHelperStats,
+  CreateAICallInput,
+} from "../persistence/interface";
 import type { ModelConfig, ModelKey } from "./model-helper";
 import type { OpenRouterRoutingOptions } from "./shared";
 
 export type { OpenRouterRoutingOptions };
 
 export interface AIHelperOptions {
+  attribution?: { tenantId?: string; labels?: Record<string, string> };
+  /** Defaults to full text without expiry. */
+  text?: { store: "full" | "none"; ttlMs?: number };
+  onLogError?: (error: unknown, call: CreateAICallInput) => void;
   routing?: OpenRouterRoutingOptions;
   /** Optional transport adapter used instead of the AI SDK for selected calls. */
   adapter?: AIAdapter;
@@ -25,6 +34,16 @@ export interface AIHelperOptions {
     perCallMs?: number;
   };
 }
+
+/** Options forwarded by the kernel when binding a helper to a stage. */
+export type StageAIHelperOptions = AIHelperOptions & {
+  attribution?: { workflowRunId?: string };
+};
+
+export type AIHelperChildOptions = Pick<
+  AIHelperOptions,
+  "attribution" | "text"
+>;
 
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
@@ -43,7 +62,8 @@ export type AICallType =
   | "stream"
   | "batch"
   | "evaluate"
-  | "transcribe";
+  | "transcribe"
+  | "realtime";
 
 /** Normalized request passed to an adapter for text generation. */
 export interface AdapterTextRequest {
@@ -730,6 +750,12 @@ export interface RecordCallParams {
   response: string;
   inputTokens: number;
   outputTokens: number;
+  /** USD cost. When supplied, modelKey is also the model ID. */
+  cost?: number;
+  costSource?: "reported" | "estimated";
+  servedBy?: string;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -804,10 +830,17 @@ export interface AIHelper {
   ): AIBatch<T>;
 
   // Hierarchy Methods
-  createChild(segment: string, id?: string): AIHelper;
+  createChild(
+    segment: string,
+    id?: string,
+    options?: AIHelperChildOptions,
+  ): AIHelper;
 
   // Manual Recording (new object-based API)
   recordCall(params: RecordCallParams): void;
+
+  /** Wait for writes and streams in this helper and its children (default 5 s). */
+  flush(options?: AICallFlushOptions): Promise<AICallFlushResult>;
 
   // Stats (queries DB)
   getStats(): Promise<AIHelperStats>;
@@ -826,6 +859,9 @@ export interface AIHelper {
 export interface AIHelperContext {
   readonly topic: string;
   readonly aiCallLogger: AICallLogger;
+  /** Counts engine work that can end in an AI call write until it settles. */
+  readonly track?: <T>(work: Promise<T>) => Promise<T>;
+  readonly onAccountingError?: (error: unknown) => void;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;
   readonly adapter?: AIAdapter;

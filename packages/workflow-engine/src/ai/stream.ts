@@ -7,8 +7,8 @@
  */
 
 import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
-import type { GenerateTextEndEvent, ToolSet } from "ai";
-import { streamText as aiStreamText } from "ai";
+import type { GenerateTextEndEvent, TextStreamPart, ToolSet } from "ai";
+import { streamText as aiStreamText, NoOutputGeneratedError } from "ai";
 import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
@@ -54,17 +54,23 @@ export function streamText(
 
   // For logging, extract prompt string
   const promptForLog =
-    "prompt" in input && input.prompt
+    typeof input.prompt === "string"
       ? input.prompt
-      : JSON.stringify(input.messages);
+      : (JSON.stringify(input.messages) ?? "");
 
-  // Track whether we've logged an error (to avoid duplicate logs)
+  // Each piece of work that can write this call's row is pending from its
+  // start until it settles: the SDK request until its row is written or it
+  // ends without one, and every reader below. A paused consumer keeps it open.
+  const track = ctx.track ?? (<T>(work: Promise<T>) => work);
+  let closeStream: (() => void) | undefined;
+  // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
   let streamError: { error: unknown } | undefined;
   const steps: ProviderResultLike[] = [];
   const onStepEnd: StreamOptions["onStepEnd"] = async (step) => {
     steps.push(step);
-    await options.onStepEnd?.(step);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || ctx.adapter?.streamText) await options.onStepEnd?.(step);
   };
 
   // Error handler that logs the error to DB
@@ -77,7 +83,7 @@ export function streamText(
     errorLogged = true;
     const callError = timeoutErrorIfExpired(timeout, error);
 
-    logFailure(ctx.aiCallLogger, {
+    logFailure(ctx, {
       topic: ctx.topic,
       callType: "stream",
       modelKey,
@@ -115,9 +121,7 @@ export function streamText(
     }
     // Reading usage keeps the SDK draining when a consumer stops at an error.
     // onEnd or getUsage will persist the bill once the SDK has reported it.
-    void Promise.resolve()
-      .then(() => getUsage())
-      .catch(() => {});
+    void track(Promise.resolve().then(() => getUsage())).catch(() => {});
   };
 
   // Trace log before stream starts
@@ -198,7 +202,10 @@ export function streamText(
     };
 
     // The SDK can finish with buffered step usage after emitting an error.
-    if (errorLogged) return cachedUsage;
+    if (errorLogged) {
+      closeStream?.();
+      return cachedUsage;
+    }
 
     logger.debug(`streamText response`, {
       model: modelKey,
@@ -239,6 +246,7 @@ export function streamText(
       },
     });
 
+    closeStream?.();
     timeout.cleanup();
 
     return cachedUsage;
@@ -285,6 +293,36 @@ export function streamText(
     }),
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
+    onAbort: () => closeStream?.(),
+    // Sees the request's parts before the SDK's own end handling. An error
+    // part can precede a billable finish, so the end decides: the SDK calls
+    // onEnd (and writes the row) only for a finished step and no
+    // NoOutputGeneratedError. A provider, tool or transport failure errors
+    // the stream and cancels this transform.
+    experimental_transform: () => {
+      let finishedStep = false;
+      let noOutput = false;
+      return new TransformStream<
+        TextStreamPart<ToolSet>,
+        TextStreamPart<ToolSet>
+      >({
+        transform(part, controller) {
+          if (part.type === "finish-step") finishedStep = true;
+          if (
+            part.type === "error" &&
+            NoOutputGeneratedError.isInstance(part.error)
+          )
+            noOutput = true;
+          controller.enqueue(part);
+        },
+        flush() {
+          if (!finishedStep || noOutput) closeStream?.();
+        },
+        cancel() {
+          closeStream?.();
+        },
+      });
+    },
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.
@@ -306,6 +344,9 @@ export function streamText(
   let adapterResponse: AdapterStreamResponse | undefined;
   let result: ReturnType<typeof aiStreamText> | undefined;
   try {
+    const request = Promise.withResolvers<void>();
+    void track(request.promise);
+    closeStream = () => request.resolve();
     if (ctx.adapter?.streamText) {
       adapterResponse = ctx.adapter.streamText({
         model: modelConfig,
@@ -331,6 +372,7 @@ export function streamText(
     }
   } catch (error) {
     logError(error);
+    closeStream?.();
     throw timeoutErrorIfExpired(timeout, error);
   }
 
@@ -339,15 +381,26 @@ export function streamText(
   // (below) reconcile against the buffered result independently.
   const streamIterable: AsyncIterable<string> = {
     [Symbol.asyncIterator]: () => {
-      const reader = adapterResponse
-        ? adapterResponse.stream[Symbol.asyncIterator]()
-        : result!.textStream[Symbol.asyncIterator]();
-      return {
+      let reader: AsyncIterator<string>;
+      try {
+        reader = adapterResponse
+          ? adapterResponse.stream[Symbol.asyncIterator]()
+          : result!.textStream[Symbol.asyncIterator]();
+      } catch (error) {
+        logError(error);
+        if (adapterResponse) closeStream?.();
+        throw error;
+      }
+      const iterator: AsyncIterator<string> = {
         async next() {
           try {
             const { done, value } = await runWithCallTimeout(timeout, () =>
               reader.next(),
-            );
+            ).catch((error: unknown) => {
+              // An adapter's stream has ended; the SDK reports its own end.
+              if (adapterResponse) closeStream?.();
+              throw error;
+            });
             if (done) {
               if (adapterResponse) persistAdapterUsage(adapterResponse);
               return { done: true, value: undefined };
@@ -362,6 +415,7 @@ export function streamText(
           }
         },
       };
+      return { next: () => track(iterator.next()) };
     },
   };
 
@@ -433,9 +487,9 @@ export function streamText(
 
   return {
     stream: streamIterable,
-    getUsage,
-    getText,
-    getReasoning,
+    getUsage: () => track(getUsage()),
+    getText: () => track(getText()),
+    getReasoning: () => track(getReasoning()),
     rawResult: result,
   };
 }

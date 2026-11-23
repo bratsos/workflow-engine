@@ -1,0 +1,7 @@
+---
+"@bratsos/workflow-engine": patch
+---
+
+Text capture now covers error text on AI call rows. Under `store: "none"` or a TTL, a row's `metadata.error` is stored as `AI call failed`, on every row a helper with that policy builds: its calls, batch results and `recordCall`, including a helper given `ctx.aiLogger`. A TTL row never stores the message, because text expiry clears prompt, response and instructions only. The engine's own console lines print provider error text only when both `WORKFLOW_ENGINE_TRACE=1` and `WORKFLOW_ENGINE_TRACE_TEXT=1` are set; otherwise a failed call prints its error name and HTTP status. Provider warnings reach the SDK, step callbacks and `rawResult` unchanged, as before, and the SDK prints them as process warnings unless `globalThis.AI_SDK_LOG_WARNINGS = false`. A provider error message can contain text the provider echoed from the request. Values thrown to callers and the SDK, stage and step error columns, events, outbox payloads, workflow logs and console reads keep it, as before. Text capture and attribution are applied once, by the helper that builds a row; the stage logger sets the run ID on every row and fills only the run's tenant and labels the row lacks, under the row's own. Direct `ctx.aiLogger` writes are stored as given with those fields, as in earlier releases. Frozen loggers and providers keep working.
+
+**Rolling-safe** for schema compatibility. Enforce the privacy policy after all writers support it and address previously captured data separately.

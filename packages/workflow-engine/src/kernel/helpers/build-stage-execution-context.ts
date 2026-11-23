@@ -1,10 +1,21 @@
-import type { AIHelper, LogContext } from "../../ai/types.js";
+import { forwardingProxy } from "../../ai/provider-diagnostics.js";
+import type {
+  AIHelper,
+  LogContext,
+  StageAIHelperOptions,
+} from "../../ai/types.js";
+import {
+  AICallWriteTracker,
+  DEFAULT_AI_FLUSH_TIMEOUT_MS,
+  trackedWrite,
+} from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
 import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
   AICallLogger,
+  CreateAICallInput,
   CreateAnnotationInput,
 } from "../../persistence/interface.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
@@ -17,6 +28,8 @@ import {
 import { writeBatchWarn } from "./batch-warn.js";
 import { createStorageShim } from "./create-storage-shim.js";
 import { toErrorMessage } from "./error-message.js";
+import { assertTimerMs } from "./host-support.js";
+import { aiWriteFence } from "./run-writes.js";
 import { createStepApi } from "./step-api.js";
 
 export interface BuiltStageExecutionContext {
@@ -32,6 +45,8 @@ export function defineLazyAIContext<T extends object>(
     workflowRunId: string;
     stageId: string;
     stageRecordId?: string;
+    tenantId?: string;
+    labels?: Record<string, string>;
   },
   deps: ExecutorDeps,
 ): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
@@ -39,23 +54,124 @@ export function defineLazyAIContext<T extends object>(
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
-  // The stage's calls name its run, so erasing the run finds them.
+  // Rows keep the text policy and attribution of whatever built them. Every
+  // row names this run, so erasing the run finds it; the stage fills only the
+  // tenant and labels a row lacks, under the row's own.
+  const stamp = (call: CreateAICallInput): CreateAICallInput => ({
+    ...call,
+    workflowRunId: params.workflowRunId,
+    tenantId: call.tenantId ?? params.tenantId,
+    labels:
+      params.labels || call.labels
+        ? { ...params.labels, ...call.labels }
+        : undefined,
+  });
+  // A plain object, so a spread keeps every member: each member of the
+  // logger, own or inherited, reaches the logger, except those `own` replaces.
+  // A read of a member the logger does not list still reaches it.
+  const overriding = (
+    logger: AICallLogger,
+    own: Partial<AICallLogger>,
+  ): AICallLogger => {
+    const view = Object.create(forwardingProxy(logger, (_, value) => value));
+    const keys = new Set(Reflect.ownKeys(own));
+    for (const key of keys) {
+      Object.defineProperty(view, key, {
+        ...Reflect.getOwnPropertyDescriptor(own, key),
+        enumerable: true,
+      });
+    }
+    for (
+      let source: object | null = logger;
+      source && source !== Object.prototype;
+      source = Reflect.getPrototypeOf(source)
+    ) {
+      for (const key of Reflect.ownKeys(source)) {
+        if (key === "constructor" || keys.has(key)) continue;
+        keys.add(key);
+        const member = Reflect.getOwnPropertyDescriptor(source, key);
+        Object.defineProperty(
+          view,
+          key,
+          typeof member?.value === "function"
+            ? {
+                enumerable: true,
+                configurable: true,
+                writable: true,
+                value: (...args: unknown[]) =>
+                  Reflect.apply(Reflect.get(logger, key), logger, args),
+              }
+            : {
+                enumerable: true,
+                configurable: true,
+                get: () => Reflect.get(logger, key),
+                set: (value: unknown) => {
+                  (logger as unknown as Record<PropertyKey, unknown>)[key] =
+                    value;
+                },
+              },
+        );
+      }
+    }
+    return view;
+  };
   let scopedLogger: AICallLogger | undefined;
-  const loggerForRun = (logger: AICallLogger): AICallLogger => {
-    return (scopedLogger ??= {
-      logCall: (call) =>
-        logger.logCall({ ...call, workflowRunId: params.workflowRunId }),
+  const loggerForRun = (logger: AICallLogger): AICallLogger =>
+    (scopedLogger ??= overriding(logger, {
+      logCall: (call) => logger.logCall(stamp(call)),
       logBatchResults: (batchId, calls) =>
-        logger.logBatchResults(
-          batchId,
-          calls.map((call) => ({
-            ...call,
-            workflowRunId: params.workflowRunId,
-          })),
+        logger.logBatchResults(batchId, calls.map(stamp)),
+    }));
+  // ctx.aiLogger stores direct writes as given. Each write is counted once:
+  // by this layer until the configured logger takes it (past the run's write
+  // fence), and from then on by that logger when it has a flush. Its flush is
+  // the configured logger's, after the writes the fence still holds, plus
+  // the writes it holds or refused.
+  let stageLogger: AICallLogger | undefined;
+  const directLogger = (logger: AICallLogger): AICallLogger => {
+    const writes = new AICallWriteTracker();
+    const fence = aiWriteFence(logger);
+    const direct = (
+      method: "logCall" | "logBatchResults",
+      write: (configured: AICallLogger) => void | Promise<void>,
+    ) =>
+      trackedWrite(writes, (release) => {
+        const handOff = (configured: AICallLogger) => {
+          if (configured.flush) release();
+          return write(configured);
+        };
+        return fence ? fence(method, handOff) : handOff(logger);
+      });
+    return overriding(logger, {
+      logCall: (call) => direct("logCall", (to) => to.logCall(stamp(call))),
+      logBatchResults: (batchId, calls) =>
+        direct("logBatchResults", (to) =>
+          to.logBatchResults(batchId, calls.map(stamp)),
         ),
-      getStats: logger.getStats.bind(logger),
-      isRecorded: logger.isRecorded.bind(logger),
-      ...(logger.listCalls && { listCalls: logger.listCalls.bind(logger) }),
+      flush: async (options) => {
+        if (!logger.flush) return writes.flush(options);
+        let forwarded = options;
+        if (writes.counts().pending > 0) {
+          const timeoutMs = assertTimerMs(
+            "timeoutMs",
+            options?.timeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
+            { allowZero: true },
+          );
+          const started = Date.now();
+          await writes.flush({ timeoutMs });
+          forwarded = {
+            ...options,
+            timeoutMs: Math.max(0, timeoutMs - (Date.now() - started)),
+          };
+        }
+        const result = await logger.flush(forwarded);
+        const held = writes.counts();
+        if (held.failed === 0 && held.pending === 0) return result;
+        return {
+          failed: (result?.failed ?? 0) + held.failed,
+          pending: (result?.pending ?? 0) + held.pending,
+        };
+      },
     });
   };
 
@@ -67,6 +183,7 @@ export function defineLazyAIContext<T extends object>(
     return {
       ai: services.ai,
       aiLogger: loggerForRun(services.aiLogger),
+      logger: services.aiLogger,
     };
   };
 
@@ -76,28 +193,37 @@ export function defineLazyAIContext<T extends object>(
     createLog: (data) => deps.persistence.createLog(data),
   };
 
+  const options: StageAIHelperOptions = {
+    attribution: {
+      tenantId: params.tenantId,
+      labels: params.labels,
+      workflowRunId: params.workflowRunId,
+    },
+  };
+  const getHelper = (): AIHelper => {
+    if (!helper) {
+      const services = configured();
+      helper = services.ai(
+        topic,
+        services.aiLogger,
+        logContext,
+        undefined,
+        options,
+      );
+    }
+    return helper;
+  };
+
   Object.defineProperties(target, {
     ai: {
       enumerable: true,
       configurable: true,
-      get: () => {
-        if (!helper) {
-          const services = configured();
-          helper = services.ai(
-            topic,
-            services.aiLogger,
-            logContext,
-            undefined,
-            undefined,
-          );
-        }
-        return helper;
-      },
+      get: getHelper,
     },
     aiLogger: {
       enumerable: true,
       configurable: true,
-      get: () => configured().aiLogger,
+      get: () => (stageLogger ??= directLogger(configured().logger)),
     },
   });
 
@@ -227,7 +353,7 @@ export function buildStageExecutionContext(
     workflowContext,
   } as StageContext<any, any, any>;
 
-  defineLazyAIContext(context, { workflowRunId, stageId, stageRecordId }, deps);
+  defineLazyAIContext(context, input, deps);
 
   return { context, progressEvents, annotationBuffer };
 }

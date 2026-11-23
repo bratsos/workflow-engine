@@ -1,4 +1,7 @@
-import { RUN_WRITE_LEASE_MS } from "../../persistence/interface.js";
+import {
+  type AICallLogger,
+  RUN_WRITE_LEASE_MS,
+} from "../../persistence/interface.js";
 import type { KernelDeps } from "../kernel.js";
 import type { Persistence } from "../ports.js";
 
@@ -102,6 +105,25 @@ export async function writeForRun<T>(
   }
 }
 
+type AIWriteFence = (
+  method: "logCall" | "logBatchResults",
+  use: (logger: AICallLogger) => void | Promise<void>,
+) => Promise<void>;
+const aiWriteFences = new WeakMap<AICallLogger, AIWriteFence>();
+
+function withAIWriteFence(logger: AICallLogger, fence: AIWriteFence) {
+  aiWriteFences.set(logger, fence);
+  return logger;
+}
+
+/**
+ * For an AI logger `fenceRunWrites` returned: run a write on the logger it
+ * fences, under the fence, as its own `logCall` or `logBatchResults` would.
+ */
+export function aiWriteFence(logger: AICallLogger): AIWriteFence | undefined {
+  return aiWriteFences.get(logger);
+}
+
 function fenced<T extends object>(
   target: T,
   methods: readonly string[],
@@ -140,6 +162,13 @@ export function fenceRunWrites(
       : writeForRun(deps.persistence, workflowRunId, boxed);
   };
   const aiLogger = deps.services?.aiLogger;
+  const writeAI = (method: string, call: () => unknown) => {
+    const written = write(call).then(() => {});
+    // AI helpers do not await `logCall`: a failed write is dropped as the
+    // logger's own failures are.
+    if (method === "logCall") written.catch(() => {});
+    return written;
+  };
   return {
     ...deps,
     blobStore: fenced(deps.blobStore, ["put"], async (_, call) => {
@@ -161,16 +190,9 @@ export function fenceRunWrites(
     services: aiLogger
       ? {
           ...deps.services,
-          aiLogger: fenced(
-            aiLogger,
-            ["logCall", "logBatchResults"],
-            (method, call) => {
-              const written = write(call).then(() => {});
-              // AI helpers do not await `logCall`: a failed write is dropped
-              // as the logger's own failures are.
-              if (method === "logCall") written.catch(() => {});
-              return written;
-            },
+          aiLogger: withAIWriteFence(
+            fenced(aiLogger, ["logCall", "logBatchResults"], writeAI),
+            (method, use) => writeAI(method, () => use(aiLogger)),
           ),
         }
       : deps.services,

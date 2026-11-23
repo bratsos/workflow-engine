@@ -502,6 +502,8 @@ async function replayStage(
     const input: ActivityRunInput = {
       stageDef,
       workflowId: run.workflowId,
+      tenantId: run.tenantId ?? undefined,
+      labels: run.labels ?? undefined,
       workflowRunId: run.id,
       workflowType: run.workflowType,
       stageId: stageRecord.stageId,
@@ -1014,6 +1016,8 @@ export async function handleStagePollSuspended(
         workflowRunId: run.id,
         stageId: stageRecord.stageId,
         stageRecordId: stageRecord.id,
+        tenantId: run.tenantId ?? undefined,
+        labels: run.labels ?? undefined,
       },
       writes,
     );

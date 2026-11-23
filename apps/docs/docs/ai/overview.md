@@ -111,6 +111,99 @@ When a workflow run completes or fails, the kernel queries `services.aiLogger.ge
 
 ---
 
+## Call attribution, text retention, and pending writes
+
+Set `AIHelperOptions.attribution` to attach an opaque `tenantId` and string
+`labels` to calls made by a standalone helper. Stage helpers inherit both from
+the run and also record the workflow run ID. A custom `KernelServices.ai`
+factory must forward its fifth argument to `createAIHelper`.
+
+```typescript
+const ai = createAIHelper("requests", logger, undefined, undefined, {
+  attribution: { tenantId: "tenant-a", labels: { queue: "interactive" } },
+  text: { store: "none" },
+  onLogError: (_error, call) => countFailedWrite(call.callType),
+});
+
+const worker = ai.createChild("worker", "1", {
+  attribution: { labels: { queue: "background" } },
+  text: { store: "full", ttlMs: 86_400_000 },
+});
+```
+
+Child helpers inherit the tenant and merge labels by key. A child text policy
+inherits the parent's TTL when omitted. The default stores full text without
+expiry. `store: "none"` leaves the prompt and response empty and drops stream
+instructions from the accounting row. Each helper applies its own attribution
+and text policy to the rows it builds, including a helper given
+`ctx.aiLogger`. The stage logger sets the run ID on every row and fills only
+the run's tenant and labels a row lacks, under the row's own. Direct
+`ctx.aiLogger.logCall` and `logBatchResults` writes are stored as given, with
+those run fields, as in earlier releases.
+A full-text TTL sets `textExpiresAt` on the row so
+`engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
+requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
+`WORKFLOW_ENGINE_TRACE=1` to include request, response, and error text.
+
+The Prisma logger's `costByTenant({ tenantId, from, to, groupBy })` returns the
+total USD cost in the half-open period `[from, to)`. With a label key in
+`groupBy`, it also returns `groups` of `{ label, cost }`. A null group
+contains rows without the selected label.
+
+Use `recordCall` with `callType: "realtime"` for externally handled sessions
+and pass their USD `cost`. A supplied cost bypasses the model registry and
+uses the supplied `modelKey` as the recorded model ID. It defaults to
+`costSource: "reported"`; set `"estimated"` for a supplied estimate.
+
+Text capture controls the AI call row and trace output only. Under
+`store: "none"` or a TTL, a row's `metadata.error` is stored as
+`AI call failed` on every row a helper with that policy builds; a TTL row never stores the message, because text expiry does not clear
+metadata. A provider error message can contain text the provider echoed from
+the request. Outside the row, provider errors are stored and passed on as in
+earlier releases: values thrown to callers and the SDK, stage and step error
+columns, events, outbox payloads, workflow logs and console reads. The
+engine's own console lines print provider error text only with both trace
+flags. Provider warnings reach the SDK, step callbacks and `rawResult`
+unchanged, and the SDK prints them as process warnings unless you set
+`globalThis.AI_SDK_LOG_WARNINGS = false`.
+Use those flags only for data you intend to send to process diagnostics.
+
+The accounting policy covers the prompt, response and top-level instructions.
+Keep opaque caller metadata free of content that needs that same lifecycle.
+Workflow inputs and outputs, durable step results and repair data, blobs,
+events, application logs and annotations each have their own lifecycle. The
+console can display those workflow copies. This also applies to manually
+persisted SDK or batch results. Apply a privacy guarantee after all writers
+use the policy and you have addressed historical rows.
+
+At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
+`{ failed, pending }`. Failed writes are cumulative for that helper and its
+children. Pending counts the work that can still write a row when the
+timeout expires, including work started during the wait: calls in
+progress, each stream request until its row is written or the AI SDK ends
+it without one, each `getUsage()`, `getText()`, `getReasoning()` or chunk
+read, batch `getResults()` and `recordResults()`, and writes in progress.
+An error part or a consumer that stops reading does not end a stream
+request. A helper write the database refuses reaches `onLogError`.
+`ctx.aiLogger.flush(options)` returns the configured logger's own
+`flush` result, as in earlier releases, once the run's write fence has
+handed on the direct writes it holds (waiting within the same bound), plus
+the direct writes the fence still holds or refused. With a logger that has
+no `flush`, it returns counts for the direct writes made through
+`ctx.aiLogger`; `ctx.ai.flush()` covers the stage helper's own. A
+caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
+message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
+rejects if that write fails; `recordResults` retries it.
+
+Stage helpers do not wait for their accounting writes, so stage outcomes,
+retries and deadlines do not depend on them. Run totals sum the ledger rows
+under the run's topic, `workflow.<runId>`, when the run ends: a write still in
+flight at that moment, or one written with another topic, is not counted. A
+worker that exits before a write lands loses that row.
+`kernel.flush({ timeoutMs })` waits for the configured logger's pending
+writes within its own bound. The Node host calls it during shutdown and the
+serverless host calls it after the invocation's work settles.
+
 ## Core Operations
 
 ### 1. `generateText`

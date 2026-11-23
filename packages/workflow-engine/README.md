@@ -1040,6 +1040,19 @@ const { text, reasoning } = await ctx.ai.generateText("anthropic/claude-opus-4.8
 
 Models are configured with `registerModels()` and resolved with `getModel(key)` (`supportsAsyncBatch` says whether a batch transport exists; `isEvaluationModel` marks decision models that answer `evaluate` and cannot generate text). `AIHelperOptions.adapter` swaps the transport below logging and cost; `timeout.perCallMs` / per-call `timeoutMs` throw `AICallTimeoutError`. Schemas that no provider dialect can express fail before submit with `UnportableSchemaError`. Outside a stage, `createAIHelper(topic, logger)` builds the same helper by hand.
 
+Set `AIHelperOptions.attribution` for tenant and label cost tracking outside stages.
+Stage helpers inherit run attribution. `PrismaAICallLogger.costByTenant` queries
+a tenant and period, with optional label grouping. Set `AIHelperOptions.text`
+to suppress stored text or to set an expiry on captured text. Set both
+`WORKFLOW_ENGINE_TRACE=1` and `WORKFLOW_ENGINE_TRACE_TEXT=1` for text in traces.
+`ai.recordCall` accepts an explicit USD cost for external calls, and
+`ai.flush()` waits for calls, stream reads and writes that can still write a row at the end of a request.
+Stage outcomes do not wait for accounting writes. Text capture covers AI call
+rows and trace output; provider error messages, which can echo request text,
+are stored elsewhere as before. Apply separate retention to caller metadata,
+workflow data, durable results and application logs.
+
+
 ### Batch AI Calls (`ctx.step.ai.map`)
 
 `map` runs one prompt per item under a policy: `"realtime"` (in-process concurrency), `"batch"` (OpenAI Batch, Anthropic Message Batches, Google batch or OpenRouter `:batch`, submitted as a durable step that suspends the stage and resumes from the ledger), or `"auto"` (batch at or above `auto.batchAbove`, default 20, when the model supports it). Schema validation and repair apply identically on both paths, and every item's tokens and cost are recorded.

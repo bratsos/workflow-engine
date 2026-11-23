@@ -10,8 +10,13 @@ import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
-import type { AICallLogger } from "../persistence";
+import { toErrorMessage } from "../kernel/helpers/error-message.js";
+import { isTraceTextEnabled } from "../utils/logger.js";
 import { getModel, type ModelKey } from "./model-helper";
+import {
+  describeAICallError,
+  traceProviderDiagnostic,
+} from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   type CostResolution,
@@ -213,7 +218,7 @@ function resolveFailureAccounting(
  * accounting as a successful call when the provider already returned its bill.
  */
 export function logFailure(
-  aiCallLogger: AICallLogger,
+  ctx: AIHelperContext,
   params: {
     topic: string;
     callType: AICallType;
@@ -229,9 +234,12 @@ export function logFailure(
   },
 ): { errorMessage: string; durationMs: number } {
   const durationMs = Date.now() - params.startTime;
-  const errorMessage =
-    params.error instanceof Error ? params.error.message : String(params.error);
+  // A provider can quote the request in its message.
+  const message = toErrorMessage(params.error);
+  const described = describeAICallError(params.error);
+  traceProviderDiagnostic(`${params.callType} call failed`, params.error);
   const steps = params.steps ?? [];
+  // A call that reached the model and failed afterwards still consumed tokens.
   const accounting =
     params.accounting ??
     resolveFailureAccounting(
@@ -247,7 +255,7 @@ export function logFailure(
   const servedBy = providerHistory.servedBy ?? accounting.servedBy;
   const servedBySteps =
     providerHistory.servedBySteps ?? accounting.servedBySteps;
-  aiCallLogger.logCall({
+  ctx.aiCallLogger.logCall({
     topic: params.topic,
     callType: params.callType,
     modelKey: params.modelKey,
@@ -274,11 +282,15 @@ export function logFailure(
       ...(servedBySteps !== undefined ? { servedBySteps } : {}),
       durationMs,
       status: "error",
-      error: errorMessage,
+      error: message,
     },
   });
 
-  return { errorMessage, durationMs };
+  // For console lines, which print call text only with text tracing on.
+  return {
+    errorMessage: isTraceTextEnabled() ? message : described,
+    durationMs,
+  };
 }
 
 export async function generateText<TTools extends ToolSet = ToolSet>(
@@ -317,6 +329,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
   const steps: ProviderResultLike[] = [];
   let accounting: CallAccounting | undefined;
+  const isAdapter = ctx.adapter?.generateText !== undefined;
   // Capture provider history before tool logging or the caller's callback can fail.
   const wrappedOnStepEnd: TextOptions<TTools>["onStepEnd"] = async (
     stepResult,
@@ -355,7 +368,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
         }
       }
     }
-    await options.onStepEnd?.(stepResult);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || isAdapter) await options.onStepEnd?.(stepResult);
   };
 
   // Build request based on input type
@@ -411,7 +425,6 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     // Cast to the SDK's own param type (not `any`) to bypass NoInfer<TTools>
     // while still catching a future SDK shape change at compile time.
     // Our TextOptions<TTools> provides proper typing at the interface level.
-    const isAdapter = ctx.adapter?.generateText !== undefined;
     const result = isAdapter
       ? await runWithCallTimeout(timeout, (signal) =>
           ctx.adapter!.generateText!({
@@ -551,7 +564,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       ...(hasOutputSchema && { output }),
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "text",
       modelKey,
@@ -608,9 +621,11 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
   const steps: ProviderResultLike[] = [];
   let accounting: CallAccounting | undefined;
+  const isAdapter = ctx.adapter?.generateObject !== undefined;
   const onStepEnd: ObjectOptions["onStepEnd"] = async (step) => {
     steps.push(step);
-    await options.onStepEnd?.(step);
+    // The SDK path calls the caller's callback only with tools; an adapter gets it as given.
+    if (hasTools || isAdapter) await options.onStepEnd?.(step);
   };
 
   // Build request using AI SDK v6 pattern: generateText with Output.object()
@@ -658,7 +673,6 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   });
 
   try {
-    const isAdapter = ctx.adapter?.generateObject !== undefined;
     const result = isAdapter
       ? await runWithCallTimeout(timeout, (signal) =>
           ctx.adapter!.generateObject!({
@@ -784,7 +798,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       ...(reasoning ? { reasoning } : {}),
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "object",
       modelKey,

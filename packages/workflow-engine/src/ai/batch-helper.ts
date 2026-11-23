@@ -10,6 +10,7 @@ import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
+import { isTraceTextEnabled } from "../utils/logger.js";
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
@@ -842,7 +843,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }));
   }
 
-  async getResults(
+  getResults(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchResult<T>[]> {
+    return this.track(this.collectResults(batchId, metadata));
+  }
+
+  private async collectResults(
     batchId: string,
     metadata?: Record<string, unknown>,
   ): Promise<AIBatchResult<T>[]> {
@@ -1110,15 +1118,19 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       // the batch discount is lost twice over. Schema failures are usually
       // a schema the provider's structured-output mode cannot express;
       // provider failures are the endpoint rejecting the request itself.
-      const classes = [
-        schemaFailures > 0
-          ? `${schemaFailures} failed schema validation (first issue: ${firstSchemaIssue ?? "unknown"})`
-          : undefined,
-        providerFailures > 0
-          ? `${providerFailures} failed at the provider (first error: ${firstProviderError ?? "unknown"})`
-          : undefined,
-      ].filter((c): c is string => c !== undefined);
-      const warnMsg = `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${classes.join("; ")}.`;
+      // The first issue and error quote model output and provider responses.
+      const describe = (detail: boolean) =>
+        `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${[
+          schemaFailures > 0
+            ? `${schemaFailures} failed schema validation${detail ? ` (first issue: ${firstSchemaIssue ?? "unknown"})` : ""}`
+            : undefined,
+          providerFailures > 0
+            ? `${providerFailures} failed at the provider${detail ? ` (first error: ${firstProviderError ?? "unknown"})` : ""}`
+            : undefined,
+        ]
+          .filter((c): c is string => c !== undefined)
+          .join("; ")}.`;
+      const warnMsg = describe(true);
       const meta = {
         batchId,
         schemaFailures,
@@ -1128,7 +1140,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       if (this.batchLogFn) {
         this.batchLogFn("WARN", warnMsg, meta);
       } else {
-        logger.warn(warnMsg, meta);
+        logger.warn(describe(isTraceTextEnabled()), meta);
       }
     }
 
@@ -1139,6 +1151,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     });
 
     return results;
+  }
+
+  /** Pending for flush until it settles, since it can write AI call rows. */
+  private track<R>(work: Promise<R>): Promise<R> {
+    return this.ctx.track ? this.ctx.track(work) : work;
   }
 
   async isRecorded(batchId: string): Promise<boolean> {
@@ -1163,9 +1180,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return inFlight;
     }
 
-    const recordPromise = (async () => {
+    const recording = (async () => {
       try {
-        if (await this.isRecorded(batchId)) {
+        if (
+          await this.isRecorded(batchId).catch((error: unknown) => {
+            this.ctx.onAccountingError?.(error);
+            throw error;
+          })
+        ) {
           logger.debug(`Batch ${batchId} already recorded, skipping.`);
           this.recordedBatchIds.add(batchId);
           return;
@@ -1174,7 +1196,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         const modelConfig = getModel(this.modelKey);
         const provider = extra.provider ?? this.provider;
 
-        await this.ctx.aiCallLogger.logBatchResults(
+        const write = this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
             const estimatedCost = calculateCostWithDiscount(
@@ -1236,6 +1258,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             };
           }),
         );
+        await write;
         // Only after the ledger write succeeded. Marking before the await
         // meant one transient DB error left the id in the set, and every
         // later getResults() in this process skipped recording for good.
@@ -1244,6 +1267,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         this.recordingPromises.delete(batchId);
       }
     })();
+    const recordPromise = this.track(recording);
 
     this.recordingPromises.set(batchId, recordPromise);
     return recordPromise;

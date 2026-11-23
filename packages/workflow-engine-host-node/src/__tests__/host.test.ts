@@ -185,6 +185,32 @@ describe("NodeHost", () => {
     }
   });
 
+  it("waits for the kernel flush when the host stops", async () => {
+    const { kernel, jobTransport } = createTestEnv();
+    const done = Promise.withResolvers<{ failed: number; pending: number }>();
+    const flush = vi.spyOn(kernel, "flush").mockReturnValue(done.promise);
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      shutdownTimeoutMs: 250,
+    });
+    await host.start();
+    let stopped = false;
+    const stop = host.stop().then(() => {
+      stopped = true;
+    });
+    try {
+      await vi.waitFor(() =>
+        expect(flush).toHaveBeenCalledWith({ timeoutMs: 250 }),
+      );
+      expect(stopped).toBe(false);
+    } finally {
+      done.resolve({ failed: 0, pending: 0 });
+      await stop;
+    }
+  });
+
   it("processes a single-stage workflow end-to-end", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);

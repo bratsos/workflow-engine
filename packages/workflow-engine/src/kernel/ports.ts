@@ -20,9 +20,9 @@
 import type { EngineBatchModelResolver } from "../ai/batch/model";
 import type {
   AIHelper,
-  AIHelperOptions,
   LogContext,
   ProviderResolver,
+  StageAIHelperOptions,
 } from "../ai/types.js";
 import type { StageResult, SuspendedResult } from "../core/types";
 import type {
@@ -208,6 +208,7 @@ export interface StepLedger {
 /** Services made available lazily to stage execution contexts. */
 export interface KernelServices {
   aiLogger?: AICallLogger;
+  /** Custom factories must forward options to createAIHelper, including run attribution. */
   ai?: AIHelperFactory;
   /**
    * Finds the transport for a stored batch ref when `run.cancel` cancels the
@@ -235,7 +236,7 @@ export type AIHelperFactory = (
   logger: AICallLogger,
   logContext?: LogContext,
   providerResolver?: ProviderResolver,
-  options?: AIHelperOptions,
+  options?: StageAIHelperOptions,
 ) => AIHelper;
 
 // ============================================================================
@@ -545,6 +546,8 @@ export interface ActivityRunInput {
   stageDef: SyncStageDefinitionLike;
   workflowId: string;
   workflowRunId: string;
+  tenantId?: string;
+  labels?: Record<string, string>;
   workflowType: string;
   stageId: string;
   stageName: string;

@@ -448,6 +448,12 @@ class NodeHostImpl implements NodeHost {
     if (this.flushOutboxOnStop) {
       await this.flushOutbox();
     }
+    const flush = Promise.resolve()
+      .then(() => this.kernel.flush?.({ timeoutMs: this.shutdownTimeoutMs }))
+      .catch(() => {
+        console.warn("[NodeHost] Call accounting drain failed");
+      });
+    await withTimeout(flush, this.shutdownTimeoutMs);
   }
 
   /** Publish pending outbox events, bounded by `shutdownTimeoutMs`. */

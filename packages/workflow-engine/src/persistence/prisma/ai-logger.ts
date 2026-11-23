@@ -8,9 +8,11 @@ import { withTransactionWriteGuard } from "./transaction-writes.js";
  * for non-blocking logging during AI operations.
  */
 
+import { AICallWriteTracker } from "../../ai/write-tracker.js";
 import type { Persistence } from "../../kernel/ports";
-import { createLogger } from "../../utils/logger";
+import { createLogger, isTraceTextEnabled } from "../../utils/logger";
 import type {
+  AICallFlushOptions,
   AICallLogger,
   AICallRecord,
   AIHelperStats,
@@ -87,6 +89,19 @@ function costColumns(call: CreateAICallInput): {
   };
 }
 
+function attributionColumns(call: CreateAICallInput) {
+  return {
+    ...(call.workflowRunId !== undefined
+      ? { workflowRunId: call.workflowRunId }
+      : {}),
+    ...(call.tenantId !== undefined ? { tenantId: call.tenantId } : {}),
+    ...(call.labels !== undefined ? { labels: call.labels } : {}),
+    ...(call.textExpiresAt !== undefined
+      ? { textExpiresAt: call.textExpiresAt }
+      : {}),
+  };
+}
+
 interface AICallRow {
   id: string;
   createdAt: Date;
@@ -146,6 +161,7 @@ export interface PrismaAICallLoggerOptions {
 
 export class PrismaAICallLogger implements AICallLogger {
   private readonly databaseType: DatabaseType;
+  private readonly writes = new AICallWriteTracker();
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -160,21 +176,30 @@ export class PrismaAICallLogger implements AICallLogger {
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
 
+  #trackWrite(write: () => Promise<void>): Promise<void> {
+    const done = this.writes.begin();
+    const result = Promise.resolve().then(write);
+    void result.then(done, (error: unknown) => {
+      this.writes.fail();
+      done();
+      logger.warn(
+        "Failed to persist AI call",
+        ...(isTraceTextEnabled() ? [error] : []),
+      );
+    });
+    return result;
+  }
+
   /**
-   * Log a single AI call (fire and forget)
-   * Returns the write for callers coordinating run erasure.
+   * Returns the insert promise, with a rejection handler for fire-and-forget
+   * callers, so callers coordinating run erasure can wait for it.
    */
   logCall(call: CreateAICallInput): Promise<void> {
-    // Not awaited by the caller, so the SQLite date check runs here (it is
-    // `undefined` on PostgreSQL); a refusal is logged like any failed write.
-    const check = sqliteCheckFor(this);
-    const write = () =>
-      this.prisma.aICall.create({
+    return this.#trackWrite(async () => {
+      await sqliteCheckFor(this);
+      await this.prisma.aICall.create({
         data: {
           topic: call.topic,
-          ...(call.workflowRunId !== undefined
-            ? { workflowRunId: call.workflowRunId }
-            : {}),
           callType: call.callType,
           modelKey: call.modelKey,
           modelId: call.modelId,
@@ -184,23 +209,35 @@ export class PrismaAICallLogger implements AICallLogger {
           outputTokens: call.outputTokens,
           cost: call.cost,
           ...costColumns(call),
-          metadata: call.metadata as unknown,
+          ...attributionColumns(call),
+          metadata: call.metadata,
           ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
           ...(call.requestId !== undefined
             ? { requestId: call.requestId }
             : {}),
         },
       });
-    return Promise.resolve(check ? check.then(write) : write()).then(
-      () => {},
-      (error: unknown) => logger.error("Failed to persist AI call:", error),
-    );
+    });
+  }
+
+  flush(options?: AICallFlushOptions) {
+    return this.writes.flush(options);
   }
 
   /**
    * Log batch results (for recording batch API results)
    */
-  async logBatchResults(
+  logBatchResults(
+    batchId: string,
+    results: CreateAICallInput[],
+  ): Promise<void> {
+    return this.#trackWrite(async () => {
+      await sqliteCheckFor(this);
+      await this.#insertBatchResults(batchId, results);
+    });
+  }
+
+  async #insertBatchResults(
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
@@ -217,9 +254,6 @@ export class PrismaAICallLogger implements AICallLogger {
 
       return {
         topic: call.topic,
-        ...(call.workflowRunId !== undefined
-          ? { workflowRunId: call.workflowRunId }
-          : {}),
         callType: call.callType,
         modelKey: call.modelKey,
         modelId: call.modelId,
@@ -229,6 +263,7 @@ export class PrismaAICallLogger implements AICallLogger {
         outputTokens: call.outputTokens,
         cost: call.cost,
         ...costColumns(call),
+        ...attributionColumns(call),
         batchId,
         ...(requestId !== undefined ? { requestId } : {}),
         metadata: getBatchMetadata(call.metadata, batchId, requestId),
@@ -321,6 +356,48 @@ export class PrismaAICallLogger implements AICallLogger {
         0,
       ),
       perModel,
+    };
+  }
+
+  /**
+   * Authoritative USD cost over [from, to). A null group collects rows
+   * without the selected label.
+   */
+  async costByTenant({
+    tenantId,
+    from,
+    to,
+    groupBy,
+  }: {
+    tenantId: string;
+    from: Date;
+    to: Date;
+    groupBy?: string;
+  }): Promise<{
+    totalCost: number;
+    groups?: { label: string | null; cost: number }[];
+  }> {
+    const where = { tenantId, createdAt: { gte: from, lt: to } };
+    const rows: { cost: number; labels?: unknown }[] =
+      await this.prisma.aICall.findMany({
+        where,
+        select:
+          groupBy === undefined ? { cost: true } : { cost: true, labels: true },
+      });
+    if (groupBy === undefined) {
+      return { totalCost: rows.reduce((total, row) => total + row.cost, 0) };
+    }
+
+    const costs = new Map<string | null, number>();
+    let totalCost = 0;
+    for (const { cost, labels } of rows) {
+      const label = getMetadataString(labels, groupBy) ?? null;
+      totalCost += cost;
+      costs.set(label, (costs.get(label) ?? 0) + cost);
+    }
+    return {
+      totalCost,
+      groups: Array.from(costs, ([label, cost]) => ({ label, cost })),
     };
   }
 
@@ -461,10 +538,12 @@ export class PrismaAICallLogger implements AICallLogger {
   }
 }
 
-// Every method but the two synchronous ones awaits the SQLite date check first
-// (see sqlite-date-guard.ts); `logCall` makes it itself.
+// Writes run the SQLite date check inside the tracked promise.
+
 guardSqliteAdapter(PrismaAICallLogger.prototype, [
   "logCall",
+  "logBatchResults",
+  "flush",
   "transactionReads",
 ]);
 

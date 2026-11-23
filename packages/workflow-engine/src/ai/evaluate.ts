@@ -150,7 +150,8 @@ export async function evaluate<const Q extends EvaluationQuestions>(
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
-    questions: questionIds,
+    // Callers may key questions by their text.
+    questionCount: questionIds.length,
   });
 
   try {
@@ -241,7 +242,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       costSource,
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "evaluate",
       modelKey,
