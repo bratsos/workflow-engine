@@ -13,8 +13,8 @@ import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
-  extractStepProvider,
   logger,
+  type ProviderResultLike,
   resolveCost,
   resolveLanguageModel,
 } from "./shared";
@@ -61,14 +61,14 @@ export function streamText(
   // Track whether we've logged an error (to avoid duplicate logs)
   let errorLogged = false;
   let sdkError: { error: unknown } | undefined;
-  const stepProviders: (string | null)[] = [];
+  const steps: ProviderResultLike[] = [];
   const onStepEnd: StreamOptions["onStepEnd"] = async (step) => {
-    stepProviders.push(extractStepProvider(step));
+    steps.push(step);
     await options.onStepEnd?.(step);
   };
 
   // Error handler that logs the error to DB
-  const logError = (error: unknown) => {
+  const logError = (error: unknown, observed?: ProviderResultLike) => {
     if (errorLogged || usageResolved) return;
     errorLogged = true;
     const callError = timeoutErrorIfExpired(timeout, error);
@@ -81,7 +81,17 @@ export function streamText(
       prompt: promptForLog,
       startTime,
       error: callError,
-      stepProviders,
+      steps,
+      result:
+        observed ??
+        (adapterResponse && {
+          usage: {
+            inputTokens: adapterResponse.inputTokens,
+            outputTokens: adapterResponse.outputTokens,
+          },
+          providerMetadata: adapterResponse.providerMetadata,
+          costUsd: adapterResponse.costUsd,
+        }),
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -122,7 +132,7 @@ export function streamText(
     outputTokens: number,
     responseText: string,
     reasoning: string | undefined,
-    resultLike?: unknown,
+    resultLike?: ProviderResultLike,
   ) => {
     if (usageResolved) return cachedUsage!;
 
@@ -143,7 +153,7 @@ export function streamText(
     );
     const durationMs = Date.now() - startTime;
 
-    if (sdkError) logError(sdkError.error);
+    if (sdkError) logError(sdkError.error, resultLike);
     usageResolved = true;
     cachedUsage = {
       inputTokens,
@@ -249,9 +259,14 @@ export function streamText(
         logError(error);
         return;
       }
-      const recordError = () => logError(error);
-      void runWithCallTimeout(timeout, () => sdkResult.steps)
-        .then(recordError, recordError)
+      void runWithCallTimeout(timeout, async () => {
+        const [usage] = await Promise.all([sdkResult.usage, sdkResult.steps]);
+        return usage;
+      })
+        .then(
+          (usage) => logError(error, { usage }),
+          () => logError(error),
+        )
         .catch(() => logger.error("Failed to record a stream call error."));
     },
     // Ensure the call is always logged once the stream finishes, even if

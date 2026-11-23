@@ -88,11 +88,14 @@ export function buildOpenRouterRoutingProvider(
       "routing.provider.only is empty, so no provider is permitted.",
     );
   }
+  if (requestProvider != null && !isRoutingObject(requestProvider)) {
+    throw new Error("OpenRouter provider options must be an object.");
+  }
+
+  const requested = requestProvider ?? {};
   const priceHeadroom = routing?.priceHeadroom ?? 1.25;
   const configured = {
-    ...(policy?.order?.length
-      ? {}
-      : { sort: routing?.sort ?? ("throughput" as const) }),
+    sort: routing?.sort ?? ("throughput" as const),
     require_parameters: routing?.requireParameters ?? true,
     ...(priceHeadroom > 0 && {
       max_price: {
@@ -100,103 +103,87 @@ export function buildOpenRouterRoutingProvider(
         completion: modelConfig.outputCostPerMillion * priceHeadroom,
       },
     }),
-    ...(policy?.only !== undefined ? { only: policy.only } : {}),
-    ...(policy?.order !== undefined ? { order: policy.order } : {}),
-    ...(policy?.allowFallbacks !== undefined
-      ? { allow_fallbacks: policy.allowFallbacks }
-      : {}),
-    ...(policy?.dataCollection !== undefined
-      ? { data_collection: policy.dataCollection }
-      : {}),
   };
-  if (requestProvider == null) return configured;
-  if (!isRoutingObject(requestProvider)) {
-    throw new Error("OpenRouter provider options must be an object.");
-  }
-
-  const merged: JSONObject = { ...configured, ...requestProvider };
-  const requestOnly = providerSlugs(requestProvider.only, "only");
-  let only = policy?.only;
-  if (requestOnly !== undefined) {
-    only =
-      only === undefined
-        ? requestOnly
-        : intersectProviderSlugs(only, requestOnly);
-  }
-  const allowFallbacks =
-    policy?.allowFallbacks === false ||
-    requestProvider.allow_fallbacks === false
-      ? false
-      : (policy?.allowFallbacks ?? requestProvider.allow_fallbacks);
-  const requestOrder = providerSlugs(requestProvider.order, "order");
-  const helperOrder = policy?.order;
-  let order = requestOrder?.length
-    ? requestOrder
-    : (helperOrder ?? requestOrder);
-  if (helperOrder?.length && requestOrder?.length) {
-    if (allowFallbacks === false) {
-      const overlap = intersectProviderSlugs(helperOrder, requestOrder);
-      const reverse = intersectProviderSlugs(requestOrder, helperOrder);
-      if (overlap.length === 0 || !sameProviderOrder(overlap, reverse)) {
-        throw new Error(
-          "The helper and per-call OpenRouter provider orders conflict.",
-        );
-      }
-      order = overlap;
-    } else {
-      const shorter =
-        helperOrder.length < requestOrder.length ? helperOrder : requestOrder;
-      const longer = shorter === helperOrder ? requestOrder : helperOrder;
-      if (!sameProviderOrder(shorter, longer.slice(0, shorter.length))) {
-        throw new Error(
-          "The helper and per-call OpenRouter provider orders conflict.",
-        );
-      }
-      order = longer;
-    }
-  }
-  if (
-    policy?.allowFallbacks === false &&
-    !helperOrder?.length &&
-    order &&
-    order.length > 1
-  ) {
-    throw new Error(
-      "The per-call provider order would add fallbacks to the helper's OpenRouter policy.",
-    );
-  }
-  if (
-    only?.length === 0 ||
-    (only &&
-      order?.length &&
-      allowFallbacks === false &&
-      !intersectProviderSlugs(only, order).length)
-  ) {
+  const merged: JSONObject = { ...configured, ...requested };
+  const ignore = providerSlugs(requested.ignore, "ignore");
+  const requestOnly = providerSlugs(requested.only, "only");
+  const configuredOnly = policy?.only ?? requestOnly;
+  let only =
+    configuredOnly &&
+    eligibleProviderSlugs(configuredOnly, requestOnly, ignore);
+  if (only?.length === 0) {
     throw new Error(
       "The merged OpenRouter provider allowlist permits no provider.",
     );
   }
 
+  const helperFallbacks = policy?.allowFallbacks;
+  const requestFallbacks = requested.allow_fallbacks;
+  const allowFallbacks =
+    helperFallbacks === false || requestFallbacks === false
+      ? false
+      : (helperFallbacks ?? requestFallbacks);
+  const helperOrder = policy?.order;
+  const requestOrder = providerSlugs(requested.order, "order");
+  const fromHelper = eligibleProviderSlugs(helperOrder ?? [], only, ignore);
+  const fromRequest = eligibleProviderSlugs(requestOrder ?? [], only, ignore);
+  let order = fromHelper.length ? fromHelper : fromRequest;
+  if (helperOrder?.length && requestOrder?.length) {
+    const overlap = intersectProviderSlugs(fromHelper, fromRequest);
+    const reverse = intersectProviderSlugs(fromRequest, fromHelper);
+    if (overlap.length === 0 || !sameProviderOrder(overlap, reverse)) {
+      throw new Error(
+        "The helper and per-call OpenRouter provider orders conflict.",
+      );
+    }
+    order = overlap;
+  }
+
+  if (
+    allowFallbacks === false &&
+    (helperOrder?.length || requestOrder?.length)
+  ) {
+    if (!order.length) {
+      throw new Error(
+        "The merged OpenRouter provider allowlist and order permit no provider.",
+      );
+    }
+    const singleEndpoint =
+      (helperFallbacks === false && !helperOrder?.length) ||
+      (requestFallbacks === false && !requestOrder?.length);
+    if (singleEndpoint && order.length !== 1) {
+      throw new Error(
+        "The OpenRouter provider order conflicts with a single-endpoint fallback restriction.",
+      );
+    }
+    // A hard allowlist also excludes private endpoints outside the order.
+    only = eligibleProviderSlugs(only ?? order, order, ignore);
+    // Adding even a singleton order to an unordered no-fallback request
+    // enables backups. Pin its provider through only instead.
+    if (singleEndpoint) order = [];
+  }
+
   if (only !== undefined) merged.only = only;
-  if (order !== undefined) merged.order = order;
-  if (order?.length) delete merged.sort;
+  if (order.length) {
+    merged.order = order;
+    delete merged.sort;
+  } else {
+    delete merged.order;
+  }
   if (allowFallbacks !== undefined) merged.allow_fallbacks = allowFallbacks;
   if (
     policy?.dataCollection === "deny" ||
-    requestProvider.data_collection === "deny"
+    requested.data_collection === "deny"
   ) {
     merged.data_collection = "deny";
   } else if (policy?.dataCollection === "allow") {
     merged.data_collection = "allow";
   }
-  if (
-    configured.require_parameters ||
-    requestProvider.require_parameters === true
-  ) {
+  if (configured.require_parameters || requested.require_parameters === true) {
     merged.require_parameters = true;
   }
   if (configured.max_price) {
-    const requestPrice = requestProvider.max_price;
+    const requestPrice = requested.max_price;
     if (requestPrice != null && !isRoutingObject(requestPrice)) {
       throw new Error("OpenRouter provider max_price must be an object.");
     }
@@ -237,20 +224,37 @@ function sameProviderOrder(first: string[], second: string[]): boolean {
   );
 }
 
-/** Base slugs include their variants. Variant slugs match only that endpoint. */
-export function intersectProviderSlugs(
-  first: string[],
-  second: string[],
-): string[] {
+/** Base slugs include variants. A specific slug covers only itself. */
+function coversProviderSlug(filter: string, slug: string): boolean {
+  return (
+    filter === slug || (!filter.includes("/") && slug.startsWith(`${filter}/`))
+  );
+}
+
+function intersectProviderSlugs(first: string[], second: string[]): string[] {
   const intersection = new Set<string>();
   for (const a of first) {
     for (const b of second) {
-      if (a === b || (!b.includes("/") && a.startsWith(`${b}/`)))
-        intersection.add(a);
-      else if (!a.includes("/") && b.startsWith(`${a}/`)) intersection.add(b);
+      if (coversProviderSlug(b, a)) intersection.add(a);
+      else if (coversProviderSlug(a, b)) intersection.add(b);
     }
   }
   return [...intersection];
+}
+
+export function eligibleProviderSlugs(
+  candidates: string[],
+  only?: string[],
+  ignore?: string[],
+): string[] {
+  const included = only
+    ? intersectProviderSlugs(candidates, only)
+    : [...new Set(candidates)];
+  // Keep broad slugs when only some of their variants are excluded. The
+  // outgoing ignore list lets OpenRouter apply those finer exclusions.
+  return included.filter(
+    (slug) => !ignore?.some((filter) => coversProviderSlug(filter, slug)),
+  );
 }
 
 function priceLimit(value: JSONValue): number {

@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { toPortableJsonSchema } from "../schema-portability";
 import {
+  eligibleProviderSlugs,
   extractReportedCost,
   extractServedBy,
   extractUsageDetails,
-  intersectProviderSlugs,
   type OpenRouterRoutingOptions,
 } from "../shared";
 import {
@@ -37,7 +37,7 @@ export function openRouterBatchProvider(
   endpoint: OpenRouterBatchConfig["endpoint"],
 ): { only?: string[]; allow_fallbacks?: boolean } | undefined {
   if (policy === undefined) return undefined;
-  let { only } = policy;
+  let only = policy.only && eligibleProviderSlugs(policy.only);
   const { order, allowFallbacks, dataCollection } = policy;
   if (only?.length === 0) {
     throw new Error("OpenRouter batch provider policy has an empty allowlist.");
@@ -48,7 +48,7 @@ export function openRouterBatchProvider(
     );
   }
   if (order?.length) {
-    const ordered = only ? intersectProviderSlugs(order, only) : order;
+    const ordered = eligibleProviderSlugs(order, only);
     if (allowFallbacks === false && ordered.length === 1) {
       // A single eligible provider can be pinned through the batch allowlist.
       only = ordered;

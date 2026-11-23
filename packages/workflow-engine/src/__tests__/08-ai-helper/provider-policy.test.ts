@@ -131,53 +131,63 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+const realtimeCalls = [
+  [
+    "text",
+    "/chat/completions",
+    (ai, providerOptions) =>
+      ai.generateText("policy-text", "Invoice", { providerOptions }),
+  ],
+  [
+    "object",
+    "/chat/completions",
+    (ai, providerOptions) =>
+      ai.generateObject(
+        "policy-text",
+        "Invoice",
+        z.object({ paid: z.boolean() }),
+        { providerOptions },
+      ),
+  ],
+  [
+    "stream",
+    "/chat/completions",
+    (ai, providerOptions) =>
+      ai
+        .streamText("policy-text", { prompt: "Invoice" }, { providerOptions })
+        .getUsage(),
+  ],
+  [
+    "embed",
+    "/embeddings",
+    (ai, providerOptions) =>
+      ai.embed("policy-embed", "Invoice", { providerOptions }),
+  ],
+  [
+    "embedMany",
+    "/embeddings",
+    (ai, providerOptions) =>
+      ai.embed("policy-embed", ["Invoice", "Order"], { providerOptions }),
+  ],
+  [
+    "evaluate",
+    "/decisions",
+    (ai, providerOptions) =>
+      ai.evaluate("policy-evaluate", spec, { providerOptions }),
+  ],
+] satisfies [
+  string,
+  string,
+  (
+    ai: ReturnType<typeof makeHelper>,
+    providerOptions?: Record<string, Record<string, unknown>>,
+  ) => Promise<unknown>,
+][];
+
 describe("helper provider policy", () => {
-  it.each([
-    [
-      "text",
-      "/chat/completions",
-      (ai) => ai.generateText("policy-text", "Invoice", { providerOptions }),
-    ],
-    [
-      "object",
-      "/chat/completions",
-      (ai) =>
-        ai.generateObject(
-          "policy-text",
-          "Invoice",
-          z.object({ paid: z.boolean() }),
-          { providerOptions },
-        ),
-    ],
-    [
-      "stream",
-      "/chat/completions",
-      (ai) =>
-        ai
-          .streamText("policy-text", { prompt: "Invoice" }, { providerOptions })
-          .getUsage(),
-    ],
-    [
-      "embed",
-      "/embeddings",
-      (ai) => ai.embed("policy-embed", "Invoice", { providerOptions }),
-    ],
-    [
-      "embedMany",
-      "/embeddings",
-      (ai) =>
-        ai.embed("policy-embed", ["Invoice", "Order"], { providerOptions }),
-    ],
-    [
-      "evaluate",
-      "/decisions",
-      (ai) => ai.evaluate("policy-evaluate", spec, { providerOptions }),
-    ],
-  ] satisfies [
-    string,
-    string,
-    (ai: ReturnType<typeof makeHelper>) => Promise<unknown>,
-  ][])("enforces the helper policy in the OpenRouter %s request", async (_call, endpoint, run) => {
+  it.each(
+    realtimeCalls,
+  )("enforces the helper policy in the OpenRouter %s request", async (_call, endpoint, run) => {
     const ai = createAIHelper(
       "policy",
       new InMemoryAICallLogger(),
@@ -190,17 +200,101 @@ describe("helper provider policy", () => {
         },
       },
     );
-    await run(ai.createChild("tenant-a")).catch(() => {});
+    await run(ai.createChild("tenant-a"), providerOptions).catch(() => {});
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(String(url)).toMatch(new RegExp(`${endpoint}$`));
     expect(JSON.parse(String(init?.body)).provider).toMatchObject({
       ...wirePolicy,
       only: ["openai"],
+      order: ["openai"],
       zdr: true,
       require_parameters: true,
       max_price: { prompt: 0.5, completion: 2.5, request: 0.01 },
       ignore: ["anthropic"],
+    });
+  });
+
+  describe.each(
+    realtimeCalls,
+  )("%s routing restrictions", (_call, _endpoint, run) => {
+    const invoke = (
+      policy: OpenRouterRoutingOptions["provider"],
+      request?: Record<string, unknown>,
+    ) =>
+      Promise.resolve()
+        .then<unknown>(() =>
+          run(
+            makeHelper(policy),
+            request && { openrouter: { provider: request } },
+          ),
+        )
+        .catch(() => {});
+
+    it("refuses a helper ranking that would add backups to the caller's no-fallback request", async () => {
+      await invoke({ order: ["azure", "openai"] }, { allow_fallbacks: false });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("pins a caller's singleton order without adding backups to the helper's no-fallback request", async () => {
+      await invoke({ allowFallbacks: false }, { order: ["azure"] });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+      expect(body.provider).toEqual({
+        only: ["azure"],
+        allow_fallbacks: false,
+        sort: "throughput",
+        require_parameters: true,
+        max_price: { prompt: 1.25, completion: 2.5 },
+      });
+    });
+
+    it("refuses an allowlist whose only eligible provider was ignored", async () => {
+      await invoke({ only: ["openai"] }, { ignore: ["openai"] });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses an incompatible helper policy without per-call options", async () => {
+      await invoke({
+        only: ["openai"],
+        order: ["azure"],
+        allowFallbacks: false,
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("compares provider orders after excluding ineligible providers", async () => {
+      await invoke(
+        { only: ["openai"], order: ["openai", "azure"], allowFallbacks: false },
+        { order: ["azure", "openai"] },
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider,
+      ).toMatchObject({
+        only: ["openai"],
+        order: ["openai"],
+        allow_fallbacks: false,
+      });
+    });
+
+    it("keeps only shared preferences even with fallbacks enabled", async () => {
+      await invoke(
+        { order: ["azure", "openai"], allowFallbacks: true },
+        { order: ["openai"] },
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).provider,
+      ).toMatchObject({ order: ["openai"], allow_fallbacks: true });
+    });
+
+    it("refuses conflicting preferences when an allowlist removes one order", async () => {
+      await invoke(
+        { only: ["openai"], order: ["openai"], allowFallbacks: true },
+        { order: ["azure"] },
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
     });
   });
 
@@ -387,6 +481,7 @@ describe("helper provider policy", () => {
   it.each([
     { only: ["openai"], allowFallbacks: false },
     { order: ["openai"], allowFallbacks: false },
+    { only: ["openai"], order: ["azure", "openai"], allowFallbacks: false },
   ])("sends the expressible policy at the top level of an OpenRouter batch (%j)", async (policy) => {
     fetchMock.mockResolvedValueOnce(
       Response.json({ id: "batch-1", status: "validating" }, { status: 202 }),
@@ -407,8 +502,11 @@ describe("helper provider policy", () => {
     expect(parsed.requests[0].body).not.toHaveProperty("provider");
   });
 
-  it("refuses a policy that depends on provider order or data denial in an OpenRouter batch", async () => {
-    const ai = makeHelper();
+  it.each([
+    provider,
+    { only: ["openai"], order: ["azure"], allowFallbacks: false },
+  ])("refuses an unrepresentable OpenRouter batch policy (%j)", async (policy) => {
+    const ai = makeHelper(policy);
     await expect(
       ai
         .batch("policy-text", "openrouter", { fetch: fetchMock })
@@ -430,9 +528,9 @@ describe("helper provider policy", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  function mockToolSteps(finalText: string) {
+  function mockToolSteps(finalText?: string, cost?: number) {
     for (const [index, name] of ["Azure", "OpenAI", "Azure"].entries()) {
-      const final = index === 2;
+      const final = index === 2 && finalText !== undefined;
       fetchMock.mockResolvedValueOnce(
         Response.json({
           id: `gen-${index}`,
@@ -457,7 +555,12 @@ describe("helper provider policy", () => {
                   },
             },
           ],
-          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            cost,
+          },
         }),
       );
     }
@@ -535,6 +638,67 @@ describe("helper provider policy", () => {
     );
   });
 
+  const alpha21ToolLimitTotals = {
+    inputTokens: 30,
+    outputTokens: 6,
+    cost: 0.375,
+  };
+  const alpha21StreamTotals = {
+    inputTokens: 20,
+    outputTokens: 4,
+    cost: 0.000028,
+  };
+
+  async function failAtToolLimit(
+    logger: AICallLogger,
+    call: "text" | "object",
+  ) {
+    const topic = `tool-limit-${crypto.randomUUID()}`;
+    const ai = createAIHelper(topic, logger);
+    mockToolSteps(undefined, 0.125);
+    const schema = z.object({ paid: z.boolean() });
+    const options = {
+      stopWhen: stepCountIs(3),
+      tools: { check: { inputSchema: z.object({}), execute: () => true } },
+    };
+    const result =
+      call === "text"
+        ? ai.generateText("policy-text", "Check the invoice.", {
+            ...options,
+            output: Output.object({ schema }),
+          })
+        : ai.generateObject(
+            "policy-text",
+            "Check the invoice.",
+            schema,
+            options,
+          );
+    await expect(result).rejects.toMatchObject({
+      name: "AI_NoOutputGeneratedError",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    return topic;
+  }
+
+  it.each([
+    "text",
+    "object",
+  ] as const)("keeps the alpha.21 billable totals when %s reaches the tool-step limit", async (call) => {
+    const logger = new InMemoryAICallLogger();
+    const topic = await failAtToolLimit(logger, call);
+    const rows = (await logger.listCalls(topic)).filter(
+      (row) => row.topic === topic,
+    );
+    expect(rows).toMatchObject([
+      {
+        ...alpha21ToolLimitTotals,
+        reportedCost: alpha21ToolLimitTotals.cost,
+        costSource: "reported",
+        ...failedHistory,
+      },
+    ]);
+  });
+
   it.skipIf(!realDatabase)(
     "persists failed object provider history through the Prisma logger",
     async () => {
@@ -554,10 +718,12 @@ describe("helper provider policy", () => {
     20_000,
   );
 
-  it.each([
-    false,
-    true,
-  ])("records completed provider steps when a subsequent stream request fails (streamed error: %s)", async (streamedError) => {
+  async function failStream(
+    logger: AICallLogger,
+    streamedError: boolean,
+    cost?: number,
+  ) {
+    const topic = `stream-history-${crypto.randomUUID()}`;
     for (const [index, name] of ["Azure", "OpenAI"].entries()) {
       const chunk = {
         id: `gen-${index}`,
@@ -580,7 +746,12 @@ describe("helper provider policy", () => {
             },
           },
         ],
-        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 2,
+          total_tokens: 12,
+          cost,
+        },
       };
       fetchMock.mockResolvedValueOnce(
         new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
@@ -609,10 +780,7 @@ describe("helper provider policy", () => {
         ),
       );
     }
-    const logger = new InMemoryAICallLogger();
-    const ai = createAIHelper("policy", logger, undefined, undefined, {
-      routing: { provider },
-    });
+    const ai = createAIHelper(topic, logger);
     const stream = ai.streamText(
       "policy-text",
       { prompt: "Check the invoice." },
@@ -621,18 +789,77 @@ describe("helper provider policy", () => {
         tools: { check: { inputSchema: z.object({}), execute: () => true } },
       },
     );
-    await stream.getUsage().catch(() => {});
+    const usage = await stream.getUsage().catch(() => undefined);
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(await logger.listCalls("policy")).toMatchObject([
+    if (streamedError)
+      expect(usage).toMatchObject({
+        ...alpha21StreamTotals,
+        cost: expect.closeTo(alpha21StreamTotals.cost, 12),
+      });
+    return topic;
+  }
+
+  const failedStream = (streamedError: boolean) => ({
+    ...alpha21StreamTotals,
+    cost: expect.closeTo(alpha21StreamTotals.cost, 12),
+    estimatedCost: expect.closeTo(alpha21StreamTotals.cost, 12),
+    costSource: "estimated",
+    servedBy: "Azure,OpenAI",
+    metadata: {
+      status: "error",
+      servedBySteps: streamedError
+        ? ["Azure", "OpenAI", "Azure"]
+        : ["Azure", "OpenAI"],
+    },
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps the alpha.21 stream ledger totals after failure (streamed error: %s)", async (streamedError) => {
+    const logger = new InMemoryAICallLogger();
+    const topic = await failStream(logger, streamedError);
+    expect(await logger.listCalls(topic)).toMatchObject([
+      failedStream(streamedError),
+    ]);
+  });
+
+  it("preserves all reported stream charges before a later request fails", async () => {
+    const logger = new InMemoryAICallLogger();
+    const topic = await failStream(logger, false, 0.125);
+    expect(await logger.listCalls(topic)).toMatchObject([
       {
-        servedBy: "Azure,OpenAI",
-        metadata: {
-          status: "error",
-          servedBySteps: streamedError
-            ? ["Azure", "OpenAI", "Azure"]
-            : ["Azure", "OpenAI"],
-        },
+        ...failedStream(false),
+        cost: 0.25,
+        reportedCost: 0.25,
+        costSource: "reported",
       },
     ]);
   });
+
+  it.skipIf(!realDatabase)(
+    "persists billable accounting for failed calls through the Prisma logger",
+    async () => {
+      const db = await kernelDatabase();
+      try {
+        const textTopic = await failAtToolLimit(db.aiLogger, "text");
+        fetchMock.mockClear();
+        const streamTopic = await failStream(db.aiLogger, true);
+        await vi.waitFor(async () => {
+          const rows = (await db.aiLogger.listCalls(textTopic)).filter(
+            (row) => row.topic === textTopic,
+          );
+          expect(rows).toMatchObject([
+            { ...alpha21ToolLimitTotals, ...failedHistory },
+          ]);
+          expect(await db.aiLogger.listCalls(streamTopic)).toMatchObject([
+            failedStream(true),
+          ]);
+        });
+      } finally {
+        await db.close();
+      }
+    },
+    20_000,
+  );
 });

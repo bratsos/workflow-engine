@@ -11,10 +11,12 @@ import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
-import { calculateCost, getModel, type ModelKey } from "./model-helper";
+import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
+  type CostResolution,
   explainRoutingError,
+  extractReportedCost,
   extractStepProvider,
   extractUsageDetails,
   logger,
@@ -150,34 +152,73 @@ export function logFailure(
     prompt: string;
     startTime: number;
     error: unknown;
-    stepProviders?: (string | null)[];
+    steps?: readonly ProviderResultLike[];
+    result?: ProviderResultLike;
     metadata?: Record<string, unknown>;
   },
 ): { errorMessage: string; durationMs: number } {
   const durationMs = Date.now() - params.startTime;
   const errorMessage =
     params.error instanceof Error ? params.error.message : String(params.error);
-  // A call that reached the model and failed afterwards (`NoObjectGeneratedError`
-  // and the like) still consumed tokens; the error carries the usage.
-  const usage = usageFromError(params.error);
-  const inputTokens = usage.inputTokens;
-  const outputTokens = usage.outputTokens;
-  let estimatedCost = 0;
-  if (inputTokens > 0 || outputTokens > 0) {
-    try {
-      estimatedCost = calculateCost(
-        params.modelKey,
-        inputTokens,
-        outputTokens,
-        usage.cachedInputTokens ?? 0,
-      ).totalCost;
-    } catch {
-      estimatedCost = 0;
-    }
+  const steps = params.steps ?? [];
+  const errorUsage = usageFromError(params.error);
+  const errorResult = params.error as ProviderResultLike | undefined;
+  const observedUsage = params.result?.usage ?? params.result?.totalUsage;
+  let stepInputTokens = 0;
+  let stepOutputTokens = 0;
+  for (const step of steps) {
+    stepInputTokens += tokenCount(step.usage?.inputTokens);
+    stepOutputTokens += tokenCount(step.usage?.outputTokens);
+  }
+  // Error usage and observed steps can describe the same requests.
+  const inputTokens = Math.max(
+    errorUsage.inputTokens,
+    stepInputTokens,
+    tokenCount(observedUsage?.inputTokens),
+  );
+  const outputTokens = Math.max(
+    errorUsage.outputTokens,
+    stepOutputTokens,
+    tokenCount(observedUsage?.outputTokens),
+  );
+  const totals = { inputTokens, outputTokens };
+  const folded = costResultLikeForSteps({
+    usage: {
+      ...(steps.length === 1 ? steps[0]?.usage : undefined),
+      ...observedUsage,
+      ...totals,
+    },
+    finalStep: steps.at(-1),
+    steps,
+  });
+  const costUsd =
+    extractReportedCost(errorResult) ??
+    params.result?.costUsd ??
+    (steps.length === 0
+      ? extractReportedCost(params.result)
+      : stepInputTokens === inputTokens && stepOutputTokens === outputTokens
+        ? extractReportedCost(folded)
+        : undefined);
+  let accounting: CostResolution = {
+    cost: costUsd ?? 0,
+    estimatedCostUsd: 0,
+    reportedCostUsd: costUsd,
+    costSource: costUsd === undefined ? "estimated" : "reported",
+    cachedInputTokens: errorUsage.cachedInputTokens,
+    reasoningTokens: errorUsage.reasoningTokens,
+  };
+  try {
+    accounting = resolveCost(params.modelKey, inputTokens, outputTokens, {
+      costUsd,
+      usage: { ...errorUsage, ...folded.usage },
+      steps,
+    });
+  } catch {
+    // Preserve available reporting if the cost catalogue cannot price the failure.
   }
 
   const { servedBy, servedBySteps } = summarizeStepProviders(
-    params.stepProviders ?? [],
+    steps.map(extractStepProvider),
   );
   aiCallLogger.logCall({
     topic: params.topic,
@@ -188,15 +229,18 @@ export function logFailure(
     response: "",
     inputTokens,
     outputTokens,
-    cost: estimatedCost,
-    estimatedCost,
-    costSource: "estimated",
-    ...(servedBy !== undefined ? { servedBy } : {}),
-    ...(usage.cachedInputTokens !== undefined
-      ? { cachedInputTokens: usage.cachedInputTokens }
+    cost: accounting.cost,
+    estimatedCost: accounting.estimatedCostUsd,
+    ...(accounting.reportedCostUsd !== undefined
+      ? { reportedCost: accounting.reportedCostUsd }
       : {}),
-    ...(usage.reasoningTokens !== undefined
-      ? { reasoningTokens: usage.reasoningTokens }
+    costSource: accounting.costSource,
+    ...(servedBy !== undefined ? { servedBy } : {}),
+    ...(accounting.cachedInputTokens !== undefined
+      ? { cachedInputTokens: accounting.cachedInputTokens }
+      : {}),
+    ...(accounting.reasoningTokens !== undefined
+      ? { reasoningTokens: accounting.reasoningTokens }
       : {}),
     metadata: {
       ...params.metadata,
@@ -244,12 +288,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     );
   }
 
-  const stepProviders: (string | null)[] = [];
+  const steps: ProviderResultLike[] = [];
   // Capture provider history before tool logging or the caller's callback can fail.
   const wrappedOnStepEnd: TextOptions<TTools>["onStepEnd"] = async (
     stepResult,
   ) => {
-    stepProviders.push(extractStepProvider(stepResult));
+    steps.push(stepResult);
     if (hasTools && Array.isArray(stepResult.toolResults)) {
       for (const toolResult of stepResult.toolResults) {
         const result = toolResult as {
@@ -502,7 +546,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       prompt: promptForLog,
       startTime,
       error,
-      stepProviders,
+      steps,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -548,9 +592,9 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   // Extract text prompt for logging (for multimodal, join text parts)
   const promptForLog = extractPromptForLog(prompt);
 
-  const stepProviders: (string | null)[] = [];
+  const steps: ProviderResultLike[] = [];
   const onStepEnd: ObjectOptions["onStepEnd"] = async (step) => {
-    stepProviders.push(extractStepProvider(step));
+    steps.push(step);
     await options.onStepEnd?.(step);
   };
 
@@ -731,7 +775,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       prompt: promptForLog,
       startTime,
       error,
-      stepProviders,
+      steps,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,

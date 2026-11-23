@@ -71,7 +71,7 @@ const ai = createAIHelper(topic, logger, undefined, undefined, {
 });
 ```
 
-Built-in OpenRouter text, object, streaming, embedding and evaluation calls combine the helper policy with per-call OpenRouter provider settings. Allow-lists intersect, the stricter privacy and fallback settings win, and extra restrictions such as `zdr` are preserved. Conflicting constraints may cause the call to fail before submission.
+Built-in OpenRouter text, object, streaming, embedding and evaluation calls combine the helper policy with per-call OpenRouter provider settings. Allow-lists intersect, the stricter privacy and fallback settings win, and extra restrictions such as `zdr` are preserved. The helper compares rankings after applying allowlists and exclusions. If either side disables fallbacks without an order, a compatible singleton preference becomes an allowlist with fallbacks disabled. A ranking that would require backups fails before submission.
 
 Direct built-in calls, including transcription and native batches, require their vendor to appear in `only` when set. They also reject a provider outside `order` when fallbacks are disabled and reject `dataCollection: "deny"` because the direct transports cannot enforce that setting.
 
@@ -274,5 +274,5 @@ Every AI result exposes `reportedCostUsd` (the provider's own figure, when it re
 
 The `ai_calls` row behind each result keeps both figures rather than the winner alone: `cost` (the authoritative number `getStats` sums and `WorkflowRun.totalCost` rolls up), `estimatedCost` (the registry figure, always computed), `reportedCost` (the provider's figure, when any), `costSource` (which of the two `cost` is), `servedBy` (the serving provider or comma-separated distinct providers), plus `cachedInputTokens` and `reasoningTokens` (breakdowns of `inputTokens` and `outputTokens`, not additions to them). The estimate prices cached input tokens at the model's `cachedInputCostPerMillion` when the registry has one (`workflow-engine-sync` emits it from OpenRouter's `input_cache_read` price) and at the full input rate otherwise; reasoning tokens are billed as output. `aiLogger.listCalls(topicPrefix)` reads the rows back. OpenRouter's `max_price` guard is the same registry price times `routing.priceHeadroom` (default 1.25). Comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic, not proof of an overcharge: cache-read rates are not guarded and `priceHeadroom: 0` disables the guard, so unexpected differences should prompt checking the endpoint's rates, caching, routing, and fees.
 
-Multi-step call rows store the provider for each step in order under `metadata.servedBySteps`. Failed text, object and stream calls preserve the steps the SDK reported before the failure. Unknown providers are represented as `null`.
+Multi-step call rows store the provider for each step in order under `metadata.servedBySteps`. Failed text, object and stream calls record the billable usage, cost and provider history available for the steps the SDK reported before the failure. Unknown providers are represented as `null`.
 
