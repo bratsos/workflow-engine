@@ -13,7 +13,6 @@ import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
-  isTraceTextEnabled,
   logger,
   type ProviderResultLike,
   resolveCost,
@@ -130,11 +129,8 @@ export function streamText(
     topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
-    ...(isTraceTextEnabled() && {
-      prompt:
-        promptForLog.substring(0, 500) +
-        (promptForLog.length > 500 ? "..." : ""),
-    }),
+    prompt:
+      promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
     temperature: options.temperature,
     maxTokens: options.maxTokens,
     hasTools,
@@ -215,11 +211,9 @@ export function streamText(
     logger.debug(`streamText response`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && {
-        response:
-          responseText.substring(0, 500) +
-          (responseText.length > 500 ? "..." : ""),
-      }),
+      response:
+        responseText.substring(0, 500) +
+        (responseText.length > 500 ? "..." : ""),
       inputTokens,
       outputTokens,
       cost: cost.toFixed(6),

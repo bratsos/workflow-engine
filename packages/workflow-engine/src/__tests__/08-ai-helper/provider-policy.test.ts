@@ -432,28 +432,35 @@ describe("helper provider policy", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("keeps audio URLs out of transcription diagnostics", async () => {
+  it("gates audio source previews in application diagnostics", async () => {
     const ai = makeHelper({ only: ["anthropic"] });
     const debug = vi.fn();
-    const error = vi.fn();
-    setLogger({ debug, info: vi.fn(), warn: vi.fn(), error });
+    const source = new URL("https://example.invalid/invoice/audio");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", undefined);
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", undefined);
+    setLogger({ debug, info: vi.fn(), warn: vi.fn(), error: vi.fn() });
     try {
-      await expect(
-        ai.transcribe(
-          "policy-transcribe",
-          new URL("https://example.invalid/audio?token=trace-fixture"),
-        ),
-      ).rejects.toThrow(/routing\.provider\.only/i);
+      await expect(ai.transcribe("policy-transcribe", source)).rejects.toThrow(
+        /routing\.provider\.only/i,
+      );
       expect(debug).toHaveBeenCalledWith(
         "[AIHelper] transcribe request",
-        expect.objectContaining({ audio: "[audio URL]" }),
+        expect.objectContaining({ model: "policy-transcribe" }),
       );
-      expect(
-        JSON.stringify([debug.mock.calls, error.mock.calls]),
-      ).not.toContain("trace-fixture");
+      expect(JSON.stringify(debug.mock.calls)).not.toContain(source.href);
+
+      vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
+      await expect(ai.transcribe("policy-transcribe", source)).rejects.toThrow(
+        /routing\.provider\.only/i,
+      );
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] transcribe request",
+        expect.objectContaining({ audio: `[audio ${source.href}]` }),
+      );
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       setLogger(undefined);
+      vi.unstubAllEnvs();
     }
   });
 

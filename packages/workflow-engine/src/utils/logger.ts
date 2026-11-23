@@ -19,11 +19,31 @@ function envFlag(name: string): boolean {
 }
 
 export function isTraceTextEnabled(): boolean {
-  return envFlag("WORKFLOW_ENGINE_TRACE_TEXT");
+  return (
+    envFlag("WORKFLOW_ENGINE_TRACE_TEXT") &&
+    (processScope[loggerKey] !== undefined || envFlag("WORKFLOW_ENGINE_TRACE"))
+  );
 }
 
 type Fields = Record<string, unknown>;
 type ConsoleOutput = () => [message: string, ...args: unknown[]];
+
+const previewFields = new Set([
+  "prompt",
+  "response",
+  "textPreview",
+  "audio",
+  "input",
+  "output",
+  "responseBody",
+]);
+
+function withoutPreviews(fields: Fields): Fields {
+  const entries = Object.entries(fields);
+  return entries.some(([key]) => previewFields.has(key))
+    ? Object.fromEntries(entries.filter(([key]) => !previewFields.has(key)))
+    : fields;
+}
 
 /** Create a logger with an optional namespace. Existing instances use the current sink. */
 export function createLogger(
@@ -39,16 +59,33 @@ export function createLogger(
       fields?: Fields,
       consoleOutput?: ConsoleOutput,
     ): void => {
+      const method = level === "debug" || level === "info" ? "log" : level;
+      const redactTrace = method === "log" && !isTraceTextEnabled();
+      const formatLine = (line: string) =>
+        format(
+          redactTrace && prefix === "JobQueue"
+            ? line.replace(/^(Job .+? failed permanently):[\s\S]*$/, "$1")
+            : line,
+        );
       const fallback = () => {
         try {
-          const method = level === "debug" || level === "info" ? "log" : level;
           if (method === "log" && !envFlag("WORKFLOW_ENGINE_TRACE")) return;
           const [line, ...args] =
             consoleOutput?.() ??
             (fields === undefined
               ? [message]
               : [message, consoleFields(fields)]);
-          console[method](format(line), ...args);
+          console[method](
+            formatLine(line),
+            ...args.map((arg) =>
+              redactTrace &&
+              arg !== null &&
+              typeof arg === "object" &&
+              !Array.isArray(arg)
+                ? withoutPreviews(arg as Fields)
+                : arg,
+            ),
+          );
         } catch {
           // Diagnostics cannot interrupt engine work.
         }
@@ -59,8 +96,11 @@ export function createLogger(
         try {
           const result: unknown =
             fields === undefined
-              ? sink[level](format(message))
-              : sink[level](format(message), fields);
+              ? sink[level](formatLine(message))
+              : sink[level](
+                  formatLine(message),
+                  redactTrace ? withoutPreviews(fields) : fields,
+                );
           // A callback typed as void can still be implemented as async.
           if (result) void Promise.resolve(result).catch(fallback);
           return;
@@ -78,12 +118,9 @@ export function createLogger(
     info: write("info"),
     warn: write("warn"),
     error,
-    /** Log a caught error. Its message, cause and extra properties may contain input. */
+    /** Preserve the original error in structured fields and console output. */
     caught(message: string, cause: unknown, fields?: Fields): void {
-      const includeCause = isTraceTextEnabled();
-      error(message, includeCause ? { ...fields, error: cause } : fields, () =>
-        includeCause ? [message, cause] : [message],
-      );
+      error(message, { ...fields, error: cause }, () => [message, cause]);
     },
   };
 }

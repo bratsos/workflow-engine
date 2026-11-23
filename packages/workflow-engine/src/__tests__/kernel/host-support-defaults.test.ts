@@ -12,6 +12,7 @@ import {
   HOST_DEFAULTS,
   runMaintenanceTick,
 } from "../../kernel/helpers/host-support.js";
+import { setLogger } from "../../kernel/index.js";
 import type { EventSink } from "../../kernel/ports.js";
 import { createTestKernel } from "../utils/index.js";
 
@@ -153,20 +154,33 @@ describe("host support defaults", () => {
       input: { value: 1 },
     });
     const complete = persistence.completeOutboxDelivery.bind(persistence);
+    const failure = new Error("write failed");
     persistence.completeOutboxDelivery = async () => {
-      throw new Error("write failed");
+      throw failure;
     };
-    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", undefined);
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const counts = await runMaintenanceTick(kernel);
       expect(counts.eventSinkStatus).toBe("degraded");
       expect(counts.eventSinkError).toContain("write failed");
-      expect(log).toHaveBeenCalledWith(
-        expect.stringContaining("outbox.flush error"),
-        expect.objectContaining({ message: "write failed" }),
-      );
+      expect(log).toHaveBeenCalledWith("[Host] outbox.flush error:", failure);
+      expect(log.mock.calls[0]?.[1]).toBe(failure);
+
+      const error = vi.fn();
+      setLogger({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error });
+      clock.advance(65_001);
+      expect(await runMaintenanceTick(kernel)).toMatchObject({
+        eventSinkStatus: "degraded",
+        eventSinkError: "write failed",
+      });
+      expect(error).toHaveBeenCalledWith("[Host] outbox.flush error:", {
+        workerId: HOST_DEFAULTS.workerId,
+        error: failure,
+      });
+      expect(error.mock.calls[0]?.[1].error).toBe(failure);
     } finally {
+      setLogger(undefined);
       persistence.completeOutboxDelivery = complete;
       log.mockRestore();
       vi.unstubAllEnvs();

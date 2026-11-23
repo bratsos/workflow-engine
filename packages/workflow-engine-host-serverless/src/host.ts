@@ -19,7 +19,6 @@ import {
   flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
-  isTraceTextEnabled,
   type JobTransport,
   type Kernel,
   type MaintenanceTickHook,
@@ -302,7 +301,8 @@ class ServerlessHostImpl implements ServerlessHost {
       try {
         await this.kernel.flush?.();
       } catch {
-        console.warn("[ServerlessHost] Call accounting drain failed");
+        const message = "Call accounting drain failed";
+        logger.warn(message, { workerId: this.workerId }, () => [message]);
       }
     }
   }
@@ -350,7 +350,7 @@ class ServerlessHostImpl implements ServerlessHost {
         logger.error(message, fields, () => [message]);
       } else if (outcome.eventSinkStatus === "degraded") {
         // Stateless: no transition to detect, so say it every time.
-        const error = isTraceTextEnabled() ? outcome.eventSinkError : undefined;
+        const error = outcome.eventSinkError;
         const message = `event sink DEGRADED: ${outcome.failed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${error ?? "unknown"}`;
         logger.error(
           message,
@@ -451,7 +451,7 @@ class ServerlessHostImpl implements ServerlessHost {
       logPrefix: "[ServerlessHost]",
     });
     if (counts.eventSinkStatus === "degraded") {
-      const error = isTraceTextEnabled() ? counts.eventSinkError : undefined;
+      const error = counts.eventSinkError;
       const message = `event sink DEGRADED: ${counts.eventsFailed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${error ?? "unknown"}`;
       logger.error(
         message,

@@ -571,13 +571,15 @@ export class PrismaJobQueue implements JobQueue {
       // and take the next row, instead of throwing out of the dequeue and
       // aborting the whole tick on that one row.
       if (typeof job.payload !== "object" || job.payload === null) {
-        const error = `Job ${job.id} has no payload (got ${job.payload === null ? "null" : typeof job.payload}); failed as a dead job`;
+        const payloadType = job.payload === null ? "null" : typeof job.payload;
+        const error = `Job ${job.id} has no payload (got ${payloadType}); failed as a dead job`;
         logger.error(
           "Job has no payload; failed as a dead job",
           {
             jobId: job.id,
             workflowRunId: job.workflowRunId,
             stageId: job.stageId,
+            payloadType,
           },
           () => [error],
         );
@@ -866,14 +868,9 @@ export class PrismaJobQueue implements JobQueue {
       return this.ackOutcome(jobId, result.count, "defer");
     }
     await this.prisma.jobQueue.update({ where: { id: jobId }, data });
-    const detail = isTraceTextEnabled() ? reason : undefined;
-    logger.debug(
-      "Job deferred",
-      { jobId, nextPollAt, ...(detail !== undefined && { reason: detail }) },
-      () => [
-        `Job ${jobId} deferred until ${nextPollAt.toISOString()}${detail !== undefined ? `: ${detail}` : ""}`,
-      ],
-    );
+    logger.debug("Job deferred", { jobId, nextPollAt, reason }, () => [
+      `Job ${jobId} deferred until ${nextPollAt.toISOString()}: ${reason}`,
+    ]);
     return "acknowledged";
   }
 
@@ -945,13 +942,10 @@ export class PrismaJobQueue implements JobQueue {
           lastError: error,
         },
       });
-      const detail = isTraceTextEnabled() ? error : undefined;
       logger.debug(
         "Job failed permanently",
-        { jobId, ...(detail !== undefined && { error: detail }) },
-        () => [
-          `Job ${jobId} failed permanently${detail !== undefined ? `: ${detail}` : ""}`,
-        ],
+        { jobId, ...(isTraceTextEnabled() && { error }) },
+        () => [`Job ${jobId} failed permanently: ${error}`],
       );
       return "acknowledged";
     }

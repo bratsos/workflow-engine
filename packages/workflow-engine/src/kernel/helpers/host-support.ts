@@ -16,13 +16,13 @@ import type {
   PurgeableRunStatus,
   ServedDefinition,
 } from "../../persistence/interface.js";
-import { createLogger, isTraceTextEnabled } from "../../utils/logger.js";
+import { createLogger } from "../../utils/logger.js";
 import type {
   EnginePruneResult,
   EventSinkStatus,
   OutboxFlushResult,
 } from "../commands.js";
-import { jobTargetMissingReason, missingTargetMessages } from "../errors.js";
+import { jobTargetMissingReason } from "../errors.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
 import { toErrorMessage } from "./error-message.js";
@@ -345,18 +345,11 @@ export async function executeJobWithHeartbeat(
     // A branded error must name this job; any other value gets main's matcher.
     const message = jobTargetMissingReason(error, job);
     if (message === undefined) throw error;
-    const knownTarget = Object.entries(missingTargetMessages(job)).find(
-      ([, detail]) => detail === message,
-    )?.[0];
     logger.error(
       `${logPrefix} dead job: missing target`,
-      { ...jobFields, missingTarget: knownTarget },
+      { ...jobFields, error: message },
       () => [
-        `${logPrefix} dead job ${jobId} (run ${workflowRunId}, stage ${stageId}): ${
-          knownTarget !== undefined || isTraceTextEnabled()
-            ? message
-            : "missing target"
-        }`,
+        `${logPrefix} dead job ${jobId} (run ${workflowRunId}, stage ${stageId}): ${message}`,
       ],
     );
     try {
@@ -1001,9 +994,9 @@ export function createEventSinkMonitor(
     if (next === "degraded") {
       log(
         `${logPrefix} event sink DEGRADED: events are staying in the outbox and will be retried; runs keep progressing through the poller. Last error: ${
-          (isTraceTextEnabled() ? lastError : undefined) ?? "unknown"
+          lastError ?? "unknown"
         }`,
-        { ...(isTraceTextEnabled() && { error: lastError }) },
+        { error: lastError },
       );
     } else if (consecutiveFailures > 0 || lastError !== null) {
       log(`${logPrefix} event sink recovered: publishing again`);

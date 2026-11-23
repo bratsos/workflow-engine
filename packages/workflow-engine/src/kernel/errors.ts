@@ -22,7 +22,7 @@ export interface JobTarget {
 }
 
 /** The message `job.execute` throws for each missing part of `target`. */
-export function missingTargetMessages(target: JobTarget) {
+function missingTargetMessages(target: JobTarget) {
   return {
     workflow: `Workflow ${target.workflowId} not found in registry`,
     stage: `Stage ${target.stageId} not found in workflow ${target.workflowId}`,

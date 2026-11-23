@@ -404,7 +404,6 @@ export type BatchLogFn = (
   level: "DEBUG" | "INFO" | "WARN" | "ERROR",
   message: string,
   meta?: Record<string, unknown>,
-  diagnosticMessage?: string,
 ) => void;
 
 export interface TextOptions<TTools extends ToolSet = ToolSet> {

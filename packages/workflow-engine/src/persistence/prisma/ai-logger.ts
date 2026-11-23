@@ -176,15 +176,21 @@ export class PrismaAICallLogger implements AICallLogger {
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
 
-  #trackWrite(write: () => Promise<void>): Promise<void> {
+  #trackWrite(
+    write: () => Promise<void>,
+    fields: Record<string, unknown>,
+  ): Promise<void> {
     const done = this.writes.begin();
     const result = Promise.resolve().then(write);
     void result.then(done, (error: unknown) => {
       this.writes.fail();
       done();
+      const message = "Failed to persist AI call";
+      const includeError = isTraceTextEnabled();
       logger.warn(
-        "Failed to persist AI call",
-        ...(isTraceTextEnabled() ? [error] : []),
+        message,
+        includeError ? { ...fields, error } : fields,
+        () => includeError ? [message, error] : [message],
       );
     });
     return result;
@@ -217,6 +223,12 @@ export class PrismaAICallLogger implements AICallLogger {
             : {}),
         },
       });
+    }, {
+      workflowRunId: call.workflowRunId,
+      topic: call.topic,
+      batchId: call.batchId,
+      requestId: call.requestId,
+      model: call.modelKey,
     });
   }
 
@@ -234,7 +246,7 @@ export class PrismaAICallLogger implements AICallLogger {
     return this.#trackWrite(async () => {
       await sqliteCheckFor(this);
       await this.#insertBatchResults(batchId, results);
-    });
+    }, { batchId });
   }
 
   async #insertBatchResults(

@@ -571,7 +571,6 @@ describe("NodeHost", () => {
 
   it("logs a hook that throws or rejects and keeps ticking", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
-    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       let calls = 0;
@@ -596,7 +595,6 @@ describe("NodeHost", () => {
       expect(host.getStats().orchestrationTicks).toBeGreaterThanOrEqual(3);
     } finally {
       logged.mockRestore();
-      vi.unstubAllEnvs();
     }
   });
 

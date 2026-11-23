@@ -24,8 +24,6 @@ import {
 import { schemaTargetForModel, withPortableSchema } from "./schema-portability";
 import type { AIHelperContext } from "./types";
 
-export { isTraceTextEnabled } from "../utils/logger";
-
 export const logger = createLogger(
   "AIHelper",
   ({ topic: _topic, ...fields }) => fields,

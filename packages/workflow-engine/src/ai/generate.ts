@@ -24,7 +24,6 @@ import {
   extractReportedCost,
   extractStepProvider,
   extractUsageDetails,
-  isTraceTextEnabled,
   logger,
   type ProviderResultLike,
   resolveCost,
@@ -294,25 +293,6 @@ export function logFailure(
   };
 }
 
-const knownFinishReasons = new Set([
-  "stop",
-  "length",
-  "content-filter",
-  "tool-calls",
-  "error",
-  "other",
-  "unknown",
-]);
-
-function finishReasonForLog(reason: unknown): string | undefined {
-  if (
-    typeof reason === "string" &&
-    (knownFinishReasons.has(reason) || isTraceTextEnabled())
-  ) {
-    return reason;
-  }
-}
-
 export async function generateText<TTools extends ToolSet = ToolSet>(
   ctx: AIHelperContext,
   modelKey: ModelKey,
@@ -433,11 +413,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
-    ...(isTraceTextEnabled() && {
-      prompt:
-        promptForLog.substring(0, 500) +
-        (promptForLog.length > 500 ? "..." : ""),
-    }),
+    prompt:
+      promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
     temperature: options.temperature,
     maxTokens: options.maxTokens,
     hasTools,
@@ -512,7 +489,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       : undefined;
     if (hasTools || hasOutputSchema) {
       logger.debug(
-        `generateText result: stepsCount=${steps.length}, hasOutput=${output !== undefined}, finishReason=${finishReasonForLog(resultAny.finishReason)}`,
+        `generateText result: stepsCount=${steps.length}, hasOutput=${output !== undefined}, finishReason=${resultAny.finishReason}`,
       );
     }
     const text = resultAny.text;
@@ -569,14 +546,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     logger.debug(`generateText response`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && {
-        response: text.substring(0, 500) + (text.length > 500 ? "..." : ""),
-      }),
+      response: text.substring(0, 500) + (text.length > 500 ? "..." : ""),
       inputTokens,
       outputTokens,
       cost: cost.toFixed(6),
       durationMs,
-      finishReason: finishReasonForLog(resultAny.finishReason),
+      finishReason: resultAny.finishReason,
     });
 
     return {
@@ -611,7 +586,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     logger.error(`generateText error`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && { error: errorMessage }),
+      error: errorMessage,
       durationMs,
     });
     throw explainRoutingError(error, ctx.routing, modelKey);
@@ -693,11 +668,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     topic: ctx.topic,
     model: modelKey,
     modelId: modelConfig.id,
-    ...(isTraceTextEnabled() && {
-      prompt:
-        promptForLog.substring(0, 500) +
-        (promptForLog.length > 500 ? "..." : ""),
-    }),
+    prompt:
+      promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
     temperature: options.temperature,
     maxTokens: options.maxTokens,
     hasTools,
@@ -808,22 +780,17 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     });
 
     // Trace log after successful AI call
-    const responseStr = isTraceTextEnabled()
-      ? JSON.stringify(object)
-      : undefined;
+    const responseStr = JSON.stringify(object);
     logger.debug(`generateObject response`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(responseStr !== undefined && {
-        response:
-          responseStr.substring(0, 500) +
-          (responseStr.length > 500 ? "..." : ""),
-      }),
+      response:
+        responseStr.substring(0, 500) + (responseStr.length > 500 ? "..." : ""),
       inputTokens,
       outputTokens,
       cost: cost.toFixed(6),
       durationMs,
-      finishReason: finishReasonForLog(resultAny.finishReason),
+      finishReason: resultAny.finishReason,
     });
 
     return {
@@ -856,7 +823,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     logger.error(`generateObject error`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && { error: errorMessage }),
+      error: errorMessage,
       durationMs,
     });
     throw explainRoutingError(error, ctx.routing, modelKey);

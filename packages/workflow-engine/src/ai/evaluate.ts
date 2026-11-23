@@ -15,7 +15,6 @@ import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
 import {
   buildOpenRouterRoutingProvider,
-  isTraceTextEnabled,
   logger,
   mergeOpenRouterProviderOptions,
   type OpenRouterRoutingOptions,
@@ -258,7 +257,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
     logger.error(`evaluate error`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && { error: errorMessage }),
+      error: errorMessage,
       durationMs,
     });
     throw error;

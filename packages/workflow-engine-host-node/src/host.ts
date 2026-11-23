@@ -459,7 +459,8 @@ class NodeHostImpl implements NodeHost {
     const flush = Promise.resolve()
       .then(() => this.kernel.flush?.({ timeoutMs: this.shutdownTimeoutMs }))
       .catch(() => {
-        console.warn("[NodeHost] Call accounting drain failed");
+        const message = "Call accounting drain failed";
+        logger.warn(message, { workerId: this.workerId }, () => [message]);
       });
     await withTimeout(flush, this.shutdownTimeoutMs);
   }

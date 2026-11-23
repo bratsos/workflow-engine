@@ -107,19 +107,28 @@ describe("AI adapter seam", () => {
       );
       await expect(
         failing.generateText(MODEL, "invoice-input"),
-      ).rejects.toThrow();
+      ).rejects.toThrow("rejected invoice-input");
       expect(error).toHaveBeenCalledWith(
         "[AIHelper] generateText error",
-        expect.objectContaining({ topic: "invoice-check", model: MODEL }),
+        expect.objectContaining({
+          topic: "invoice-check",
+          model: MODEL,
+          error: "Error: AI call failed",
+        }),
       );
-      expect(
-        JSON.stringify([debug.mock.calls, error.mock.calls]),
-      ).not.toContain("invoice-input");
+      expect(JSON.stringify(debug.mock.calls)).not.toContain("invoice-input");
       expect(consoleLog).not.toHaveBeenCalled();
 
       vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
       await ai.generateText(MODEL, "invoice-input");
       expect(JSON.stringify(debug.mock.calls)).toContain("cli:invoice-input");
+      await expect(failing.generateText(MODEL, "invoice-input")).rejects.toThrow(
+        "rejected invoice-input",
+      );
+      expect(debug).toHaveBeenCalledWith(
+        "[AIHelper] text call failed",
+        { detail: "rejected invoice-input" },
+      );
     } finally {
       setLogger(undefined);
       vi.unstubAllEnvs();

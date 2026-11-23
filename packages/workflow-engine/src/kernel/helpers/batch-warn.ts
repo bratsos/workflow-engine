@@ -7,7 +7,7 @@
  * and then reported through the engine logger rather than dropped.
  */
 
-import { createLogger, isTraceTextEnabled } from "../../utils/logger.js";
+import { createLogger } from "../../utils/logger.js";
 import type { KernelDeps } from "../kernel.js";
 import { toErrorMessage } from "./error-message.js";
 
@@ -34,13 +34,8 @@ export async function writeBatchWarn(
     }
   }
   const diagnostic = "a WARN naming a provider batch could not be written";
-  const includeText = isTraceTextEnabled();
-  const detail = includeText ? toErrorMessage(failure) : undefined;
-  logger.error(
-    diagnostic,
-    { workflowRunId, ...(includeText && { error: detail, warning: message }) },
-    () => [
-      `run ${workflowRunId}: ${diagnostic} (${detail ?? "error details omitted"})${includeText ? `: ${message}` : ""}`,
-    ],
-  );
+  const error = toErrorMessage(failure);
+  logger.error(diagnostic, { workflowRunId, error, warning: message }, () => [
+    `run ${workflowRunId}: ${diagnostic} (${error}): ${message}`,
+  ]);
 }

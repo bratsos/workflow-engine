@@ -7,7 +7,6 @@
 
 export {
   createLogger,
-  isTraceTextEnabled,
   type Logger,
   type LogLevel,
   setLogger,

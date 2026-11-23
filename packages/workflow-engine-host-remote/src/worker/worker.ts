@@ -1,8 +1,4 @@
-import {
-  assertTimerMs,
-  createLogger,
-  isTraceTextEnabled,
-} from "@bratsos/workflow-engine/kernel";
+import { assertTimerMs, createLogger } from "@bratsos/workflow-engine/kernel";
 import type { WorkerTransport } from "../transport.js";
 import type { RemoteStage } from "./run-activity.js";
 import { runActivity } from "./run-activity.js";
@@ -69,18 +65,14 @@ export function createActivityWorker(
     cfg.onError ??
     ((error: unknown, info: { consecutiveFailures: number }) => {
       const message = `processOne failed (consecutive failures: ${info.consecutiveFailures})`;
-      const includeError = isTraceTextEnabled();
       logger.error(
         `[activity-worker] ${message}`,
         {
           workerId: cfg.workerId,
           consecutiveFailures: info.consecutiveFailures,
-          ...(includeError && { error }),
+          error,
         },
-        () => [
-          `[activity-worker ${cfg.workerId}] ${message}`,
-          ...(includeError ? [error] : []),
-        ],
+        () => [`[activity-worker ${cfg.workerId}] ${message}`, error],
       );
     });
   let running = false;

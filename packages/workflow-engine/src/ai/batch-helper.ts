@@ -32,7 +32,6 @@ import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
-  isTraceTextEnabled,
   logger,
 } from "./shared";
 import type {
@@ -1150,11 +1149,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         providerFailures,
         total: results.length,
       };
-      const diagnostic = isTraceTextEnabled()
-        ? warnMsg
-        : `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${schemaFailures} schema validation failure(s), ${providerFailures} provider failure(s).`;
       if (this.batchLogFn) {
-        this.batchLogFn("WARN", warnMsg, meta, diagnostic);
+        this.batchLogFn("WARN", warnMsg, meta);
       } else {
         const consoleMessage = describe(isTraceTextEnabled());
         logger.warn(

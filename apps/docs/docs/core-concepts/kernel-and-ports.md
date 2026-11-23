@@ -327,7 +327,7 @@ setLogger({
 
 Each method receives a message and an optional `Record<string, unknown>`. Entries include identifiers such as `workflowRunId`, `stageId` and `jobId` when available. The application sink receives all emitted levels and controls filtering. If a method throws or rejects, the engine tries the console sink once for that entry and continues.
 
-The default console sink emits warnings and errors and enables debug and info with `WORKFLOW_ENGINE_TRACE=1` (or `true`). Call `setLogger(undefined)` to restore it. Set `WORKFLOW_ENGINE_TRACE_TEXT=1` (or `true`) to include AI prompt and response previews and potentially sensitive error details. This flag applies to both sinks. Persisted workflow logs and AI call records have their own storage configuration.
+The default console sink emits warnings and errors and enables debug and info with `WORKFLOW_ENGINE_TRACE=1` (or `true`). Call `setLogger(undefined)` to restore it. Set `WORKFLOW_ENGINE_TRACE_TEXT=1` (or `true`) to include AI prompt and response previews in either sink. Error details use their usual log levels and retain the original error values or messages. Provider error messages can echo input text. Persisted workflow logs and AI call records have their own storage configuration.
 
 ---
 

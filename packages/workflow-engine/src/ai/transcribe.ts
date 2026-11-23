@@ -19,7 +19,6 @@ import {
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
   extractReportedCost,
-  isTraceTextEnabled,
   logger,
   type OpenRouterRoutingOptions,
 } from "./shared";
@@ -187,7 +186,7 @@ export async function transcribe(
     model: modelKey,
     modelId: modelConfig.id,
     provider: modelConfig.provider,
-    audio: audio instanceof URL ? "[audio URL]" : prompt,
+    audio: prompt,
   });
 
   try {
@@ -292,7 +291,7 @@ export async function transcribe(
     logger.error(`transcribe error`, {
       topic: ctx.topic,
       model: modelKey,
-      ...(isTraceTextEnabled() && { error: errorMessage }),
+      error: errorMessage,
       durationMs,
     });
     throw error;
