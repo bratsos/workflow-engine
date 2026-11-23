@@ -1,4 +1,5 @@
 import { runInNewContext } from "node:vm";
+import { APICallError } from "@ai-sdk/provider";
 import { MockLanguageModelV4 } from "ai/test";
 import {
   afterAll,
@@ -22,6 +23,7 @@ import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { defineWorkflow } from "../core/workflow.js";
 import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import type { Kernel, KernelConfig } from "../kernel/kernel.js";
+import { CollectingEventSink } from "../kernel/testing/index.js";
 import type { CreateAICallInput } from "../persistence/interface.js";
 import {
   type KernelDatabase,
@@ -663,81 +665,6 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(stageAfter.status).toBe("COMPLETED");
   });
 
-  it("writes a count-only run warning when the stage drain has failures and an open stream", async () => {
-    const definition = defineWorkflow({
-      id: "logging-warning",
-      name: "Logging warning",
-      description: "Records usage",
-      input: schema,
-    })
-      .pipe(
-        defineStage({
-          id: "classify",
-          name: "Classify",
-          schemas: { input: schema, output: schema, config: schema },
-          async execute(ctx) {
-            ctx.ai.recordCall(manual);
-            ctx.ai.streamText(modelKey, { prompt: "request marker" });
-            return { output: {} };
-          },
-        }),
-      )
-      .build();
-    const kernel = db.makeKernel({
-      registry: { getWorkflow: () => definition },
-      aiFlushTimeoutMs: 10,
-      services: {
-        aiLogger: db.aiLogger,
-        ai: (topic, logger, context, resolver, options) =>
-          createAIHelper(
-            topic,
-            {
-              logCall: () => {
-                throw new Error("write error marker");
-              },
-              getStats: logger.getStats.bind(logger),
-              isRecorded: logger.isRecorded.bind(logger),
-              logBatchResults: logger.logBatchResults.bind(logger),
-            },
-            context,
-            resolver,
-            { ...options, adapter },
-          ),
-      },
-    });
-    const { workflowRunId } = await kernel.dispatch({
-      type: "run.create",
-      workflowId: definition.id,
-      idempotencyKey: "warning",
-      input: {},
-    });
-    await kernel.dispatch({
-      type: "run.claimPending",
-      workerId: "kernel-worker",
-    });
-    const job = await db.jobTransport.dequeue();
-    if (!job) throw new Error("Expected a job");
-    const result = await executeJobWithHeartbeat(kernel, {
-      jobTransport: db.jobTransport,
-      job,
-    });
-    expect(result.outcome).toBe("completed");
-    await kernel.flush();
-    await vi.waitFor(async () => {
-      expect(
-        await db.client.workflowLog.findMany({
-          where: { workflowRunId, level: "WARN" },
-        }),
-      ).toEqual([
-        expect.objectContaining({
-          workflowStageId: null,
-          message: "AI call logging did not finish successfully",
-          metadata: { failed: 1, pending: 1 },
-        }),
-      ]);
-    });
-  });
-
   async function queueJob(
     stage: Stage<typeof schema, typeof schema, typeof schema>,
     config: Partial<KernelConfig>,
@@ -777,6 +704,39 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
   } as const;
   const sensitive = "private provider diagnostic marker";
 
+  // A provider model whose stream fails in one of the ways the SDK reports.
+  const failingStream = (path: string) =>
+    new MockLanguageModelV4({
+      async doStream() {
+        if (path === "stream call") {
+          throw new APICallError({
+            message: sensitive,
+            url: "https://provider.invalid/v1",
+            requestBodyValues: { prompt: sensitive },
+            statusCode: 400,
+            responseBody: sensitive,
+            isRetryable: false,
+          });
+        }
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: "stream-start", warnings: [] });
+              if (path === "stream transport") {
+                controller.error(new Error(sensitive));
+                return;
+              }
+              controller.enqueue({
+                type: "error",
+                error: new Error(sensitive),
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+
   it.each([
     ["batch", "none"],
     ["batch", "full"],
@@ -784,7 +744,19 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ["realtime", "full"],
     ["validation", "none"],
     ["batch accounting", "full"],
-  ] as const)("keeps %s provider diagnostics out of host and console data with %s capture", async (path, store) => {
+    ["stream transport", "none"],
+    ["stream transport", "full"],
+    ["stream part", "none"],
+    ["stream call", "full"],
+  ] as const)("keeps %s provider diagnostics out of host, console, events and traces with %s capture", async (path, store) => {
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
+    vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
+    const output = (["log", "warn", "error"] as const).map((level) =>
+      vi.spyOn(console, level).mockImplementation(() => {}),
+    );
+    const warnings = vi
+      .spyOn(process, "emitWarning")
+      .mockImplementation(() => {});
     const stage = defineStage({
       ...diagnosticsStage,
       async execute(ctx) {
@@ -816,33 +788,50 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
               requestId: "item-1",
             },
           ]);
+        } else if (path.startsWith("stream")) {
+          // No log call or explicit wrapping: the SDK's own surface propagates.
+          await ctx.step.run("read", async () => {
+            const { rawResult } = ctx.ai.streamText(modelKey, {
+              prompt: "request marker",
+            });
+            for await (const part of rawResult!.fullStream) {
+              if (part.type === "error") throw part.error;
+            }
+            return null;
+          });
         } else {
           await ctx.ai.generateText(modelKey, "request marker");
         }
         return { output: {} };
       },
     });
+    const eventSink = new CollectingEventSink();
     const { workflowRunId, kernel, job } = await queueJob(stage, {
+      eventSink,
       services: {
         aiLogger: override(db.aiLogger, {
           async logBatchResults() {
             throw new Error(sensitive);
           },
         }),
-        ai: (topic, logger, context, resolver, options) =>
-          createAIHelper(topic, logger, context, resolver, {
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => failingStream(path), {
             ...options,
             text: { store, ttlMs: 1 },
             adapter: {
-              streamText() {
-                return {
-                  stream: (async function* () {
-                    yield "{}";
-                  })(),
-                  inputTokens: 1,
-                  outputTokens: 1,
-                };
-              },
+              ...(path.startsWith("stream")
+                ? {}
+                : {
+                    streamText() {
+                      return {
+                        stream: (async function* () {
+                          yield "{}";
+                        })(),
+                        inputTokens: 1,
+                        outputTokens: 1,
+                      };
+                    },
+                  }),
               async generateText() {
                 throw new Error(sensitive);
               },
@@ -850,35 +839,58 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
           }),
       },
     });
-    const { createServerlessHost } = await import(integration.serverless);
-    const host = createServerlessHost({
-      kernel,
-      jobTransport: db.jobTransport,
-      workerId: "kernel-worker",
-    });
-    const result = await host.handleJob({ ...job, maxAttempts: 1 });
-    expect(result.outcome).toBe(path === "validation" ? "completed" : "failed");
-    const { createPrismaConsoleReadPort } = await import(integration.console);
-    const reader = createPrismaConsoleReadPort(db.client, {
-      databaseType: sqlite ? "sqlite" : "postgresql",
-    });
-    const reads = await Promise.all([
-      reader.getRunDetail(workflowRunId),
-      reader.listRunEvents(workflowRunId, 0),
-      db.client.workflowStage.findMany({ where: { workflowRunId } }),
-      db.client.workflowLog.findMany({ where: { workflowRunId } }),
-      db.client.workflowStep.findMany({ where: { stage: { workflowRunId } } }),
-      db.client.jobQueue.findMany({ where: { workflowRunId } }),
-      db.client.outboxEvent.findMany({ where: { workflowRunId } }),
-    ]);
-    expect(reads[0]).toBeTruthy();
-    expect(reads[1]?.length).toBeGreaterThan(0);
-    if (path === "validation") {
-      expect(JSON.stringify(reads[4])).toContain(
-        "AI map response validation failed",
+    try {
+      const { createServerlessHost } = await import(integration.serverless);
+      const host = createServerlessHost({
+        kernel,
+        jobTransport: db.jobTransport,
+        workerId: "kernel-worker",
+      });
+      const result = await host.handleJob({ ...job, maxAttempts: 1 });
+      expect(result.outcome).toBe(
+        path === "validation" ? "completed" : "failed",
       );
+      await kernel.dispatch({ type: "outbox.flush", maxEvents: 100 });
+      const { createPrismaConsoleReadPort } = await import(integration.console);
+      const reader = createPrismaConsoleReadPort(db.client, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+      const reads = await Promise.all([
+        reader.getRunDetail(workflowRunId),
+        reader.listRunEvents(workflowRunId, 0),
+        db.client.workflowStage.findMany({ where: { workflowRunId } }),
+        db.client.workflowLog.findMany({ where: { workflowRunId } }),
+        db.client.workflowStep.findMany({
+          where: { stage: { workflowRunId } },
+        }),
+        db.client.jobQueue.findMany({ where: { workflowRunId } }),
+        db.client.outboxEvent.findMany({ where: { workflowRunId } }),
+        db.client.idempotencyKey.findMany({ where: { workflowRunId } }),
+        db.client.aICall.findMany({ where: { workflowRunId } }),
+      ]);
+      expect(reads[0]).toBeTruthy();
+      expect(reads[1]?.length).toBeGreaterThan(0);
+      expect(eventSink.getByType("workflow:failed").length).toBe(
+        path === "validation" ? 0 : 1,
+      );
+      if (path === "validation") {
+        expect(JSON.stringify(reads[4])).toContain(
+          "AI map response validation failed",
+        );
+      }
+      expect(
+        JSON.stringify([
+          result,
+          ...reads,
+          eventSink.events,
+          ...output.map((spy) => spy.mock.calls),
+          warnings.mock.calls,
+        ]),
+      ).not.toContain(sensitive);
+    } finally {
+      for (const spy of [...output, warnings]) spy.mockRestore();
+      vi.unstubAllEnvs();
     }
-    expect(JSON.stringify([result, ...reads])).not.toContain(sensitive);
   });
 
   it.each([
@@ -1012,14 +1024,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(await db.client.aICall.count({ where: { workflowRunId } })).toBe(1);
   });
 
-  it.each([
-    "throw",
-    "hold",
-  ] as const)("preserves a committed host result with a %s helper drain, rejecting logger drain and held warning", async (mode) => {
-    const held = Promise.withResolvers<{ failed: number; pending: number }>();
-    const warningWritten = Promise.withResolvers<void>();
-    const warning = Promise.withResolvers<void>();
-    const warningStarted = Promise.withResolvers<void>();
+  it("preserves a committed serverless result when the logger flush rejects", async () => {
     const stage = defineStage({
       ...diagnosticsStage,
       async execute(ctx) {
@@ -1028,40 +1033,12 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       },
     });
     const { kernel, job, workflowRunId } = await queueJob(stage, {
-      persistence: override(db.persistence, {
-        async createLog(input) {
-          if (input.message === "AI call logging did not finish successfully") {
-            warningStarted.resolve();
-            await warning.promise;
-          }
-          const saved = await db.persistence.createLog(input);
-          if (input.message === "AI call logging did not finish successfully")
-            warningWritten.resolve();
-          return saved;
-        },
-      }),
-      aiFlushTimeoutMs: 20,
       services: {
         aiLogger: override(db.aiLogger, {
           flush: async () => {
             throw new Error(sensitive);
           },
         }),
-        ai: (topic, logger, context, resolver, options) => {
-          const helper = createAIHelper(
-            topic,
-            logger,
-            context,
-            resolver,
-            options,
-          );
-          return override(helper, {
-            flush() {
-              if (mode === "throw") throw new Error(sensitive);
-              return held.promise;
-            },
-          });
-        },
       },
     });
     const { createServerlessHost } = await import(integration.serverless);
@@ -1070,21 +1047,10 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       jobTransport: db.jobTransport,
       workerId: "kernel-worker",
     });
-    const result = host.handleJob(job);
-    try {
-      await within(warningStarted.promise);
-      expect((await within<{ outcome: string }>(result)).outcome).toBe(
-        "completed",
-      );
-      expect(
-        await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
-      ).toMatchObject({ status: "COMPLETED" });
-    } finally {
-      held.resolve({ failed: 0, pending: 0 });
-      warning.resolve();
-      await result;
-      await within(warningWritten.promise);
-    }
+    expect((await host.handleJob(job)).outcome).toBe("completed");
+    expect(
+      await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+    ).toMatchObject({ status: "COMPLETED" });
   });
 
   it("bounds both kernel flush and Node shutdown when the logger ignores the supplied timeout", async () => {
@@ -1119,76 +1085,212 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     }
   });
 
-  it("completes a leased durable batch read while its automatic write is still pending", async () => {
-    const writeStarted = Promise.withResolvers<void>();
-    const receipt = Promise.withResolvers<void>();
+  // An OpenRouter batch transport answering with two completed items.
+  const batchTransport = {
+    apiKey: "fixture-key",
+    fetch: async () =>
+      Response.json({
+        id: "batch-1",
+        status: "completed",
+        results: ["first", "second"].map((custom_id) => ({
+          custom_id,
+          response: {
+            status_code: 200,
+            body: {
+              choices: [{ message: { content: "reply" } }],
+              usage: { prompt_tokens: 2, completion_tokens: 3, cost: 1.25 },
+            },
+          },
+        })),
+      }),
+  };
+
+  it("rolls back a batch whose recording fails partway, so recordResults restores all of it", async () => {
+    const refuse = sqlite
+      ? [
+          `CREATE TRIGGER refuse_second BEFORE INSERT ON "ai_calls" WHEN NEW."requestId" = 'second' BEGIN SELECT RAISE(ABORT, 'refused'); END`,
+        ]
+      : [
+          `CREATE FUNCTION refuse_second() RETURNS trigger AS $$ BEGIN IF NEW."requestId" = 'second' THEN RAISE EXCEPTION 'refused'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`,
+          `CREATE TRIGGER refuse_second BEFORE INSERT ON "ai_calls" FOR EACH ROW EXECUTE FUNCTION refuse_second()`,
+        ];
+    const allow = sqlite
+      ? [`DROP TRIGGER IF EXISTS refuse_second`]
+      : [
+          `DROP TRIGGER IF EXISTS refuse_second ON "ai_calls"`,
+          `DROP FUNCTION IF EXISTS refuse_second()`,
+        ];
+    const onLogError = vi.fn();
+    const helper = () =>
+      createAIHelper("accounting", db.aiLogger, undefined, undefined, {
+        attribution,
+        onLogError,
+      }).batch(modelKey, "openrouter", batchTransport);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const sql of refuse) await db.client.$executeRawUnsafe(sql);
+      // Recording is awaited by getResults, as in earlier releases.
+      await expect(helper().getResults("batch-1")).rejects.toThrow(
+        "AI call accounting write failed",
+      );
+      expect(onLogError).toHaveBeenCalledTimes(2);
+      expect(await db.client.aICall.count()).toBe(0);
+    } finally {
+      for (const sql of allow) await db.client.$executeRawUnsafe(sql);
+      warn.mockRestore();
+    }
+    const batch = helper();
+    await batch.recordResults("batch-1", await batch.getResults("batch-1"));
+    const rows = await db.client.aICall.findMany({
+      orderBy: { requestId: "asc" },
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        ...attribution,
+        requestId: "first",
+        cost: 1.25,
+      }),
+      expect.objectContaining({
+        ...attribution,
+        requestId: "second",
+        cost: 1.25,
+      }),
+    ]);
+  });
+
+  it("counts batch accounting in the run total as soon as the stage completes", async () => {
     const stage = defineStage({
       ...diagnosticsStage,
       async execute(ctx) {
-        const count = await ctx.step.run(
-          "retrieve",
-          async () => {
-            const batch = ctx.ai.batch(modelKey, "openrouter", {
-              apiKey: "fixture-key",
-              fetch: async () =>
-                Response.json({
-                  id: "batch-1",
-                  status: "completed",
-                  results: [
-                    {
-                      custom_id: "item-1",
-                      response: {
-                        status_code: 200,
-                        body: { choices: [{ message: { content: "reply" } }] },
-                      },
-                    },
-                  ],
-                }),
-            });
-            return (await batch.getResults("batch-1")).length;
-          },
-          { lease: 1_000 },
-        );
-        expect(count).toBe(1);
+        const batch = ctx.ai.batch(modelKey, "openrouter", batchTransport);
+        expect(await batch.getResults("batch-1")).toHaveLength(2);
         return { output: {} };
       },
     });
     const { kernel, job, workflowRunId } = await queueJob(stage, {
       services: {
+        // A slow write: the stage still waits for it before completing.
         aiLogger: override(db.aiLogger, {
-          async logBatchResults() {
-            writeStarted.resolve();
-            await receipt.promise;
+          async logBatchResults(batchId, rows) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            await db.aiLogger.logBatchResults(batchId, rows);
           },
         }),
       },
     });
-    const outcome = executeJobWithHeartbeat(kernel, {
-      job,
-      jobTransport: db.jobTransport,
-    });
-    try {
-      await within(writeStarted.promise);
-      expect((await within(outcome)).outcome).toBe("completed");
-      const saved = await db.client.workflowStep.findFirst({
-        where: { stepId: "retrieve", stage: { workflowRunId } },
-      });
-      expect(saved.status.toLowerCase()).toBe("completed");
-    } finally {
-      receipt.reject(new Error(sensitive));
-      await outcome;
-      await kernel.flush();
-    }
     expect(
-      await db.client.workflowLog.findMany({
-        where: {
-          workflowRunId,
-          level: "WARN",
-          message: "AI call logging did not finish successfully",
-        },
-      }),
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
+    expect(
+      await db.client.workflowRun.findUnique({ where: { id: workflowRunId } }),
+    ).toMatchObject({ status: "COMPLETED", totalCost: 2.5, totalTokens: 10 });
+    expect(
+      await db.client.aICall.findMany({ where: { workflowRunId } }),
     ).toEqual([
-      expect.objectContaining({ metadata: { failed: 1, pending: 0 } }),
+      expect.objectContaining({ ...attribution, workflowRunId }),
+      expect.objectContaining({ ...attribution, workflowRunId }),
     ]);
+  });
+
+  it("rejects an awaited stage write that the database refuses and reports both failures", async () => {
+    const onLogError = vi.fn();
+    const call = {
+      ...manual,
+      modelId: manual.modelKey,
+      topic: "external",
+      batchId: "batch-1",
+      requestId: "item-1",
+    };
+    const outcomes: string[] = [];
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await ctx.aiLogger.logCall(call);
+        outcomes.push(
+          await Promise.resolve(ctx.aiLogger.logCall(call)).then(
+            () => "resolved",
+            (error: Error) => error.message,
+          ),
+        );
+        // Ignored: handled by the logger, reported to the callback.
+        void ctx.aiLogger.logCall(call);
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, {
+            ...options,
+            onLogError,
+          }),
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(
+        (
+          await executeJobWithHeartbeat(kernel, {
+            job,
+            jobTransport: db.jobTransport,
+          })
+        ).outcome,
+      ).toBe("completed");
+      await vi.waitFor(() => expect(onLogError).toHaveBeenCalledTimes(2));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(outcomes).toEqual(["AI call accounting write failed"]);
+    expect(onLogError).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ ...attribution, workflowRunId }),
+    );
+    expect(
+      await db.client.aICall.findMany({ where: { workflowRunId } }),
+    ).toEqual([expect.objectContaining({ ...attribution, workflowRunId })]);
+  });
+
+  it("fails a stage terminally on an adapter's Zod error, as earlier releases did", async () => {
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await ctx.ai.generateText(modelKey, "request marker");
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, {
+            ...options,
+            adapter: {
+              async generateText() {
+                z.string().min(1).parse("");
+                return { text: "", inputTokens: 0, outputTokens: 0 };
+              },
+            },
+          }),
+      },
+    });
+    const { createServerlessHost } = await import(integration.serverless);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport: db.jobTransport,
+      workerId: "kernel-worker",
+    });
+    expect((await host.handleJob({ ...job, maxAttempts: 3 })).outcome).toBe(
+      "failed",
+    );
+    expect(
+      await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+    ).toMatchObject({ status: "FAILED" });
   });
 });

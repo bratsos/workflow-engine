@@ -882,7 +882,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       batchId.startsWith("batch-empty-")
     ) {
       const emptyResults: AIBatchResult<T>[] = [];
-      void this.recordResults(batchId, emptyResults).catch(() => {});
+      await this.recordResults(batchId, emptyResults);
       return emptyResults;
     }
 
@@ -1160,11 +1160,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
-    // Accounting follows the result independently of the caller's step deadline.
-    void this.recordResults(batchId, results, {
+    // Auto-record results
+    await this.recordResults(batchId, results, {
       batchDurationMs: durationMs,
       provider,
-    }).catch(() => {});
+    });
 
     return results;
   }

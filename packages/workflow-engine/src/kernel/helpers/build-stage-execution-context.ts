@@ -4,16 +4,11 @@ import type {
   LogContext,
   StageAIHelperOptions,
 } from "../../ai/types.js";
-import {
-  boundedAIFlush,
-  DEFAULT_AI_FLUSH_TIMEOUT_MS,
-} from "../../ai/write-tracker.js";
 import type { StageContext } from "../../core/stage.js";
 import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
-  AICallFlushResult,
   AICallLogger,
   CreateAnnotationInput,
 } from "../../persistence/interface.js";
@@ -32,7 +27,6 @@ import { createStepApi } from "./step-api.js";
 export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
   progressEvents: KernelEvent[];
-  scheduleAIFlush: () => void;
   annotationBuffer: ReturnType<typeof createAnnotationBuffer>;
 }
 
@@ -47,13 +41,9 @@ export function defineLazyAIContext<T extends object>(
     labels?: Record<string, string>;
   },
   deps: ExecutorDeps,
-): {
-  context: T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger };
-  scheduleAIFlush: () => void;
-} {
+): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
   let helper: AIHelper | undefined;
   let boundLogger: AICallLogger | undefined;
-  let fallback: AIHelper | undefined;
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
@@ -132,62 +122,19 @@ export function defineLazyAIContext<T extends object>(
         if (!boundLogger) {
           // A custom implementation can omit the binding supplied by createAIHelper.
           // Its capture policy is unknown, so use a text-free logger for direct writes.
-          fallback = createAIHelper(
-            topic,
-            configured().aiLogger,
-            logContext,
-            undefined,
-            {
-              ...options,
-              text: { store: "none" },
-            },
-          );
+          createAIHelper(topic, configured().aiLogger, logContext, undefined, {
+            ...options,
+            text: { store: "none" },
+          });
         }
         return boundLogger;
       },
     },
   });
 
-  return {
-    context: target as T & {
-      readonly ai: AIHelper;
-      readonly aiLogger: AICallLogger;
-    },
-    scheduleAIFlush() {
-      if (!helper) return;
-      const flush = async () => {
-        const timeoutMs = deps.aiFlushTimeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS;
-        const deadline = Date.now() + timeoutMs;
-        const counts = await boundedAIFlush(async (opts) => {
-          const results = await Promise.all([
-            helper?.flush?.(opts),
-            fallback?.flush(opts),
-          ]);
-          return results.reduce<AICallFlushResult>(
-            (total, result) => ({
-              failed: total.failed + (result?.failed ?? 0),
-              pending: total.pending + (result?.pending ?? 0),
-            }),
-            { failed: 0, pending: 0 },
-          );
-        }, timeoutMs);
-        const { failed, pending } = counts;
-        if (failed === 0 && pending === 0) return;
-        await boundedAIFlush(
-          async () => {
-            await deps.persistence.createLog({
-              workflowRunId: params.workflowRunId,
-              level: "WARN",
-              message: "AI call logging did not finish successfully",
-              metadata: { failed, pending },
-            });
-          },
-          Math.max(0, deadline - Date.now()),
-        );
-      };
-      if (deps.deferAIFlush) deps.deferAIFlush(flush);
-      else void flush();
-    },
+  return target as T & {
+    readonly ai: AIHelper;
+    readonly aiLogger: AICallLogger;
   };
 }
 
@@ -311,9 +258,9 @@ export function buildStageExecutionContext(
     workflowContext,
   } as StageContext<any, any, any>;
 
-  const { scheduleAIFlush } = defineLazyAIContext(context, input, deps);
+  defineLazyAIContext(context, input, deps);
 
-  return { context, progressEvents, annotationBuffer, scheduleAIFlush };
+  return { context, progressEvents, annotationBuffer };
 }
 
 /** Resolve the same stage input used by job.execute for a replay. */

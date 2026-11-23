@@ -111,27 +111,28 @@ class AIHelperImpl implements AIHelper {
     this.providerResolver = providerResolver;
     this.options = options;
     this.writes = new AICallWriteTracker(parentWrites);
-    this.trackedLogger = {
+    const writes: Partial<AICallLogger> = {
       logCall: (input) => {
         const call = this.prepareCall(input);
-        this.trackWrite([call], () => aiCallLogger.logCall(call));
+        return this.trackWrite([call], () => aiCallLogger.logCall(call));
       },
       logBatchResults: (batchId, inputs) => {
         const calls = inputs.map((input) => this.prepareCall(input));
-        const write = this.trackWrite(calls, () =>
+        return this.trackWrite(calls, () =>
           aiCallLogger.logBatchResults(batchId, calls),
-        ).catch((error) => {
-          traceProviderDiagnostic("Batch accounting write failed", error);
-          throw new Error("Batch accounting write failed");
-        });
-        void write.catch(() => {});
-        return write;
+        );
       },
-      isRecorded: (batchId) => aiCallLogger.isRecorded(batchId),
-      getStats: (prefix) => aiCallLogger.getStats(prefix),
-      listCalls: aiCallLogger.listCalls?.bind(aiCallLogger),
       flush: (config) => this.flush(config),
     };
+    // Reads and any logger-specific members are those of the configured logger.
+    this.trackedLogger = new Proxy(aiCallLogger, {
+      get(target, key) {
+        if (Object.hasOwn(writes, key))
+          return writes[key as keyof AICallLogger];
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -202,23 +203,28 @@ class AIHelperImpl implements AIHelper {
           // A reporting callback cannot change the model result or block flush.
         }
       }
-    };
-    let result: Promise<void>;
-    try {
-      const writeResult = write();
-      if (!writeResult) {
-        done();
-        return Promise.resolve();
-      }
-      result = Promise.resolve(writeResult);
-    } catch (error) {
-      result = Promise.reject(error);
-    }
-    void result.then(done, (error) => {
-      onFailure(error);
       done();
+    };
+    let result: void | Promise<void>;
+    try {
+      result = write();
+    } catch (error) {
+      // A synchronous throw still reaches the caller, as in earlier releases.
+      onFailure(error);
+      throw error;
+    }
+    if (!result) {
+      done();
+      return Promise.resolve();
+    }
+    // A database error can quote the row it refused; callers get a safe one.
+    const tracked = Promise.resolve(result).then(done, (error: unknown) => {
+      onFailure(error);
+      traceProviderDiagnostic("AI call accounting write failed", error);
+      throw new Error("AI call accounting write failed");
     });
-    return result;
+    void tracked.catch(() => {});
+    return tracked;
   }
 
   bindCallLogger(): void {

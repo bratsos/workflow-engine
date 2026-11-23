@@ -605,8 +605,6 @@ export interface ExecutorDeps {
   clock: Clock;
   stepLedger?: StepLedger;
   services?: KernelServices;
-  aiFlushTimeoutMs?: number;
-  deferAIFlush?: (flush: () => Promise<void>) => void;
 }
 
 /**

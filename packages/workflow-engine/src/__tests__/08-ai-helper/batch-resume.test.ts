@@ -357,16 +357,13 @@ describe("cost ledger recording is retried after a transient failure", () => {
     const handle = await batch.submit([{ id: "r1", prompt: "p" }]);
     const meta = { batchRefs: JSON.parse(JSON.stringify(handle.refs)) };
 
-    const firstResults = await batch.getResults(handle.id, meta);
-    expect(firstResults).toHaveLength(1);
-    await expect(batch.recordResults(handle.id, firstResults)).rejects.toThrow(
+    await expect(batch.getResults(handle.id, meta)).rejects.toThrow(
       /transient/,
     );
     expect(await batch.isRecorded(handle.id)).toBe(false);
 
     const results = await batch.getResults(handle.id, meta);
     expect(results).toHaveLength(1);
-    await batch.recordResults(handle.id, results);
     expect(logged).toHaveLength(1);
   });
 });
