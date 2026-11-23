@@ -177,7 +177,10 @@ At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
 `{ failed, pending }`. Failed writes are cumulative for that helper and its
 children. Pending includes open streams and writes still in progress when
 the timeout expires. A stream is pending from the call until its row is
-written or it ends without one, including after an error part. A write the database refuses reaches `onLogError`. A
+written, or until the AI SDK ends the request without one (an abort, a
+failed provider or tool step, or no output) and no `getUsage()` call is
+still writing its row. An error part or a consumer that stops reading
+does not end the request. A write the database refuses reaches `onLogError`. A
 caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
 message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
 rejects if that write fails; `recordResults` retries it.
