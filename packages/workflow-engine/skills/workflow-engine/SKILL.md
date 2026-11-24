@@ -158,7 +158,7 @@ All operations go through `kernel.dispatch(command)`:
 | `stage.pollSuspended` | Poll suspended stages for readiness (claims each stage first; skips cancelled runs; per-stage transactions) |
 | `step.signal` | Complete a durable `ctx.step.waitForSignal` step with a payload (idempotent) |
 | `lease.reapStale` | Release stale job leases (`{ staleThresholdMs, absoluteTimeoutMs? }` → `{ released, expired }`) |
-| `run.reapStuck` | Fail stuck RUNNING runs and active stages atomically (heals runs whose stages all finished) |
+| `run.reapStuck` | Recover missing jobs and reap inactive runs without a queued job or live lease |
 | `outbox.flush` | Publish pending outbox events; reports `eventSinkStatus: "healthy" \| "degraded"` |
 | `plugin.replayDLQ` | Replay dead-letter queue events |
 
@@ -317,7 +317,7 @@ const host = createNodeHost({
   orchestrationIntervalMs: 10_000,
   jobPollIntervalMs: 1_000,
   staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
-  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: absolute cap on one job claim (default 1h, 0 disables)
+  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: fallback absolute cap (default 1h, 0 for no fallback)
   jobHeartbeatIntervalMs: 60_000,   // v0.11+: heartbeat a job's lease while it executes; 1.0: also feeds ctx.abortSignal
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // 1.0: run.purge on every tick (off by default)
   // serves: "all",                 // 1.0: disable definition-version filtering (default: derived from the registry)
@@ -348,7 +348,7 @@ const host = createServerlessHost({
   workerId: "my-worker",
   // Optional tuning (same defaults as Node host)
   staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
-  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: absolute cap on one job claim (default 1h, 0 disables)
+  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: fallback absolute cap (default 1h, 0 for no fallback)
   jobHeartbeatIntervalMs: 60_000,   // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,

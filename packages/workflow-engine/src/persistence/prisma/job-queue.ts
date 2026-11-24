@@ -11,6 +11,7 @@ import {
  * This is migrated from the original services/job-queue.server.ts
  */
 
+import { type JobRetryBackoff, retryBackoffMs } from "../../core/job-runtime";
 import type { Persistence } from "../../kernel/ports";
 import { createLogger, isTraceTextEnabled } from "../../utils/logger";
 import {
@@ -27,6 +28,7 @@ import {
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
   type ServedDefinition,
+  type WorkflowJobLimit,
 } from "../interface";
 import { countActiveByStatus } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
@@ -35,6 +37,7 @@ import {
   type EnginePrismaClient,
   type RawColumns,
   rawFor,
+  readPrismaSql,
   validateDatabaseType,
 } from "./prisma-client-type";
 import {
@@ -45,6 +48,8 @@ import {
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
+const WORKFLOW_CLAIM_INDEX = "job_queue_status_workflow_priority_idx";
+const absoluteCapReason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
 
 /**
  * Bounds retry loops for optimistic-lock dequeue paths so heavy contention
@@ -76,6 +81,8 @@ type DequeuedJobRow = {
   priority: number;
   attempt: number;
   maxAttempts: number;
+  retryPolicy: JobRetryBackoff | null;
+  leaseTimeoutMs: number | null;
   payload: unknown;
   startedAt: Date;
 };
@@ -88,9 +95,34 @@ const DEQUEUED_JOB_COLUMNS: RawColumns = {
   priority: "int",
   attempt: "int",
   maxAttempts: "int",
+  retryPolicy: "json",
+  leaseTimeoutMs: "int",
   payload: "json",
   startedAt: "timestamp",
 };
+
+/** Seek to each pending workflow's key, then drop saturated workflows before reading any heads. */
+function workflowBuckets(bucket: string, from: string): string {
+  return `, pending_workflows(bucket) AS (
+    SELECT (
+      SELECT ${bucket} FROM ${from}
+      WHERE j.status = 'PENDING'
+      ORDER BY 1 LIMIT 1
+    )
+    UNION ALL
+    SELECT (
+      SELECT ${bucket} FROM ${from}
+      WHERE j.status = 'PENDING' AND ${bucket} > w.bucket
+      ORDER BY 1 LIMIT 1
+    )
+    FROM pending_workflows w WHERE w.bucket IS NOT NULL
+  ), eligible AS MATERIALIZED (
+    SELECT w.bucket FROM pending_workflows w
+    WHERE w.bucket IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
+    )
+  )`;
+}
 
 /**
  * Splits a dotted payload path into the segments Postgres's `#>>` operator
@@ -160,6 +192,7 @@ export class PrismaJobQueue implements JobQueue {
   private readonly inSqliteTransaction: boolean;
   private readonly fairnessPath: string[] | null;
   private readonly fairnessLimit: number;
+  private workflowClaimIndex?: Promise<boolean>;
 
   /**
    * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
@@ -204,6 +237,7 @@ export class PrismaJobQueue implements JobQueue {
   private enqueueData(job: EnqueueJobInput) {
     return {
       workflowRunId: job.workflowRunId,
+      workflowId: job.workflowId,
       stageId: job.stageId,
       priority: job.priority ?? 5,
       payload: {
@@ -218,6 +252,18 @@ export class PrismaJobQueue implements JobQueue {
       } as unknown,
       status: this.enums.status("PENDING"),
       nextPollAt: job.scheduledFor ?? null,
+      ...(job.maxAttempts !== undefined
+        ? { maxAttempts: job.maxAttempts }
+        : {}),
+      ...(job.retryPolicy !== undefined
+        ? { retryPolicy: job.retryPolicy }
+        : {}),
+      ...(job.leaseTimeoutMs !== undefined
+        ? { leaseTimeoutMs: job.leaseTimeoutMs }
+        : {}),
+      ...(job.absoluteTimeoutMs !== undefined
+        ? { absoluteTimeoutMs: job.absoluteTimeoutMs }
+        : {}),
     };
   }
 
@@ -331,13 +377,20 @@ export class PrismaJobQueue implements JobQueue {
    */
   async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      const claim = () => this.dequeueSqlite(0, options?.serves);
+      const claim = () =>
+        options?.workflowLimits?.length
+          ? this.dequeueSqliteLimited(options, options.workflowLimits)
+          : this.dequeueSqlite(0, options?.serves, options?.leaseTimeoutMs);
       const turn = sqliteClaims.get(this.prisma);
       const claimed = turn ? turn.then(claim, claim) : claim();
       sqliteClaims.set(this.prisma, claimed);
       return claimed;
     }
-    return this.dequeuePostgres(options?.serves);
+    return this.dequeuePostgres(
+      options?.serves,
+      options?.leaseTimeoutMs,
+      options?.workflowLimits,
+    );
   }
 
   /**
@@ -394,9 +447,11 @@ export class PrismaJobQueue implements JobQueue {
    */
   private async dequeuePostgres(
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
+    limits?: readonly WorkflowJobLimit[],
   ): Promise<DequeueResult | null> {
     for (let i = 0; i < MAX_DEQUEUE_ATTEMPTS; i++) {
-      const job = await this.dequeuePostgresOnce(serves);
+      const job = await this.dequeuePostgresOnce(serves, hostLeaseMs, limits);
       if (job !== "dead") return job;
     }
     return null;
@@ -405,6 +460,8 @@ export class PrismaJobQueue implements JobQueue {
   /** One claim; `"dead"` when the claimed row was failed as unexecutable. */
   private async dequeuePostgresOnce(
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
+    limits?: readonly WorkflowJobLimit[],
   ): Promise<DequeueResult | null | "dead"> {
     const {
       active: servesActive,
@@ -459,10 +516,12 @@ export class PrismaJobQueue implements JobQueue {
       // - Cost: the CTE aggregates every RUNNING row per claim, where the
       //   default statement stops at the first index entry. That is why
       //   fairness is opt-in; the measured difference is in the release notes.
-      const result = this.fairnessPath
-        ? await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
-            DequeuedJobRow[]
-          >`
+      const result = limits?.length
+        ? await this.claimPostgresLimited(limits, serves)
+        : this.fairnessPath
+          ? await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
+              DequeuedJobRow[]
+            >`
         WITH "group_load" AS (
           SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], payload ->> '_groupKey', '') AS grp,
                  count(*) AS running
@@ -476,6 +535,10 @@ export class PrismaJobQueue implements JobQueue {
           "workerId" = ${this.workerId},
           "lockedAt" = (now() AT TIME ZONE 'UTC'),
           "startedAt" = (now() AT TIME ZONE 'UTC'),
+          "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "leaseTimeoutMs" * interval '1 millisecond',
+          "absoluteExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "absoluteTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT j.id
@@ -513,17 +576,21 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE OF j SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
       `
-        : await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
-            DequeuedJobRow[]
-          >`
+          : await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
+              DequeuedJobRow[]
+            >`
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
           "lockedAt" = (now() AT TIME ZONE 'UTC'),
           "startedAt" = (now() AT TIME ZONE 'UTC'),
+          "leaseExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "leaseTimeoutMs" * interval '1 millisecond',
+          "absoluteExpiresAt" = (now() AT TIME ZONE 'UTC')
+            + "absoluteTimeoutMs" * interval '1 millisecond',
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
@@ -557,7 +624,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -591,6 +658,8 @@ export class PrismaJobQueue implements JobQueue {
             lastError: error,
             workerId: null,
             lockedAt: null,
+            leaseExpiresAt: null,
+            absoluteExpiresAt: null,
           },
         });
         return "dead";
@@ -610,6 +679,7 @@ export class PrismaJobQueue implements JobQueue {
         ],
       );
 
+      const leaseMs = job.leaseTimeoutMs ?? hostLeaseMs;
       const payload = job.payload as Record<string, unknown>;
       const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
@@ -620,7 +690,16 @@ export class PrismaJobQueue implements JobQueue {
         priority: job.priority,
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
+        ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
         payload: rest,
+        ...(leaseMs !== undefined
+          ? {
+              leaseMs,
+              ...(job.leaseTimeoutMs == null
+                ? { usesHostLease: true as const }
+                : {}),
+            }
+          : {}),
         startedAt: job.startedAt,
       };
     } catch (error) {
@@ -633,6 +712,264 @@ export class PrismaJobQueue implements JobQueue {
     }
   }
 
+  private async hasWorkflowClaimIndex(workflowId: string): Promise<boolean> {
+    // Share the catalog read across simultaneous first claims by this adapter.
+    this.workflowClaimIndex ??= this.probeWorkflowClaimIndex(workflowId).catch(
+      (error) => {
+        this.workflowClaimIndex = undefined;
+        throw error;
+      },
+    );
+    return this.workflowClaimIndex;
+  }
+
+  private async probeWorkflowClaimIndex(workflowId: string): Promise<boolean> {
+    const raw = rawFor(this.prisma, { found: "int" });
+    const [index] =
+      this.databaseType === "sqlite"
+        ? await raw.$queryRaw!<Array<{ found: number }>>`
+            SELECT 1 AS found FROM pragma_index_list('job_queue')
+            WHERE name = ${WORKFLOW_CLAIM_INDEX}
+          `
+        : await raw.$queryRaw!<Array<{ found: number }>>`
+            SELECT 1 AS found
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+            WHERE i.indrelid = pg_catalog.to_regclass('"job_queue"')
+              AND c.relname = ${WORKFLOW_CLAIM_INDEX}
+              AND i.indisvalid AND i.indisready
+          `;
+    if (!index) {
+      logger.warn(
+        "Missing usable workflow claim index. Workflow concurrency limits still apply with a slower claim. Apply the bundled SQL file and restart the worker to use bounded claims.",
+        {
+          workflowId,
+          indexName: WORKFLOW_CLAIM_INDEX,
+          sqlFile: `sql/job-workflow-index.${this.databaseType}.sql`,
+          workerId: this.workerId,
+        },
+      );
+    }
+    return Boolean(index);
+  }
+
+  private async claimPostgresLimited(
+    limits: readonly WorkflowJobLimit[],
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeuedJobRow[]> {
+    if (!this.prisma.$transaction) {
+      throw new Error("Workflow job limits require a PostgreSQL transaction");
+    }
+
+    const indexed = await this.hasWorkflowClaimIndex(limits[0]!.workflowId);
+    const { active, workflowIds, versions } = this.servesParams(serves);
+    const key = `COALESCE(j."workflowId", j.payload ->> '_workflowId')`;
+    // The ':' prefix keeps the unknown workflow bucket separate from any ID.
+    const bucket = `COALESCE(':' || ${key}, '')`;
+    const candidates = `
+      SELECT ${indexed ? 'j.id, j.priority, j."createdAt"' : "j.id"}
+      FROM "job_queue" j
+      LEFT JOIN group_load g
+        ON g.grp = COALESCE(j.payload #>> $3::text[], j.payload ->> '_groupKey', '')
+      WHERE j.status = 'PENDING'
+        AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= (statement_timestamp() AT TIME ZONE 'UTC'))
+        AND ${
+          indexed
+            ? `${bucket} = e.bucket`
+            : `NOT EXISTS (SELECT 1 FROM saturated s WHERE s.wf = ${key})`
+        }
+        AND (NOT $4::boolean OR COALESCE(g.running, 0) < $6::bigint)
+        AND (
+          NOT $7::boolean OR (j.payload ->> '_workflowId') IS NULL OR EXISTS (
+            SELECT 1 FROM unnest($8::text[], $9::text[]) AS s(wf, ver)
+            WHERE s.wf = j.payload ->> '_workflowId'
+              AND ((j.payload ->> '_definitionVersion') IS NULL OR s.ver = j.payload ->> '_definitionVersion')
+          )
+        )
+      ORDER BY j.priority DESC, j."createdAt" ASC
+      LIMIT 1
+      FOR UPDATE OF j SKIP LOCKED`;
+    return this.prisma.$transaction(
+      async (tx: PrismaClient) => {
+        // Take the lock before the claim takes its READ COMMITTED snapshot.
+        await rawFor(tx, { locked: "int" }).$queryRaw!`
+          SELECT 1::int AS locked FROM pg_advisory_xact_lock(1464223045, 413)
+        `;
+
+        return readPrismaSql<DequeuedJobRow>(
+          tx,
+          "postgresql",
+          DEQUEUED_JOB_COLUMNS,
+          `
+          WITH RECURSIVE saturated AS MATERIALIZED (
+            SELECT l.wf
+            FROM unnest($1::text[], $2::integer[]) AS l(wf, cap)
+            WHERE EXISTS (
+              SELECT 1 FROM (
+                SELECT 1 FROM "job_queue" q
+                  WHERE q.status = 'RUNNING' AND q."workflowId" = l.wf
+                UNION ALL
+                SELECT 1 FROM "job_queue" q
+                  WHERE q.status = 'RUNNING' AND q."workflowId" IS NULL
+                    AND q.payload ->> '_workflowId' = l.wf
+              ) running
+              OFFSET (l.cap - 1) LIMIT 1
+            )
+          ), group_load AS (
+            SELECT COALESCE(payload #>> $3::text[], payload ->> '_groupKey', '') AS grp,
+                   count(*) AS running
+            FROM "job_queue"
+            WHERE $4::boolean AND status = 'RUNNING'
+            GROUP BY 1
+          )${indexed ? workflowBuckets(bucket, '"job_queue" j') : ""}
+          UPDATE "job_queue"
+          SET status = 'RUNNING',
+              "workerId" = $5,
+              "lockedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
+              "startedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
+              "leaseExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
+                + "leaseTimeoutMs" * interval '1 millisecond',
+              "absoluteExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
+                + "absoluteTimeoutMs" * interval '1 millisecond',
+              attempt = attempt + 1
+          WHERE id = (${
+            indexed
+              ? `SELECT head.id FROM eligible e
+                 CROSS JOIN LATERAL (${candidates}) head
+                 ORDER BY head.priority DESC, head."createdAt" ASC LIMIT 1`
+              : candidates
+          })
+          RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"`,
+          [
+            limits.map((limit) => limit.workflowId),
+            limits.map((limit) => limit.maxConcurrent),
+            this.fairnessPath ?? [],
+            this.fairnessPath !== null,
+            this.workerId,
+            this.fairnessLimit,
+            active,
+            workflowIds,
+            versions,
+          ],
+        );
+      },
+      { isolationLevel: "ReadCommitted" },
+    );
+  }
+
+  private async dequeueSqliteLimited(
+    options: DequeueOptions,
+    limits: readonly WorkflowJobLimit[],
+  ): Promise<DequeueResult | null> {
+    type Candidate = {
+      id: string;
+      workflowId: string | null;
+      leaseTimeoutMs: number | null;
+      absoluteTimeoutMs: number | null;
+    };
+    const indexed = await this.hasWorkflowClaimIndex(limits[0]!.workflowId);
+    const key = `COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId'))`;
+    const bucket = `COALESCE(':' || ${key}, '')`;
+    const from = `"job_queue" j${indexed ? ` INDEXED BY "${WORKFLOW_CLAIM_INDEX}"` : ""}`;
+    const columns = `j.id, j."leaseTimeoutMs", j."absoluteTimeoutMs", ${key} AS "workflowId"`;
+    const candidates = `
+      SELECT ${indexed ? "j.id" : columns} FROM ${from}
+      WHERE j.status = 'PENDING'
+        AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= $2)
+        AND ${
+          indexed
+            ? `${bucket} = e.bucket`
+            : `NOT EXISTS (SELECT 1 FROM saturated s WHERE s.wf = ${key})`
+        }
+        AND (
+          $3 = 1
+          OR json_type(j.payload, '$._workflowId') IS NOT 'text'
+          OR EXISTS (
+            SELECT 1 FROM json_each($4) s
+            WHERE json_extract(s.value, '$.workflowId') = json_extract(j.payload, '$._workflowId')
+              AND (json_type(j.payload, '$._definitionVersion') IS NOT 'text'
+                OR json_extract(s.value, '$.version') = json_extract(j.payload, '$._definitionVersion'))
+          )
+        )
+      ORDER BY j.priority DESC, j."createdAt" ASC
+      LIMIT 1`;
+    const sql = `
+      WITH RECURSIVE saturated AS MATERIALIZED (
+        SELECT json_extract(l.value, '$.workflowId') AS wf
+        FROM json_each($1) l
+        WHERE (
+          (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+            AND q."workflowId" = json_extract(l.value, '$.workflowId'))
+          + (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+            AND q."workflowId" IS NULL
+            AND json_extract(q.payload, '$._workflowId') = json_extract(l.value, '$.workflowId'))
+        ) >= json_extract(l.value, '$.maxConcurrent')
+      )${indexed ? workflowBuckets(bucket, from) : ""}
+      ${
+        indexed
+          ? `SELECT ${columns} FROM eligible e CROSS JOIN "job_queue" j
+           WHERE j.id = (${candidates})
+           ORDER BY j.priority DESC, j."createdAt" ASC LIMIT 1`
+          : candidates
+      }`;
+    const writer = rawFor(this.prisma, { id: "text" });
+    for (let attempt = 0; attempt < MAX_DEQUEUE_ATTEMPTS; attempt++) {
+      const now = new Date();
+      const [candidate] = await readPrismaSql<Candidate>(
+        this.prisma,
+        "sqlite",
+        {
+          id: "text",
+          workflowId: "text",
+          leaseTimeoutMs: "int",
+          absoluteTimeoutMs: "int",
+        },
+        sql,
+        [
+          JSON.stringify(limits),
+          now,
+          options.serves === undefined ? 1 : 0,
+          JSON.stringify(options.serves ?? []),
+        ],
+      );
+      if (!candidate) return null;
+
+      const cap =
+        limits.find(({ workflowId }) => workflowId === candidate.workflowId)
+          ?.maxConcurrent ?? null;
+      const stamps = this.sqliteClaimTimestamps(candidate, now);
+      // Recheck the cap under SQLite's write lock, in the same statement as
+      // the claim. Bind the Date stamps in the client's own storage format.
+      // The split lets us compute them without SQL date arithmetic or
+      // holding the write lock across a JavaScript await.
+      const [claimed] = await writer.$queryRaw!<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET status = 'RUNNING', "workerId" = ${this.workerId}, attempt = attempt + 1,
+            "lockedAt" = ${stamps.lockedAt}, "startedAt" = ${stamps.startedAt},
+            "leaseExpiresAt" = ${stamps.leaseExpiresAt}, "absoluteExpiresAt" = ${stamps.absoluteExpiresAt},
+            "updatedAt" = ${now}
+        WHERE id = ${candidate.id} AND status = 'PENDING'
+          AND ("nextPollAt" IS NULL OR "nextPollAt" <= ${now})
+          AND (${cap} IS NULL OR (
+            (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+              AND q."workflowId" = ${candidate.workflowId})
+            + (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+              AND q."workflowId" IS NULL AND json_extract(q.payload, '$._workflowId') = ${candidate.workflowId})
+          ) < ${cap})
+        RETURNING id
+      `;
+      if (!claimed) continue;
+
+      const job = await this.prisma.jobQueue.findUnique({
+        where: { id: claimed.id },
+      });
+      return job
+        ? this.sqliteClaimResult(job, now, options.leaseTimeoutMs)
+        : null;
+    }
+    return null;
+  }
+
   /**
    * SQLite implementation using optimistic locking.
    * SQLite doesn't support FOR UPDATE SKIP LOCKED, so we use a two-step approach:
@@ -643,6 +980,7 @@ export class PrismaJobQueue implements JobQueue {
   private async dequeueSqlite(
     attempt = 0,
     serves?: readonly ServedDefinition[],
+    hostLeaseMs?: number,
   ): Promise<DequeueResult | null> {
     try {
       if (attempt >= MAX_DEQUEUE_ATTEMPTS) {
@@ -688,21 +1026,20 @@ export class PrismaJobQueue implements JobQueue {
       const result = await this.prisma.jobQueue.updateMany({
         where: {
           id: job.id,
-          status: this.enums.status("PENDING"), // Optimistic lock
+          status: this.enums.status("PENDING"),
         },
         data: {
           status: this.enums.status("RUNNING"),
           workerId: this.workerId,
-          lockedAt: now,
-          startedAt: now,
           attempt: { increment: 1 },
+          ...this.sqliteClaimTimestamps(job, now),
         },
       });
 
       if (result.count === 0) {
         // Another worker claimed it, retry (bounded to avoid unbounded
         // recursion under heavy contention)
-        return this.dequeueSqlite(attempt + 1, serves);
+        return this.dequeueSqlite(attempt + 1, serves, hostLeaseMs);
       }
 
       // Fetch the updated job to get the new attempt count
@@ -710,46 +1047,81 @@ export class PrismaJobQueue implements JobQueue {
         where: { id: job.id },
       });
 
-      if (!claimedJob) {
-        return null;
-      }
-
-      logger.debug(
-        "Dequeued job",
-        {
-          jobId: claimedJob.id,
-          workflowRunId: claimedJob.workflowRunId,
-          stageId: claimedJob.stageId,
-          attempt: claimedJob.attempt,
-          workerId: this.workerId,
-        },
-        () => [
-          `Dequeued job ${claimedJob.id} (stage: ${claimedJob.stageId}, attempt: ${claimedJob.attempt})`,
-        ],
-      );
-
-      const claimedPayload = claimedJob.payload as Record<string, unknown>;
-      const {
-        _workflowId: claimedWfId,
-        _groupKey,
-        _definitionVersion,
-        ...claimedRest
-      } = claimedPayload;
-      return {
-        jobId: claimedJob.id,
-        workflowRunId: claimedJob.workflowRunId,
-        workflowId: (claimedWfId as string) ?? "",
-        stageId: claimedJob.stageId,
-        priority: claimedJob.priority,
-        attempt: claimedJob.attempt,
-        maxAttempts: claimedJob.maxAttempts,
-        payload: claimedRest,
-        startedAt: now,
-      };
+      return claimedJob
+        ? this.sqliteClaimResult(claimedJob, now, hostLeaseMs)
+        : null;
     } catch (error) {
       logger.caught("Error dequeuing job:", error, { workerId: this.workerId });
       throw error;
     }
+  }
+
+  private sqliteClaimResult(
+    claimedJob: DequeuedJobRow,
+    now: Date,
+    hostLeaseMs?: number,
+  ): DequeueResult {
+    const leaseMs = claimedJob.leaseTimeoutMs ?? hostLeaseMs;
+    logger.debug(
+      "Dequeued job",
+      {
+        jobId: claimedJob.id,
+        workflowRunId: claimedJob.workflowRunId,
+        stageId: claimedJob.stageId,
+        attempt: claimedJob.attempt,
+        workerId: this.workerId,
+      },
+      () => [
+        `Dequeued job ${claimedJob.id} (stage: ${claimedJob.stageId}, attempt: ${claimedJob.attempt})`,
+      ],
+    );
+
+    const claimedPayload = claimedJob.payload as Record<string, unknown>;
+    const {
+      _workflowId: claimedWfId,
+      _groupKey,
+      _definitionVersion,
+      ...claimedRest
+    } = claimedPayload;
+    return {
+      jobId: claimedJob.id,
+      workflowRunId: claimedJob.workflowRunId,
+      workflowId: (claimedWfId as string) ?? "",
+      stageId: claimedJob.stageId,
+      priority: claimedJob.priority,
+      attempt: claimedJob.attempt,
+      maxAttempts: claimedJob.maxAttempts,
+      ...(claimedJob.retryPolicy
+        ? { retryPolicy: claimedJob.retryPolicy }
+        : {}),
+      payload: claimedRest,
+      ...(leaseMs !== undefined
+        ? {
+            leaseMs,
+            ...(claimedJob.leaseTimeoutMs == null
+              ? { usesHostLease: true as const }
+              : {}),
+          }
+        : {}),
+      startedAt: now,
+    };
+  }
+
+  private sqliteClaimTimestamps(
+    job: { leaseTimeoutMs: number | null; absoluteTimeoutMs: number | null },
+    now: Date,
+  ) {
+    const leaseMs = job.leaseTimeoutMs;
+    return {
+      lockedAt: now,
+      startedAt: now,
+      leaseExpiresAt:
+        leaseMs == null ? null : new Date(now.getTime() + leaseMs),
+      absoluteExpiresAt:
+        job.absoluteTimeoutMs == null
+          ? null
+          : new Date(now.getTime() + job.absoluteTimeoutMs),
+    };
   }
 
   /**
@@ -821,6 +1193,8 @@ export class PrismaJobQueue implements JobQueue {
           nextPollAt,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
+          absoluteExpiresAt: null,
         },
       });
       return this.ackOutcome(jobId, result.count, "suspend");
@@ -832,6 +1206,8 @@ export class PrismaJobQueue implements JobQueue {
         nextPollAt,
         workerId: null,
         lockedAt: null,
+        leaseExpiresAt: null,
+        absoluteExpiresAt: null,
       },
     });
     logger.debug("Job suspended", { jobId, nextPollAt }, () => [
@@ -857,6 +1233,8 @@ export class PrismaJobQueue implements JobQueue {
       nextPollAt,
       workerId: null,
       lockedAt: null,
+      leaseExpiresAt: null,
+      absoluteExpiresAt: null,
       lastError: reason,
       attempt: { decrement: 1 },
     };
@@ -885,12 +1263,12 @@ export class PrismaJobQueue implements JobQueue {
   ): Promise<JobAckOutcome> {
     const job = await this.prisma.jobQueue.findUnique({
       where: { id: jobId },
-      select: { attempt: true, maxAttempts: true },
+      select: { attempt: true, maxAttempts: true, retryPolicy: true },
     });
 
     if (shouldRetry && job && job.attempt < job.maxAttempts) {
       // Re-queue for retry with exponential backoff
-      const backoffMs = 2 ** job.attempt * 1000; // 2s, 4s, 8s...
+      const backoffMs = retryBackoffMs(job.attempt, job.retryPolicy);
       const nextPollAt = new Date(Date.now() + backoffMs);
 
       if (fence) {
@@ -901,6 +1279,8 @@ export class PrismaJobQueue implements JobQueue {
             lastError: error,
             workerId: null,
             lockedAt: null,
+            leaseExpiresAt: null,
+            absoluteExpiresAt: null,
             nextPollAt: nextPollAt,
           },
         });
@@ -914,6 +1294,8 @@ export class PrismaJobQueue implements JobQueue {
           lastError: error,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
+          absoluteExpiresAt: null,
           nextPollAt: nextPollAt,
         },
       });
@@ -1033,10 +1415,23 @@ export class PrismaJobQueue implements JobQueue {
         priority: job.priority,
         workerId: job.workerId,
         lockedAt: job.lockedAt,
+        ...(job.leaseTimeoutMs != null
+          ? { leaseTimeoutMs: job.leaseTimeoutMs }
+          : {}),
+        ...(job.leaseExpiresAt != null
+          ? { leaseExpiresAt: job.leaseExpiresAt }
+          : {}),
+        ...(job.absoluteTimeoutMs != null
+          ? { absoluteTimeoutMs: job.absoluteTimeoutMs }
+          : {}),
+        ...(job.absoluteExpiresAt != null
+          ? { absoluteExpiresAt: job.absoluteExpiresAt }
+          : {}),
         startedAt: job.startedAt,
         completedAt: job.completedAt,
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
+        ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
         lastError: job.lastError,
         nextPollAt: job.nextPollAt,
         payload: rest,
@@ -1064,7 +1459,11 @@ export class PrismaJobQueue implements JobQueue {
   /**
    * Refresh a running job's lease without changing status.
    */
-  async touchJob(jobId: string): Promise<void> {
+  async touchJob(
+    jobId: string,
+    leaseMs?: number,
+    fence?: JobAckFence,
+  ): Promise<void> {
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // Renew the lease from the database clock: a heartbeat written from
       // the application clock while the sweeper reads the database clock
@@ -1072,14 +1471,28 @@ export class PrismaJobQueue implements JobQueue {
       await rawFor(this.prisma, {}).$queryRaw!`
         UPDATE "job_queue"
         SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
+            "leaseExpiresAt" = CASE WHEN ${leaseMs ?? null}::integer IS NULL
+              THEN "leaseExpiresAt"
+              ELSE (now() AT TIME ZONE 'UTC') + ${leaseMs ?? null}::integer * interval '1 millisecond'
+            END,
             "updatedAt" = (now() AT TIME ZONE 'UTC')
         WHERE id = ${jobId} AND status = 'RUNNING'
+          AND ((${fence?.startedAt.toISOString() ?? null}::timestamptz AT TIME ZONE 'UTC') IS NULL
+            OR ("startedAt" = (${fence?.startedAt.toISOString() ?? null}::timestamptz AT TIME ZONE 'UTC') AND attempt = ${fence?.attempt ?? null}::integer))
       `;
       return;
     }
+    const now = new Date();
     await this.prisma.jobQueue.updateMany({
-      where: { id: jobId, status: this.enums.status("RUNNING") },
-      data: { lockedAt: new Date() },
+      where: fence
+        ? this.fenceWhere(jobId, fence)
+        : { id: jobId, status: this.enums.status("RUNNING") },
+      data: {
+        lockedAt: now,
+        ...(leaseMs !== undefined
+          ? { leaseExpiresAt: new Date(now.getTime() + leaseMs) }
+          : {}),
+      },
     });
   }
 
@@ -1099,7 +1512,7 @@ export class PrismaJobQueue implements JobQueue {
    * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
-    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
+    const reason = `${LEASE_HEARTBEAT_LOST}: lease expired without a heartbeat; released for another worker`;
 
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
@@ -1113,13 +1526,15 @@ export class PrismaJobQueue implements JobQueue {
           status = 'PENDING',
           "workerId" = NULL,
           "lockedAt" = NULL,
+          "leaseExpiresAt" = NULL,
+          "absoluteExpiresAt" = NULL,
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
           "lastError" = ${reason}
         WHERE status = 'RUNNING'
-          AND "lockedAt" IS NOT NULL
-          AND "lockedAt" <
+          AND ("leaseExpiresAt" < (now() AT TIME ZONE 'UTC')
+            OR ("leaseExpiresAt" IS NULL AND "lockedAt" <
               (now() AT TIME ZONE 'UTC')
-              - ${staleThresholdMs}::double precision * interval '1 millisecond'
+              - ${staleThresholdMs}::double precision * interval '1 millisecond'))
         RETURNING id
       `;
       if (released.length > 0) {
@@ -1130,17 +1545,23 @@ export class PrismaJobQueue implements JobQueue {
       return released.length;
     }
 
-    const thresholdDate = new Date(Date.now() - staleThresholdMs);
+    const now = new Date();
+    const thresholdDate = new Date(now.getTime() - staleThresholdMs);
 
     const result = await this.prisma.jobQueue.updateMany({
       where: {
         status: this.enums.status("RUNNING"),
-        lockedAt: { lt: thresholdDate },
+        OR: [
+          { leaseExpiresAt: { lt: now } },
+          { leaseExpiresAt: null, lockedAt: { lt: thresholdDate } },
+        ],
       },
       data: {
         status: this.enums.status("PENDING"),
         workerId: null,
         lockedAt: null,
+        leaseExpiresAt: null,
+        absoluteExpiresAt: null,
         lastError: reason,
       },
     });
@@ -1173,8 +1594,6 @@ export class PrismaJobQueue implements JobQueue {
    * `run.reapStuck` on its next pass.
    */
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
-    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
-
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
       // than destructuring it into a local first -- Prisma's runtime reads
@@ -1187,32 +1606,65 @@ export class PrismaJobQueue implements JobQueue {
           status = 'FAILED',
           "completedAt" = (now() AT TIME ZONE 'UTC'),
           "updatedAt" = (now() AT TIME ZONE 'UTC'),
-          "lastError" = ${reason}
+          "lastError" = ${absoluteCapReason}
         WHERE status = 'RUNNING'
-          AND "startedAt" IS NOT NULL
-          AND "startedAt" <
+          AND ("absoluteExpiresAt" < (now() AT TIME ZONE 'UTC')
+            OR ("absoluteExpiresAt" IS NULL AND "startedAt" <
               (now() AT TIME ZONE 'UTC')
-              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'
+              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'))
         RETURNING id
       `;
       if (expired.length > 0) {
         logger.warn(
-          `Expired ${expired.length} runaway job(s) past the ${absoluteTimeoutMs}ms absolute lease cap`,
+          `Expired ${expired.length} runaway job(s) past their absolute lease deadlines`,
+          {
+            expiredCount: expired.length,
+            absoluteTimeoutMs,
+            workerId: this.workerId,
+          },
         );
       }
       return expired.length;
     }
 
-    const cutoff = new Date(this.now().getTime() - absoluteTimeoutMs);
+    const now = this.now();
+    const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
+    return this.expireJobsByFilter({
+      OR: [
+        { absoluteExpiresAt: { lt: now } },
+        { absoluteExpiresAt: null, startedAt: { lt: cutoff } },
+      ],
+    });
+  }
+
+  async expireExplicitDeadlines(): Promise<number> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      const expired = await rawFor(this.prisma, { id: "text" }).$queryRaw!<
+        Array<{ id: string }>
+      >`
+        UPDATE "job_queue"
+        SET status = 'FAILED',
+            "completedAt" = (now() AT TIME ZONE 'UTC'),
+            "updatedAt" = (now() AT TIME ZONE 'UTC'),
+            "lastError" = ${absoluteCapReason}
+        WHERE status = 'RUNNING'
+          AND "absoluteExpiresAt" < (now() AT TIME ZONE 'UTC')
+        RETURNING id
+      `;
+      return expired.length;
+    }
+    return this.expireJobsByFilter({ absoluteExpiresAt: { lt: this.now() } });
+  }
+
+  private async expireJobsByFilter(
+    filter: Record<string, unknown>,
+  ): Promise<number> {
     const result = await this.prisma.jobQueue.updateMany({
-      where: {
-        status: this.enums.status("RUNNING"),
-        startedAt: { not: null, lt: cutoff },
-      },
+      where: { status: this.enums.status("RUNNING"), ...filter },
       data: {
         status: this.enums.status("FAILED"),
         completedAt: this.now(),
-        lastError: reason,
+        lastError: absoluteCapReason,
       },
     });
     return result.count;
@@ -1231,6 +1683,8 @@ guardSqliteAdapter(PrismaJobQueue.prototype, [
   "getWorkerId",
   "servesParams",
   "servesPayload",
+  "sqliteClaimResult",
+  "sqliteClaimTimestamps",
   "transactionReads",
 ]);
 

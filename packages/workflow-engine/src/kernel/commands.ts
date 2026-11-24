@@ -378,6 +378,8 @@ export interface JobHeartbeatCommand {
    * RUNNING: another worker re-claimed it after a stale-lease release.
    */
   readonly attempt?: number;
+  readonly startedAt?: Date;
+  readonly leaseMs?: number;
 }
 
 /** Result of a `job.heartbeat` command. */
@@ -401,11 +403,9 @@ export interface LeaseReapStaleCommand {
   readonly type: "lease.reapStale";
   readonly staleThresholdMs: number;
   /**
-   * Absolute cap (ms) on how long one claim may hold its lease, measured
-   * from `startedAt` and therefore unaffected by heartbeating. Jobs past it
-   * are failed terminally with the `LEASE_ABSOLUTE_CAP` reason. Omit, or
-   * pass 0, to run the heartbeat tier alone (the pre-1.0.0-alpha.9
-   * behaviour). Ignored by a transport with no `expireRunawayJobs`.
+   * Default absolute cap (ms) on one claim, measured from `startedAt`.
+   * Omit or pass 0 to apply only explicit deadlines in the absolute sweep.
+   * Jobs past their deadline fail with `LEASE_ABSOLUTE_CAP`.
    */
   readonly absoluteTimeoutMs?: number;
 }
@@ -490,6 +490,8 @@ export interface PluginReplayDLQResult {
 export interface RunReapStuckCommand {
   readonly type: "run.reapStuck";
   readonly stuckThresholdMs: number;
+  /** Fallback lease threshold for jobs without a recorded deadline. */
+  readonly staleLeaseThresholdMs?: number;
 }
 
 /** Result of a `run.reapStuck` command. */

@@ -277,22 +277,28 @@ model WorkflowAnnotation {
 }
 
 model JobQueue {
-  id            String             @id @onCreate(cuid(2))
-  createdAt     TimestampString(3) @default(now()) @onCreate(now())
-  updatedAt     TimestampString(3) @onCreate(now()) @onUpdate(now())
-  workflowRunId String
-  stageId       String
-  status        pg.enum(Status)    @default("PENDING")
-  priority      Int                @default(5)
-  attempt       Int                @default(0)
-  maxAttempts   Int                @default(3)
-  workerId      String?
-  lockedAt      TimestampString(3)?
-  startedAt     TimestampString(3)?
-  completedAt   TimestampString(3)?
-  nextPollAt    TimestampString(3)?
-  payload       Jsonb?
-  lastError     String?
+  id                 String              @id @onCreate(cuid(2))
+  createdAt          TimestampString(3)  @default(now()) @onCreate(now())
+  updatedAt          TimestampString(3)  @onCreate(now()) @onUpdate(now())
+  workflowRunId      String
+  stageId            String
+  status             pg.enum(Status)     @default("PENDING")
+  priority           Int                 @default(5)
+  attempt            Int                 @default(0)
+  maxAttempts        Int                 @default(3)
+  workerId           String?
+  lockedAt           TimestampString(3)?
+  startedAt          TimestampString(3)?
+  completedAt        TimestampString(3)?
+  nextPollAt         TimestampString(3)?
+  payload            Jsonb?
+  lastError          String?
+  workflowId         String?
+  retryPolicy        Jsonb?
+  leaseTimeoutMs     Int?
+  leaseExpiresAt     TimestampString(3)?
+  absoluteTimeoutMs  Int?
+  absoluteExpiresAt  TimestampString(3)?
 
   // One job row per stage per run; every enqueue path is idempotent on this
   // pair. See schema.prisma.
@@ -304,6 +310,10 @@ model JobQueue {
   // a status.
   @@index([status, createdAt], map: "job_queue_status_createdAt_idx")
   @@index([nextPollAt], map: "job_queue_nextPollAt_idx")
+  @@index([status, leaseExpiresAt], map: "job_queue_status_leaseExpiresAt_idx")
+  @@index([status, absoluteExpiresAt], map: "job_queue_status_absoluteExpiresAt_idx")
+  @@index([status, workflowId], map: "job_queue_status_workflowId_idx")
+  // Install sql/job-workflow-index.postgresql.sql for bounded maxConcurrent claims.
   @@map("job_queue")
 }
 

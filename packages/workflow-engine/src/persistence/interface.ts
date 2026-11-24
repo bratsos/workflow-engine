@@ -1,3 +1,5 @@
+import type { JobRetryBackoff } from "../core/job-runtime";
+
 /**
  * Persistence Interfaces for Workflow Engine
  *
@@ -394,6 +396,11 @@ export interface JobRecord {
   completedAt: Date | null;
   attempt: number;
   maxAttempts: number;
+  retryPolicy?: JobRetryBackoff | null;
+  leaseTimeoutMs?: number | null;
+  leaseExpiresAt?: Date | null;
+  absoluteTimeoutMs?: number | null;
+  absoluteExpiresAt?: Date | null;
   lastError: string | null;
   nextPollAt: Date | null;
   payload: Record<string, unknown>;
@@ -638,6 +645,10 @@ export interface EnqueueJobInput {
   priority?: number;
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
+  leaseTimeoutMs?: number;
+  absoluteTimeoutMs?: number;
+  maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
   /**
    * Fairness group this job belongs to — typically a tenant id. Stored on
    * the payload as `_groupKey`; a transport with fairness enabled presents
@@ -663,6 +674,11 @@ export interface DequeueResult {
   priority: number;
   attempt: number;
   maxAttempts: number;
+  retryPolicy?: JobRetryBackoff;
+  /** Effective lease duration for the claim. */
+  leaseMs?: number;
+  /** This claim uses the host's existing lease and heartbeat settings. */
+  usesHostLease?: true;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp this claim wrote to `startedAt`. Hand it back as a
@@ -670,6 +686,11 @@ export interface DequeueResult {
    * only lands if this attempt is still the current one.
    */
   startedAt: Date;
+}
+
+export interface WorkflowJobLimit {
+  readonly workflowId: string;
+  readonly maxConcurrent: number;
 }
 
 export interface DequeueOptions {
@@ -682,6 +703,10 @@ export interface DequeueOptions {
    * version-ghost deferral is the backstop.
    */
   serves?: readonly ServedDefinition[];
+  /** Caps on RUNNING jobs across hosts serving these workflows. */
+  workflowLimits?: readonly WorkflowJobLimit[];
+  /** Host fallback when the job has no lease override. */
+  leaseTimeoutMs?: number;
 }
 
 /**
@@ -1423,7 +1448,8 @@ export interface JobQueue {
 
   /**
    * Fail every RUNNING job whose claim (`startedAt`, stamped once and never
-   * refreshed) is older than `absoluteTimeoutMs`, stamping `lastError` with
+   * refreshed) is past its recorded deadline or, without one, older than
+   * `absoluteTimeoutMs`, stamping `lastError` with
    * the `LEASE_ABSOLUTE_CAP` prefix; returns how many. The coarse tier of a
    * two-tier expiry: `releaseStaleJobs` is the fine-grained heartbeat
    * signal and is defeated by a worker that is alive but wedged, because
@@ -1431,6 +1457,9 @@ export interface JobQueue {
    * does not implement it simply has no absolute cap.
    */
   expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
+
+  /** Fail RUNNING jobs with overdue explicit deadlines when the host has no default cap. */
+  expireExplicitDeadlines?(): Promise<number>;
 
   /**
    * Cancel all pending/suspended jobs for a workflow run.
@@ -1444,14 +1473,17 @@ export interface JobQueue {
    * treat a FAILED stage with a queued retry as terminal) and to find
    * orphaned SUSPENDED job rows or PENDING stages missing a queued job.
    */
-  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+  getJobsByWorkflowRun(
+    workflowRunId: string,
+    options?: { includePayload?: boolean },
+  ): Promise<JobRecord[]>;
 
   /**
    * Refresh a running job's lease (`lockedAt`) without changing status.
    * Called periodically by hosts while a long-running stage executes so
    * `releaseStaleJobs` doesn't duplicate work still in-flight.
    */
-  touchJob(jobId: string): Promise<void>;
+  touchJob(jobId: string, leaseMs?: number, fence?: JobAckFence): Promise<void>;
 
   /**
    * Optional. Jobs in each active status and the creation time of the oldest

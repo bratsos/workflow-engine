@@ -111,6 +111,7 @@ class MyCustomJobQueue implements JobQueue {
   async defer(jobId: string, nextPollAt: Date, reason: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... } // optional, see below
   async releaseStaleJobs(staleThresholdMs?: number): Promise<number> { ... }
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> { ... } // optional, absolute lease tier
+  async expireExplicitDeadlines(): Promise<number> { ... } // optional, used with a zero host fallback
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
@@ -188,14 +189,12 @@ persistence reference.
 
 #### Two-tier lease expiry
 
-`releaseStaleJobs` compares `lockedAt`, which `touchJob` refreshes, so it detects
-a worker that *stopped*. It cannot detect a worker that is alive but wedged — a
-hung request with no timeout, an infinite loop — because that worker keeps
-heartbeating and holds the job forever. `expireRunawayJobs(absoluteTimeoutMs)` is
-the coarse backstop: it compares `startedAt`, stamped once per claim and
-refreshed by nothing, and fails the job terminally rather than requeueing it (a
-job that hung for the whole cap will hang again). The method is optional on the
-port — an adapter without it simply has no absolute tier.
+`releaseStaleJobs` requeues jobs past their explicit lease deadline. For an
+inherited lease it uses `lockedAt`, which `touchJob` refreshes.
+`expireRunawayJobs(absoluteTimeoutMs)` fails running jobs past their explicit
+absolute deadline. For jobs without one, it uses the host fallback measured
+from `startedAt`. Implement optional `expireExplicitDeadlines()` to enforce
+explicit deadlines when the host fallback is zero.
 
 Write the two outcomes so they can be told apart afterwards: stamp `lastError`
 with the exported `LEASE_HEARTBEAT_LOST` prefix when reclaiming a lease and

@@ -7,3 +7,4 @@ node_modules/
 docs/migrations/migrate-0.11-to-0.12.md
 docs/migrations/migrate-0.12-to-0.13.md
 docs/migrations/migrate-0.13-to-1.0.md
+docs/migrations/job-runtime-controls.md

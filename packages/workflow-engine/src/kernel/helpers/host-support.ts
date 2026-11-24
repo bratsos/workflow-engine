@@ -11,6 +11,12 @@
  */
 
 import { z } from "zod";
+import {
+  type JobRetryBackoff,
+  jobRetryBackoffSchema,
+  positiveInt32,
+  retryBackoffMs,
+} from "../../core/job-runtime.js";
 import { parseStepDuration, StageAbortedError } from "../../core/steps.js";
 import type {
   PurgeableRunStatus,
@@ -144,6 +150,9 @@ export interface HostJobMessage {
   stageId: string;
   attempt: number;
   maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
+  leaseMs?: number;
+  usesHostLease?: true;
   payload: Record<string, unknown>;
   /**
    * The attempt stamp from `DequeueResult`, forwarded as the acknowledgement
@@ -217,14 +226,14 @@ const JobMessageSchema = z.object({
   stageId: z.string().min(1),
   attempt: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().optional(),
+  retryPolicy: jobRetryBackoffSchema.optional(),
+  leaseMs: positiveInt32.optional(),
+  usesHostLease: z.literal(true).optional(),
   payload: z.record(z.string(), z.unknown()),
   startedAt: z.date().optional(),
 });
 
-/** The backoff the built-in transports apply before redelivering a retry. */
-export function retryBackoffMs(attempt: number): number {
-  return 2 ** Math.max(0, attempt) * 1000;
-}
+export { retryBackoffMs };
 
 /**
  * Dispatches `job.execute` for one job, holding a lease heartbeat for its
@@ -302,6 +311,7 @@ export async function executeJobWithHeartbeat(
   // or a lease it no longer holds, aborts `ctx.abortSignal` with the
   // reason — otherwise a long body runs to completion and only its outcome
   // write is rejected.
+  const leaseMs = job.usesHostLease ? undefined : job.leaseMs;
   const abort = new AbortController();
   const beat = async (): Promise<void> => {
     const status = await kernel.dispatch({
@@ -309,6 +319,8 @@ export async function executeJobWithHeartbeat(
       jobId: job.jobId,
       workflowRunId: job.workflowRunId,
       attempt: job.attempt,
+      startedAt: job.startedAt,
+      leaseMs,
     });
     if (abort.signal.aborted) return;
     if (status.runStatus === "CANCELLED") {
@@ -319,7 +331,7 @@ export async function executeJobWithHeartbeat(
   };
   const heartbeat = setInterval(
     () => void beat().catch(() => {}),
-    jobHeartbeatIntervalMs,
+    Math.min(jobHeartbeatIntervalMs, (leaseMs ?? Infinity) / 3),
   );
 
   let result;
@@ -494,7 +506,9 @@ export async function executeJobWithHeartbeat(
     willRetry: canRetry,
     attempt: job.attempt,
     maxAttempts,
-    ...(canRetry ? { retryDelayMs: retryBackoffMs(job.attempt) } : {}),
+    ...(canRetry
+      ? { retryDelayMs: retryBackoffMs(job.attempt, job.retryPolicy) }
+      : {}),
   };
 }
 
@@ -604,7 +618,7 @@ export interface RunMaintenanceTickOptions {
   outboxFlushSignal?: Pick<AbortSignal, "aborted">;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
-  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
+  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the default cap. */
   jobAbsoluteTimeoutMs?: number;
   /**
    * Delete terminal runs older than `retention.olderThanMs` through
@@ -833,6 +847,7 @@ export async function runMaintenanceTick(
   try {
     const reapStuckResult = await kernel.dispatch({
       type: "run.reapStuck",
+      staleLeaseThresholdMs,
       stuckThresholdMs: HOST_DEFAULTS.computeStuckThresholdMs(
         staleLeaseThresholdMs,
       ),

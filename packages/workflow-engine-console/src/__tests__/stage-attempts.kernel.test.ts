@@ -310,13 +310,15 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
     );
     const { workflowRunId: runId } = await h.start("wf", { v: "x" });
     await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
-    await h.kernel.dispatch({
+    const job = await h.jobQueue.dequeue();
+    const result = await h.kernel.dispatch({
       type: "job.execute",
       workflowRunId: runId,
       workflowId: "wf",
       stageId: "nap",
       config: {},
     });
+    await h.jobQueue.suspend(job.jobId, result.nextPollAt);
     // Past the 20 minute poll deadline and one threshold beyond it.
     h.clock.advance(30 * 60_000);
     const reaped = await h.kernel.dispatch({
@@ -1578,13 +1580,15 @@ describe("I want a history shown as available after rows were removed and the ru
         );
         const runId = (await h.start("wf", { v: "x" })).workflowRunId;
         await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
-        await h.kernel.dispatch({
+        const job = await h.jobQueue.dequeue();
+        const result = await h.kernel.dispatch({
           type: "job.execute",
           workflowRunId: runId,
           workflowId: "wf",
           stageId: "nap",
           config: {},
         });
+        await h.jobQueue.suspend(job.jobId, result.nextPollAt);
         h.clock.advance(30 * 60_000);
         await h.kernel.dispatch({
           type: "run.reapStuck",

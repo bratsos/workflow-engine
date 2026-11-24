@@ -12,6 +12,8 @@ This skill activates when a user says things like:
 
 CI loads rows left in flight under every release from `1.0.0-alpha.13` through `1.0.0-alpha.20` through the current SQLite and Postgres adapters, then drives each run to its expected terminal outcome. Coverage includes queued and suspended runs, durable steps, batch work, redrive, parallel stages, and outbox delivery.
 
+For the release introducing workflow job retry, lease, runaway and concurrency options, apply the [job runtime controls upgrade](job-runtime-controls.md).
+
 The router's job is to figure out **which migration guides to apply**, in order, given the version delta. The user should already have run their package manager's upgrade command before invoking this — if not, ask them to do that first or do it for them. See "Package manager reference" below for the right command per ecosystem.
 
 ## Step 0 — Detect the project layout

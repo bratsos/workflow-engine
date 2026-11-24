@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { JobRetry } from "../core/job-runtime.js";
 import { defineStage } from "../core/stage-factory.js";
 import { type StepApi, StepTimeoutError } from "../core/steps.js";
 import { WorkflowBuilder } from "../core/workflow.js";
@@ -64,11 +65,13 @@ describe.skipIf(!realDatabase)(
     async function start(
       execute: (step: StepApi) => Promise<string>,
       overrides: Partial<KernelConfig> = {},
+      jobRetry?: JobRetry,
     ) {
       const stage = defineStage({
         id: "try",
         name: "Try",
         schemas: { input, output, config: input },
+        jobRetry,
         async execute({ step }) {
           return { output: { branch: await execute(step) } };
         },
@@ -1330,6 +1333,54 @@ describe.skipIf(!realDatabase)(
       await t.execute();
       expect(await t.status()).toBe("COMPLETED");
       expect(await storedOutput(t)).toBe(stored);
+    });
+
+    it.each([
+      { deadline: "upcoming", elapsedDuringReplay: 0, retryDelay: 10_000 },
+      { deadline: "expired", elapsedDuringReplay: 10_100, retryDelay: 2_000 },
+    ])("schedules a failed replay with a 60 s backoff and an $deadline opted-in deadline", async ({
+      elapsedDuringReplay,
+      retryDelay,
+    }) => {
+      let failReplay = false;
+      const t = await start(
+        async (step) => {
+          if (failReplay) {
+            // Simulate an I/O request that fails once its response arrives.
+            clock.advance(elapsedDuringReplay);
+            throw new Error("temporary replay failure");
+          }
+          const answer = await step.waitForSignal("answer", {
+            keepalive: 200,
+            timeout: 10_200,
+            onTimeout: "return",
+          });
+          return outcome(answer);
+        },
+        {},
+        { maxAttempts: 3, backoff: { initialDelayMs: 60_000 } },
+      );
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      failReplay = true;
+      clock.advance(200);
+      await t.tick();
+      const nextPollAt = new Date(clock.now().getTime() + retryDelay);
+      expect(await t.getStage()).toMatchObject({
+        status: "SUSPENDED",
+        errorMessage: "temporary replay failure",
+        nextPollAt,
+      });
+
+      failReplay = false;
+      clock.set(new Date(nextPollAt.getTime() - 1));
+      await t.tick();
+      expect((await t.record())?.status).toBe("pending");
+      clock.set(nextPollAt);
+      await t.tick();
+      expect(await t.status()).toBe("COMPLETED");
+      expect(await storedOutput(t)).toBe("timeout");
     });
 
     it("replays within the claim lease when a worker dies after opening a wait", async () => {

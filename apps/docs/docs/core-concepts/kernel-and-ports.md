@@ -103,7 +103,7 @@ The key kernel commands are:
 * **`lease.reapStale`**: Recovers jobs held by crashed workers (heartbeat tier) and fails jobs past the absolute cap.
 * **`outbox.flush`**: Publishes committed outbox events to the `EventSink` and reports the sink's health.
 * **`plugin.replayDLQ`**: Re-queues dead-lettered outbox events once the sink is back.
-* **`run.reapStuck`**: Automatically fails workflow runs that have ceased database updates.
+* **`run.reapStuck`**: Recovers missing jobs and fails inactive runs once they have no queued job or live lease.
 * **`run.purge`**: Deletes terminal runs by age, run IDs, or tenant. Targeted erasure also removes attributed outbox events, idempotency keys and AI calls. See [Run Retention](../troubleshooting/overview.md#run-retention).
 * **`engine.prune`**: Runs bounded retention for AI calls, expired AI call text, published outbox events, and completed idempotency keys.
 * **`run.listVersions`**: Reports which definition versions still have runs and whether this build serves them.

@@ -720,8 +720,9 @@ export function createSpillingJobTransport(
       return { ...job, payload: await resolvePayload(job.payload) };
     },
 
-    async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
-      const jobs = await transport.getJobsByWorkflowRun(workflowRunId);
+    async getJobsByWorkflowRun(workflowRunId, options): Promise<JobRecord[]> {
+      const jobs = await transport.getJobsByWorkflowRun(workflowRunId, options);
+      if (options?.includePayload === false) return jobs;
       return Promise.all(
         jobs.map(async (job) => ({
           ...job,
@@ -751,8 +752,9 @@ export function createSpillingJobTransport(
       transport.releaseStaleJobs(staleThresholdMs),
     cancelByRun: (workflowRunId: string) =>
       transport.cancelByRun(workflowRunId),
-    touchJob: (jobId: string) => transport.touchJob(jobId),
-    // Both optional methods are forwarded only when the wrapped transport
+    touchJob: (jobId, leaseMs, fence) =>
+      transport.touchJob(jobId, leaseMs, fence),
+    // Optional methods are forwarded only when the wrapped transport
     // has them, so wrapping never claims a capability the inner transport
     // lacks — and never hides one it has.
     ...(transport.expireRunawayJobs
@@ -761,6 +763,9 @@ export function createSpillingJobTransport(
             transport.expireRunawayJobs?.(absoluteTimeoutMs) ??
             Promise.resolve(0),
         }
+      : {}),
+    ...(transport.expireExplicitDeadlines
+      ? { expireExplicitDeadlines: () => transport.expireExplicitDeadlines!() }
       : {}),
     ...(transport.getJobStats
       ? { getJobStats: () => transport.getJobStats!() }

@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from "crypto";
+import { retryBackoffMs } from "../core/job-runtime.js";
 import {
   type DequeueOptions,
   type DequeueResult,
@@ -197,7 +198,10 @@ export class InMemoryJobQueue implements JobQueue {
       startedAt: null,
       completedAt: null,
       attempt: 0,
-      maxAttempts: this.defaultMaxAttempts,
+      leaseTimeoutMs: options.leaseTimeoutMs,
+      absoluteTimeoutMs: options.absoluteTimeoutMs,
+      maxAttempts: options.maxAttempts ?? this.defaultMaxAttempts,
+      ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {}),
       lastError: null,
       nextPollAt: options.scheduledFor ?? null,
       payload: {
@@ -288,12 +292,28 @@ export class InMemoryJobQueue implements JobQueue {
       return seqA - seqB;
     };
 
+    const limits = new Map(
+      options?.workflowLimits?.map((limit) => [
+        limit.workflowId,
+        limit.maxConcurrent,
+      ]),
+    );
+    if (limits.size) {
+      for (const job of this.jobs.values()) {
+        const remaining = limits.get(job.workflowId);
+        if (remaining !== undefined && job.status === "RUNNING") {
+          limits.set(job.workflowId, remaining - 1);
+        }
+      }
+    }
+
     const pendingJobs = Array.from(this.jobs.values())
       .filter(
         (j) =>
           j.status === "PENDING" &&
           (j.nextPollAt === null || j.nextPollAt <= now) &&
-          canServe(j),
+          canServe(j) &&
+          (limits.get(j.workflowId) ?? Infinity) > 0,
       )
       .sort(comparator);
 
@@ -323,6 +343,7 @@ export class InMemoryJobQueue implements JobQueue {
     const job = candidates[0]!;
 
     // Lock the job and increment attempt (matches Prisma dequeue semantics)
+    const leaseMs = job.leaseTimeoutMs ?? options?.leaseTimeoutMs;
     const newAttempt = job.attempt + 1;
     const updated: JobRecord = {
       ...job,
@@ -332,6 +353,14 @@ export class InMemoryJobQueue implements JobQueue {
       startedAt: now,
       updatedAt: now,
       attempt: newAttempt,
+      leaseExpiresAt:
+        job.leaseTimeoutMs == null
+          ? null
+          : new Date(now.getTime() + job.leaseTimeoutMs),
+      absoluteExpiresAt:
+        job.absoluteTimeoutMs == null
+          ? null
+          : new Date(now.getTime() + job.absoluteTimeoutMs),
     };
     this.jobs.set(job.id, updated);
 
@@ -344,7 +373,16 @@ export class InMemoryJobQueue implements JobQueue {
       priority: job.priority,
       attempt: newAttempt,
       maxAttempts: job.maxAttempts,
+      ...(job.retryPolicy ? { retryPolicy: job.retryPolicy } : {}),
       payload,
+      ...(leaseMs !== undefined
+        ? {
+            leaseMs,
+            ...(job.leaseTimeoutMs == null
+              ? { usesHostLease: true as const }
+              : {}),
+          }
+        : {}),
       startedAt: now,
     };
   }
@@ -500,6 +538,13 @@ export class InMemoryJobQueue implements JobQueue {
         ...job,
         status: "PENDING",
         lastError: error,
+        ...(job.retryPolicy
+          ? {
+              nextPollAt: new Date(
+                now.getTime() + retryBackoffMs(job.attempt, job.retryPolicy),
+              ),
+            }
+          : {}),
         workerId: null,
         lockedAt: null,
         updatedAt: now,
@@ -528,8 +573,9 @@ export class InMemoryJobQueue implements JobQueue {
     for (const job of this.jobs.values()) {
       if (
         job.status === "RUNNING" &&
-        job.lockedAt &&
-        job.lockedAt < threshold
+        (job.leaseExpiresAt
+          ? job.leaseExpiresAt < now
+          : job.lockedAt && job.lockedAt < threshold)
       ) {
         // Release the stale lock
         const updated: JobRecord = {
@@ -538,6 +584,8 @@ export class InMemoryJobQueue implements JobQueue {
           lastError: reason,
           workerId: null,
           lockedAt: null,
+          leaseExpiresAt: null,
+          absoluteExpiresAt: null,
           updatedAt: now,
         };
         this.jobs.set(job.id, updated);
@@ -554,16 +602,30 @@ export class InMemoryJobQueue implements JobQueue {
    * a worker that is alive but wedged as readily as on one that died.
    */
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    return this.expireJobs(absoluteTimeoutMs);
+  }
+
+  async expireExplicitDeadlines(): Promise<number> {
+    return this.expireJobs();
+  }
+
+  private expireJobs(absoluteTimeoutMs?: number): number {
     const now = this.now();
-    const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
-    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+    const cutoff =
+      absoluteTimeoutMs === undefined
+        ? undefined
+        : new Date(now.getTime() - absoluteTimeoutMs);
+    const reason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
     let expired = 0;
 
     for (const job of this.jobs.values()) {
       if (
         job.status === "RUNNING" &&
-        job.startedAt !== null &&
-        job.startedAt < cutoff
+        (job.absoluteExpiresAt
+          ? job.absoluteExpiresAt < now
+          : cutoff !== undefined &&
+            job.startedAt !== null &&
+            job.startedAt < cutoff)
       ) {
         const updated: JobRecord = {
           ...job,
@@ -606,13 +668,27 @@ export class InMemoryJobQueue implements JobQueue {
       });
   }
 
-  async touchJob(jobId: string): Promise<void> {
+  async touchJob(
+    jobId: string,
+    leaseMs?: number,
+    fence?: JobAckFence,
+  ): Promise<void> {
     const job = this.jobs.get(jobId);
-    if (!job || job.status !== "RUNNING") return;
+    if (
+      !job ||
+      job.status !== "RUNNING" ||
+      (fence &&
+        (job.attempt !== fence.attempt ||
+          job.startedAt?.getTime() !== fence.startedAt.getTime()))
+    )
+      return;
     const now = this.now();
     this.jobs.set(jobId, {
       ...job,
       lockedAt: now,
+      ...(leaseMs !== undefined
+        ? { leaseExpiresAt: new Date(now.getTime() + leaseMs) }
+        : {}),
       updatedAt: now,
     });
   }

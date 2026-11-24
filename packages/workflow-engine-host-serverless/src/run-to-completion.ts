@@ -215,7 +215,10 @@ export async function runToCompletion(
   }
 
   while (claimed && jobsProcessed < maxJobs) {
-    const job = await jobTransport.dequeue();
+    const job = await jobTransport.dequeue({
+      leaseTimeoutMs: HOST_DEFAULTS.staleLeaseThresholdMs,
+      workflowLimits: kernel.workflowJobLimits?.(),
+    });
     if (!job) {
       reason = `no runnable job remained (${jobsProcessed} executed)`;
       break;
@@ -223,16 +226,7 @@ export async function runToCompletion(
 
     const outcome = await executeJobWithHeartbeat(kernel, {
       jobTransport,
-      job: {
-        jobId: job.jobId,
-        workflowRunId: job.workflowRunId,
-        workflowId: job.workflowId,
-        stageId: job.stageId,
-        attempt: job.attempt,
-        maxAttempts: job.maxAttempts,
-        payload: job.payload,
-        startedAt: job.startedAt,
-      },
+      job,
       jobHeartbeatIntervalMs,
       logPrefix,
     });

@@ -24,6 +24,7 @@ const referencesOnGitHub =
 
 /** Guides the site publishes as-is from the skill. */
 export const GENERATED_GUIDES = [
+  "job-runtime-controls.md",
   "migrate-0.11-to-0.12.md",
   "migrate-0.12-to-0.13.md",
   "migrate-0.13-to-1.0.md",

@@ -449,6 +449,9 @@ export interface JobTransport {
    */
   expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
 
+  /** Fail RUNNING jobs with overdue explicit deadlines when the host has no default cap. */
+  expireExplicitDeadlines?(): Promise<number>;
+
   /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
   cancelByRun(workflowRunId: string): Promise<number>;
 
@@ -456,10 +459,13 @@ export interface JobTransport {
    * Get all job rows for a workflow run (any status). Used to detect
    * pending/in-flight retries for a stage and to find orphaned job rows.
    */
-  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+  getJobsByWorkflowRun(
+    workflowRunId: string,
+    options?: { includePayload?: boolean },
+  ): Promise<JobRecord[]>;
 
   /** Refresh a running job's lease without changing status. */
-  touchJob(jobId: string): Promise<void>;
+  touchJob(jobId: string, leaseMs?: number, fence?: JobAckFence): Promise<void>;
 
   /**
    * Optional. Jobs in each active status and the creation time of the oldest

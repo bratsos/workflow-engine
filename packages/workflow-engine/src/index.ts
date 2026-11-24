@@ -7,6 +7,11 @@
 // The AI SDK error an adapter should throw so `ctx.step.ai.map` repairs the
 // item instead of counting the call against `realtime.retries`.
 export { NoObjectGeneratedError } from "ai";
+export type {
+  JobRetry,
+  JobRetryBackoff,
+  JobRuntimeOptions,
+} from "./core/job-runtime";
 export { NoInputSchema } from "./core/schema-helpers";
 export { type Stage } from "./core/stage";
 export {

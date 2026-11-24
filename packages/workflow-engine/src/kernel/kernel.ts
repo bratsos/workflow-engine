@@ -37,6 +37,7 @@ import type {
   CreateOutboxEventInput,
   ServedDefinition,
   WorkflowAnnotationRecord,
+  WorkflowJobLimit,
 } from "../persistence/interface";
 import type {
   CommandResult,
@@ -249,6 +250,7 @@ export interface Kernel {
    * do this work" is made once and applied in every query that takes work.
    */
   servedDefinitions(): readonly ServedDefinition[] | undefined;
+  workflowJobLimits?(): readonly WorkflowJobLimit[] | undefined;
 }
 
 // ============================================================================
@@ -881,5 +883,13 @@ export function createKernel(config: KernelConfig): Kernel {
       return boundedAIFlush(async (opts) => logger.flush?.(opts), timeoutMs);
     },
     servedDefinitions: () => servedDefinitions(config.registry),
+    workflowJobLimits: () =>
+      config.registry
+        .listWorkflows?.()
+        .flatMap(({ id, maxConcurrent }) =>
+          maxConcurrent === undefined
+            ? []
+            : [{ workflowId: id, maxConcurrent }],
+        ),
   };
 }

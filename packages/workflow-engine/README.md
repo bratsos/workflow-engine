@@ -397,25 +397,35 @@ model WorkflowAnnotation {
 }
 
 model JobQueue {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  workflowRunId String
-  stageId       String
-  status        Status    @default(PENDING)
-  priority      Int       @default(5)
-  attempt       Int       @default(0)
-  maxAttempts   Int       @default(3)
-  workerId      String?
-  lockedAt      DateTime?
-  startedAt     DateTime?
-  completedAt   DateTime?
-  nextPollAt    DateTime?
-  payload       Json?
-  lastError     String?
+  id                 String    @id @default(cuid())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  workflowRunId      String
+  stageId            String
+  status             Status    @default(PENDING)
+  priority           Int       @default(5)
+  attempt            Int       @default(0)
+  maxAttempts        Int       @default(3)
+  workerId           String?
+  lockedAt           DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  nextPollAt         DateTime?
+  payload            Json?
+  lastError          String?
+  workflowId         String?
+  retryPolicy        Json?
+  leaseTimeoutMs     Int?
+  leaseExpiresAt     DateTime?
+  absoluteTimeoutMs  Int?
+  absoluteExpiresAt  DateTime?
 
-  // One job row per stage per run: run.redrive retires the rows of the
-  // stages it supersedes and every enqueue path is idempotent on this pair.
+  // One job row per stage per run. `run.redrive` retires the rows of the
+  // stages it replaces or reopens, and every enqueue path is idempotent on
+  // this pair, so
+  // the invariant is declared here rather than left implicit. Adding it to
+  // an existing database requires collapsing any duplicate rows first --
+  // see the 0.13 -> 1.0 migration guide.
   @@unique([workflowRunId, stageId])
   // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
@@ -437,6 +447,9 @@ model JobQueue {
   // the status to find it.
   @@index([status, createdAt])
   @@index([nextPollAt])
+  @@index([status, leaseExpiresAt])
+  @@index([status, absoluteExpiresAt])
+  @@index([status, workflowId])
   @@map("job_queue")
 }
 

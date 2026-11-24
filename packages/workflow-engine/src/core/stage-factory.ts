@@ -31,6 +31,7 @@
  */
 
 import type { z } from "zod";
+import { type JobRuntimeOptions, jobRuntimeSchema } from "./job-runtime";
 import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
 import {
@@ -188,7 +189,7 @@ export interface SyncStageDefinition<
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
   TId extends string = string,
-> {
+> extends JobRuntimeOptions {
   /** Unique stage identifier */
   id: TId;
   /** Human-readable name */
@@ -447,6 +448,7 @@ function buildStage<
     description: definition.description,
     mode: isAsyncBatch ? "async-batch" : "sync",
     dependencies: definition.dependencies,
+    ...jobRuntimeSchema.parse(definition),
 
     inputSchema: inputSchema as any,
     outputSchema: definition.schemas.output,

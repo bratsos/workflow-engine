@@ -6,7 +6,16 @@ interface Binding {
   client: EnginePrismaClient;
 }
 
-const bindings = new WeakMap<Persistence, Binding>();
+// A transparent wrapper over a scoped persistence must keep the same read
+// connection. The token identifies the scope without exposing its client.
+const bindingToken = Symbol("SQLite transaction read scope");
+const bindings = new WeakMap<object, Binding>();
+
+function bindingOf(persistence: Persistence): Binding | undefined {
+  const token = Object.getOwnPropertyDescriptor(persistence, bindingToken)
+    ?.value as object | undefined;
+  return token && bindings.get(token);
+}
 
 /** Internal scope association; neither the persistence nor its read facades expose the client. */
 export function registerSqliteTransaction(
@@ -15,10 +24,12 @@ export function registerSqliteTransaction(
   root: object,
   client: EnginePrismaClient,
 ): () => void {
-  const binding = { root: bindings.get(parent)?.root ?? root, client };
-  bindings.set(persistence, binding);
+  const token = {};
+  const binding = { root: bindingOf(parent)?.root ?? root, client };
+  Object.defineProperty(persistence, bindingToken, { value: token });
+  bindings.set(token, binding);
   return () => {
-    if (bindings.get(persistence) === binding) bindings.delete(persistence);
+    bindings.delete(token);
   };
 }
 
@@ -54,7 +65,7 @@ export function sqliteTransactionReads<R extends Reads>(
   client: object,
   read: (tx: EnginePrismaClient) => R | undefined,
 ): R | undefined {
-  const binding = bindings.get(persistence);
+  const binding = bindingOf(persistence);
   if (!binding || (binding.root !== client && binding.client !== client)) {
     return undefined;
   }
@@ -64,7 +75,7 @@ export function sqliteTransactionReads<R extends Reads>(
     Object.entries(reads).map(([name, fn]) => [
       name,
       async (...args: any[]) => {
-        if (bindings.get(persistence) !== binding) {
+        if (bindingOf(persistence) !== binding) {
           throw Object.assign(
             new Error("SQLite transaction reads are no longer active"),
             {

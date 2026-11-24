@@ -313,23 +313,36 @@ model WorkflowAnnotation {
 
 // 8. Distributed job queue
 model JobQueue {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  workflowRunId String
-  stageId       String
-  status        Status    @default(PENDING)
-  priority      Int       @default(5)
-  attempt       Int       @default(0)
-  maxAttempts   Int       @default(3)
-  workerId      String?
-  lockedAt      DateTime?
-  startedAt     DateTime?
-  completedAt   DateTime?
-  nextPollAt    DateTime?
-  payload       Json?
-  lastError     String?
+  id                 String    @id @default(cuid())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  workflowRunId      String
+  stageId            String
+  status             Status    @default(PENDING)
+  priority           Int       @default(5)
+  attempt            Int       @default(0)
+  maxAttempts        Int       @default(3)
+  workerId           String?
+  lockedAt           DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  nextPollAt         DateTime?
+  payload            Json?
+  lastError          String?
+  workflowId         String?
+  retryPolicy        Json?
+  leaseTimeoutMs     Int?
+  leaseExpiresAt     DateTime?
+  absoluteTimeoutMs  Int?
+  absoluteExpiresAt  DateTime?
 
+  // One job row per stage per run. `run.redrive` retires the rows of the
+  // stages it replaces or reopens, and every enqueue path is idempotent on
+  // this pair, so
+  // the invariant is declared here rather than left implicit. Adding it to
+  // an existing database requires collapsing any duplicate rows first --
+  // see the 0.13 -> 1.0 migration guide.
+  @@unique([workflowRunId, stageId])
   // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
   // @@index([status, priority]) -- a composite whose leading columns are
@@ -350,6 +363,9 @@ model JobQueue {
   // the status to find it.
   @@index([status, createdAt])
   @@index([nextPollAt])
+  @@index([status, leaseExpiresAt])
+  @@index([status, absoluteExpiresAt])
+  @@index([status, workflowId])
   @@map("job_queue")
 }
 
@@ -1254,6 +1270,10 @@ Close the SQLite runtime on shutdown with `await db.close()`.
 Pass `prisma` to the same factories shown above with `{ databaseType: "sqlite" }`. For the console, use `createPrismaConsoleReadPort(prisma, { databaseType: "sqlite" })`; `workflow-console --database-url` still requires `@prisma/client`, so configure the console with `--config` on Prisma 8. SQLite does not implement PostgreSQL's `statement_timeout`; `statementTimeoutMs` does not cancel an SQLite statement.
 
 ---
+
+## Workflow concurrency index
+
+The expression index is required for bounded workflow `maxConcurrent` claims. Install it from `sql/job-workflow-index.postgresql.sql` or `sql/job-workflow-index.sqlite.sql` in the engine package. Run the PostgreSQL file outside a transaction so the index builds concurrently. The SQL upgrade for job runtime controls includes the index. Databases provisioned from a Prisma schema or contract need the matching SQL file. With the index missing, the queue still enforces the cap and warns once per adapter that the fallback can scan the backlog. Restart workers after installing the index so their adapters detect it.
 
 ## Environments
 

@@ -37,6 +37,11 @@ const logger = createLogger("NodeHost");
 // Public interfaces
 // ============================================================================
 
+interface JobSlot {
+  wakePending: boolean;
+  endIdleWait?: () => void;
+}
+
 export interface NodeHostConfig {
   /** Kernel instance to dispatch commands to. */
   kernel: Kernel;
@@ -46,6 +51,9 @@ export interface NodeHostConfig {
 
   /** Unique worker identifier. */
   workerId: string;
+
+  /** Number of jobs this host can execute at once (default: 1). */
+  concurrency?: number;
 
   /**
    * Orchestration poll interval in milliseconds (default: 10_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
@@ -89,7 +97,7 @@ export interface NodeHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
-  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  /** Fallback absolute cap (ms) for jobs without a deadline. Set 0 for no fallback. */
   jobAbsoluteTimeoutMs?: number;
 
   /** Max pending runs to claim per orchestration tick (default: 10). */
@@ -171,6 +179,9 @@ export interface NodeHostConfig {
 
 export interface HostStats {
   workerId: string;
+
+  /** Number of jobs this host can execute at once (default: 1). */
+  concurrency?: number;
   jobsProcessed: number;
   orchestrationTicks: number;
   isRunning: boolean;
@@ -221,10 +232,7 @@ class NodeHostImpl implements NodeHost {
   private tickInFlight: Promise<void> | null = null;
   /** A `wake()` came while a tick ran: one more tick follows it. */
   private tickWakePending = false;
-  /** A `wake()` came since the job loop's current pass began: its next idle wait is skipped. */
-  private jobWakePending = false;
-  /** Ends the job loop's idle wait early; set only while the loop is waiting. */
-  private endIdleWait: (() => void) | null = null;
+  private readonly jobSlots: JobSlot[];
   /** `start()` while it is still verifying the storage, so a second call joins it. */
   private starting: Promise<void> | null = null;
   /** Incremented by every stop(), so a start whose storage check settles after it does not begin. */
@@ -267,6 +275,17 @@ class NodeHostImpl implements NodeHost {
     this.kernel = config.kernel;
     this.jobTransport = config.jobTransport;
     this.workerId = config.workerId;
+    const concurrency = config.concurrency ?? 1;
+    if (
+      !Number.isInteger(concurrency) ||
+      concurrency < 1 ||
+      concurrency > 2_147_483_647
+    ) {
+      throw new RangeError("concurrency must be a positive 32-bit integer");
+    }
+    this.jobSlots = Array.from({ length: concurrency }, () => ({
+      wakePending: false,
+    }));
     this.orchestrationIntervalMs = assertTimerMs(
       "orchestrationIntervalMs",
       config.orchestrationIntervalMs ?? 10_000,
@@ -358,7 +377,7 @@ class NodeHostImpl implements NodeHost {
     this.running = true;
     this.startTime = Date.now();
     this.tickWakePending = false;
-    this.jobWakePending = false;
+    for (const slot of this.jobSlots) slot.wakePending = false;
 
     // Hand this host's id to the job transport, so `job_queue.workerId`
     // names the same worker `run.claimPending` does. A transport built
@@ -394,11 +413,15 @@ class NodeHostImpl implements NodeHost {
       this.startOrchestrationTick(lifecycle);
     }
 
-    // Start job processing loop (runs until stop())
     // A timed-out dequeue or job can still be settling from the last start.
-    // Queue its replacement behind it so we never have two job loops.
+    // Wait for those slots before starting a replacement set.
     const loop = (this.jobLoop ?? Promise.resolve())
-      .then(() => this.processJobs(lifecycle))
+      .then(() =>
+        Promise.all(
+          this.jobSlots.map((slot) => this.processJobs(lifecycle, slot)),
+        ),
+      )
+      .then(() => undefined)
       .finally(() => {
         if (this.jobLoop === loop) this.jobLoop = null;
       });
@@ -423,7 +446,7 @@ class NodeHostImpl implements NodeHost {
 
     this.running = false;
     // A job loop parked in its idle wait leaves now, not after jobPollIntervalMs.
-    this.endIdleWait?.();
+    this.wakeJobLoop();
 
     if (this.orchestrationTimer) {
       clearInterval(this.orchestrationTimer);
@@ -642,7 +665,7 @@ class NodeHostImpl implements NodeHost {
   // Job processing loop
   // --------------------------------------------------------------------------
 
-  private async processJobs(lifecycle: number): Promise<void> {
+  private async processJobs(lifecycle: number, slot: JobSlot): Promise<void> {
     // Run of the job this loop completed last, and whether the queue has
     // since handed it work from a different run. Together they separate
     // "I am following the run I just advanced" (yield, so another worker
@@ -654,12 +677,14 @@ class NodeHostImpl implements NodeHost {
 
     while (this.isCurrent(lifecycle)) {
       // A wake from here on is for a pass that has not looked yet.
-      this.jobWakePending = false;
+      slot.wakePending = false;
       try {
         const serves = this.dequeueServes();
-        const job = await this.jobTransport.dequeue(
-          serves !== undefined ? { serves } : undefined,
-        );
+        const job = await this.jobTransport.dequeue({
+          serves,
+          leaseTimeoutMs: this.staleLeaseThresholdMs,
+          workflowLimits: this.kernel.workflowJobLimits?.(),
+        });
         if (!this.isCurrent(lifecycle)) {
           // The dequeue counted an attempt. Give it back instead of leaving
           // the job RUNNING for the reaper, which keeps the attempt.
@@ -670,7 +695,7 @@ class NodeHostImpl implements NodeHost {
         if (!job) {
           lastRunId = null;
           drainingBacklog = false;
-          await this.idleWait(this.jobPollIntervalMs);
+          await this.idleWait(slot, this.jobPollIntervalMs);
           continue;
         }
 
@@ -760,24 +785,26 @@ class NodeHostImpl implements NodeHost {
   }
 
   private wakeJobLoop(): void {
-    this.jobWakePending = true;
-    this.endIdleWait?.();
+    for (const slot of this.jobSlots) {
+      slot.wakePending = true;
+      slot.endIdleWait?.();
+    }
   }
 
   /**
    * The job loop's wait on an empty queue: `ms`, unless a wake came while the
    * loop was busy or comes during the wait, or `stop()` is called.
    */
-  private idleWait(ms: number): Promise<void> {
-    if (this.jobWakePending) return Promise.resolve();
+  private idleWait(slot: JobSlot, ms: number): Promise<void> {
+    if (slot.wakePending) return Promise.resolve();
     return new Promise((resolve) => {
       const end = () => {
         clearTimeout(timer);
-        if (this.endIdleWait === end) this.endIdleWait = null;
+        delete slot.endIdleWait;
         resolve();
       };
       const timer = setTimeout(end, ms);
-      this.endIdleWait = end;
+      slot.endIdleWait = end;
     });
   }
 }

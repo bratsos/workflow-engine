@@ -167,6 +167,38 @@ export function rawFor<C extends EnginePrismaClient>(
   return (prisma.$withColumns?.(columns) as C | undefined) ?? prisma;
 }
 
+/** Execute the same positional statement through either raw-read capability. */
+export function readPrismaSql<T>(
+  prisma: EnginePrismaClient,
+  databaseType: "sqlite" | "postgresql",
+  columns: RawColumns,
+  sql: string,
+  args: readonly unknown[],
+): Promise<T[]> {
+  const client = rawFor(prisma, columns);
+  if (
+    prisma.$queryRawUnsafe &&
+    (databaseType === "postgresql" || prisma.$databaseType === "sqlite")
+  ) {
+    return client.$queryRawUnsafe!<T[]>(sql, ...args);
+  }
+  // A repeated $n binds the same value at each occurrence when a native
+  // SQLite query or a tagged template needs one value per placeholder.
+  const parts = sql.split(/\$(\d+)/);
+  const strings: string[] = [parts[0]!];
+  const values: unknown[] = [];
+  for (let i = 1; i < parts.length; i += 2) {
+    values.push(args[Number(parts[i]) - 1]);
+    strings.push(parts[i + 1]!);
+  }
+  if (prisma.$queryRawUnsafe)
+    return client.$queryRawUnsafe!<T[]>(strings.join("?"), ...values);
+  return client.$queryRaw!<T[]>(
+    Object.assign(strings, { raw: strings }),
+    ...values,
+  );
+}
+
 /** Reject a configured dialect that disagrees with the wrapped client's contract. */
 export function validateDatabaseType(
   prisma: Pick<EnginePrismaClient, "$databaseType">,

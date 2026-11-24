@@ -10,6 +10,7 @@
  * cron triggers) around these methods.
  */
 
+import type { JobRetryBackoff } from "@bratsos/workflow-engine";
 import {
   assertTimerMs,
   createLogger,
@@ -49,7 +50,7 @@ export interface ServerlessHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
-  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  /** Fallback absolute cap (ms) for jobs without a deadline. Set 0 for no fallback. */
   jobAbsoluteTimeoutMs?: number;
 
   /** Max pending runs to claim per maintenance tick (default: 10). */
@@ -139,6 +140,10 @@ export interface JobMessage {
   stageId: string;
   attempt: number;
   maxAttempts?: number;
+  retryPolicy?: JobRetryBackoff;
+  leaseMs?: number;
+  usesHostLease?: true;
+  startedAt?: Date;
   payload: Record<string, unknown>;
 }
 
@@ -160,7 +165,7 @@ export interface JobResult {
   /** The job attempt that ran (1 on the first execution). */
   attempt?: number;
   maxAttempts?: number;
-  /** Backoff before the retry (`2^attempt` seconds), when `willRetry`. */
+  /** Backoff before the retry, when `willRetry`. */
   retryDelayMs?: number;
 }
 
@@ -388,22 +393,16 @@ class ServerlessHostImpl implements ServerlessHost {
 
     while (processed < maxJobs) {
       const serves = this.dequeueServes();
-      const job = await this.jobTransport.dequeue(
-        serves !== undefined ? { serves } : undefined,
-      );
+      const job = await this.jobTransport.dequeue({
+        serves,
+        leaseTimeoutMs: this.staleLeaseThresholdMs,
+        workflowLimits: this.kernel.workflowJobLimits?.(),
+      });
       if (!job) break;
 
       // Storage was checked above. A second check here could throw after the
       // dequeue counted an attempt and leave the job unrun.
-      const result = await this.runJob({
-        jobId: job.jobId,
-        workflowRunId: job.workflowRunId,
-        workflowId: job.workflowId,
-        stageId: job.stageId,
-        attempt: job.attempt,
-        maxAttempts: job.maxAttempts,
-        payload: job.payload,
-      });
+      const result = await this.runJob(job);
 
       processed++;
       if (result.outcome === "failed") {

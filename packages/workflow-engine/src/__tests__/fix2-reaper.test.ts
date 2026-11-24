@@ -66,7 +66,11 @@ describe.skipIf(!realDatabase)(
         workflowId: run.workflowId,
         stageId: pending.stageId,
       });
-      expect(pendingJobId).toBeTruthy();
+      expect((await db.jobTransport.dequeue())?.jobId).toBe(pendingJobId);
+      await db.client.jobQueue.update({
+        where: { id: pendingJobId },
+        data: { lockedAt: terminalAt },
+      });
 
       const suspended = await db.persistence.createStage({
         workflowRunId: run.id,

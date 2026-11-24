@@ -126,7 +126,7 @@ run onto a version you do serve. See
 Both are `lastError` prefixes the lease sweep stamps on `job_queue`, so an operator can tell a reclaimed lease from a stage-level failure.
 
 - **`LEASE_HEARTBEAT_LOST`** — the worker stopped calling `touchJob` for longer than `staleLeaseThresholdMs` (measured from `lockedAt`): it died, or a single body ran longer than the heartbeat could cover. The job went back to `PENDING` for another worker. On Postgres the lease runs on the database clock, so a host with a skewed system clock is not the cause.
-- **`LEASE_ABSOLUTE_CAP`** — the claim held its lease past `jobAbsoluteTimeoutMs` (default one hour, measured from `startedAt`, which no heartbeat refreshes): a worker that was alive but wedged. The job is failed terminally, because a job that hung for the whole cap will hang again. Raise the cap for a stage that legitimately runs longer; `0` disables the tier.
+- **`LEASE_ABSOLUTE_CAP`** — the job failed terminally after its explicit absolute deadline or the host fallback `jobAbsoluteTimeoutMs` (default one hour), measured from `startedAt`. Set `0` for no fallback. Explicit deadlines still apply.
 
 The body that lost its lease learns of it through `ctx.abortSignal` (a `StageAbortedError` with `reason: "lease-lost"`) on the next heartbeat; its outcome, if it finishes anyway, is discarded as `"superseded"` by the fenced acknowledgement. A `run.cancel` aborts the same signal with `reason: "cancelled"`. Use `stageAbortReason(signal)` to read it.
 
@@ -188,7 +188,7 @@ The orchestration tick runs these steps in order, each independently:
 |------|---------|---------|
 | 1 | `run.claimPending` | Find PENDING runs, create stages, enqueue jobs |
 | 2 | `stage.pollSuspended` | Check suspended stages for readiness, trigger transitions |
-| 3 | `lease.reapStale` | Release job leases from crashed workers (heartbeat tier) and fail runaway jobs past `jobAbsoluteTimeoutMs` (absolute tier) |
+| 3 | `lease.reapStale` | Release job leases from crashed workers (heartbeat tier) and fail jobs past an explicit deadline or the host fallback (absolute tier) |
 | 4 | `outbox.flush` | Publish pending events through EventSink; reports `eventSinkStatus: "degraded"` when the sink refused an event |
 | 5 | `run.reapStuck` | Fail RUNNING runs with no recent activity |
 | 6 | `run.purge` | Opt-in (`retention` host option): delete terminal runs past their retention age — see "Run Retention" below |
