@@ -48,3 +48,8 @@ CREATE INDEX IF NOT EXISTS "outbox_events_prune_idx" ON "outbox_events" ("publis
 -- statement-breakpoint
 CREATE INDEX IF NOT EXISTS "idempotency_keys_prune_idx" ON "idempotency_keys" ("createdAt")
   WHERE json_extract("result", '$.__workflowEngineState') IS NOT 'in_progress';
+-- statement-breakpoint
+-- Run writer registrations are in progress, so the index above never holds
+-- them; this one lets pruning find those whose lease lapsed.
+CREATE INDEX IF NOT EXISTS "idempotency_keys_writer_prune_idx" ON "idempotency_keys" ("createdAt")
+  WHERE "commandType" = 'run.write';

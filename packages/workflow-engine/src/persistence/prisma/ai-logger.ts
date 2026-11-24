@@ -1,5 +1,10 @@
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
-import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
+import {
+  prefixRange,
+  pruneRows,
+  RetentionIndexes,
+  writeRetentionSql,
+} from "./retention-sql.js";
 import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
@@ -162,6 +167,7 @@ export interface PrismaAICallLoggerOptions {
 export class PrismaAICallLogger implements AICallLogger {
   private readonly databaseType: DatabaseType;
   private readonly writes = new AICallWriteTracker();
+  private readonly retentionIndexes: RetentionIndexes;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -174,6 +180,10 @@ export class PrismaAICallLogger implements AICallLogger {
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
+    this.retentionIndexes = new RetentionIndexes(
+      this.prisma,
+      this.databaseType,
+    );
   }
 
   #trackWrite(
@@ -550,11 +560,19 @@ export class PrismaAICallLogger implements AICallLogger {
       "aiCalls",
       olderThan,
       limit,
+      this.retentionIndexes,
     );
   }
 
   async clearExpiredText(now: Date, limit: number): Promise<number> {
-    return pruneRows(this.prisma, this.databaseType, "aiCallText", now, limit);
+    return pruneRows(
+      this.prisma,
+      this.databaseType,
+      "aiCallText",
+      now,
+      limit,
+      this.retentionIndexes,
+    );
   }
 }
 

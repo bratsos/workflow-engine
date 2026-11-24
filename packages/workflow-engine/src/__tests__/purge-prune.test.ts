@@ -20,13 +20,19 @@ import { SUPERSEDED_ATTEMPT_KEY } from "../kernel/handlers/run-redrive.js";
 import { runMaintenanceTick } from "../kernel/helpers/host-support.js";
 import { RUN_WRITE_LEASE_MS } from "../persistence/interface.js";
 import {
+  createPrismaAICallLogger,
   createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   fromPrisma8,
 } from "../persistence/prisma/index.js";
-import { writeRetentionSql } from "../persistence/prisma/retention-sql.js";
+import { rawFor } from "../persistence/prisma/prisma-client-type.js";
+import {
+  pruneRows,
+  RetentionIndexes,
+  writeRetentionSql,
+} from "../persistence/prisma/retention-sql.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -61,6 +67,10 @@ function hold() {
 describe.skipIf(!realDatabase)("run erasure and retention", () => {
   let db: KernelDatabase;
   let sibling: any;
+  let writerIndexDdl = "";
+  const options = {
+    databaseType: sqlite ? ("sqlite" as const) : ("postgresql" as const),
+  };
   beforeAll(async () => {
     db = await kernelDatabase();
     const fixture = createRequire(import.meta.url)(
@@ -95,6 +105,8 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     );
     for (const statement of eligibility.split("-- statement-breakpoint")) {
       await db.client.$executeRawUnsafe(statement.trim());
+      if (statement.includes("idempotency_keys_writer_prune_idx"))
+        writerIndexDdl = statement.trim();
     }
   });
   beforeEach(() => db.reset());
@@ -613,11 +625,20 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     ).rejects.toMatchObject({ code: 77 });
     // The key named only the job, so it went before the job did.
     expect(await db.client.jobQueue.count()).toBe(0);
-    expect(await db.client.idempotencyKey.count()).toBe(0);
+    // Only the mark of the erasure that was under way is left.
+    expect(
+      (await db.client.idempotencyKey.findMany()).map(
+        (key: { commandType: string }) => key.commandType,
+      ),
+    ).toEqual(["run.erase"]);
     expect(
       await kernel().dispatch({ type: "run.purge", workflowRunIds: [id] }),
-    ).toMatchObject({ removed: { runs: 1 }, incomplete: [] });
+    ).toMatchObject({
+      removed: { runs: 1, idempotencyKeys: 0 },
+      incomplete: [],
+    });
     expect(await db.client.workflowRun.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
   }, 30_000);
 
   it("keeps a written run from the age sweep and erases what the sweep leaves", async () => {
@@ -699,6 +720,49 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
     }
     expect(await db.client.aICall.count()).toBe(0);
     expect(await db.client.workflowBlob.count()).toBe(0);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it("does not revive a lapsed lease, so a stalled writer cannot write into an erasure under way", async () => {
+    const { id } = await db.seed();
+    const gate = hold();
+    const worker = pausingWorker(gate);
+    const executing = worker.execute(id).catch(() => {});
+    await gate.reached;
+    const listing = hold();
+    // Erasure saw no writer and is in its external phase, past the listing.
+    const erasing = db.makeKernel({
+      services: { aiLogger: db.aiLogger },
+      blobStore: override(db.blobStore, {
+        async list(prefix) {
+          const keys = await db.blobStore.list(prefix);
+          await listing.pause();
+          return keys;
+        },
+      }),
+    });
+    let erased: Promise<unknown> | undefined;
+    try {
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      vi.setSystemTime(Date.now() + RUN_WRITE_LEASE_MS + 1000);
+      erased = erasing.dispatch({ type: "run.purge", workflowRunIds: [id] });
+      await listing.reached;
+      // The stalled writer resumes while its lapsed registration still exists.
+      gate.release();
+      await executing;
+    } finally {
+      gate.release();
+      listing.release();
+      await executing;
+      vi.useRealTimers();
+    }
+    expect(await erased).toMatchObject({
+      removed: { runs: 1 },
+      incomplete: [],
+    });
+    expect(await db.client.workflowBlob.count()).toBe(0);
+    expect(await db.client.aICall.count()).toBe(0);
     expect(await db.client.idempotencyKey.count()).toBe(0);
   });
 
@@ -1158,5 +1222,503 @@ describe.skipIf(!realDatabase)("run erasure and retention", () => {
       ),
     ).toEqual(["dlq", "live", "pending"]);
     expect(await db.client.idempotencyKey.count()).toBe(1);
+  });
+
+  it("prunes the registrations of writers that stopped refreshing them", async () => {
+    const live = await db.seed();
+    const dialect = sqlite ? "sqlite" : "postgresql";
+    const numbers = sqlite
+      ? "(WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 10000) SELECT n FROM numbers)"
+      : "generate_series(1,10000) AS numbers(n)";
+    const created = (at: Date) => (sqlite ? at : at.toISOString());
+    const stamp = sqlite ? "$2" : "$2::timestamp";
+    // Registrations that still count, and keys that are in progress, are
+    // an old backlog that holds nothing eligible.
+    await writeRetentionSql(
+      db.client,
+      dialect,
+      `INSERT INTO "idempotency_keys" ("id","key","commandType","workflowRunId","createdAt","result")
+        SELECT 'live-' || n, 'live-' || n, 'run.write', $1, ${stamp}, '{"__workflowEngineState":"in_progress"}'
+        FROM ${numbers}`,
+      [live.id, created(new Date())],
+    );
+    const busy = {
+      commandType: "job.execute",
+      createdAt: old,
+      result: { __workflowEngineState: "in_progress" },
+    };
+    await db.client.idempotencyKey.createMany({
+      data: [
+        { ...busy, key: "busy" },
+        { ...busy, key: "completed", result: {} },
+        {
+          ...busy,
+          key: "abandoned",
+          commandType: "run.write",
+          workflowRunId: live.id,
+          createdAt: new Date(Date.now() - 11 * RUN_WRITE_LEASE_MS),
+        },
+      ],
+    });
+    const command = {
+      type: "engine.prune",
+      limit: 1,
+      idempotencyKeys: { olderThan: cutoff },
+    } as const;
+    // One limit for the clause: the completed key first, then the writer.
+    for (const removed of [1, 1, 0]) {
+      expect(await kernel().dispatch(command)).toMatchObject({
+        idempotencyKeys: removed,
+      });
+    }
+    expect(await db.client.idempotencyKey.count()).toBe(10001);
+    expect(
+      await db.client.idempotencyKey.count({ where: { key: "busy" } }),
+    ).toBe(1);
+  });
+
+  it.skipIf(!sqlite)(
+    "keeps every prune statement on its primary key after statistics taken on near-empty tables",
+    async () => {
+      const live = await db.seed();
+      await seedCall("first", { createdAt: old, textExpiresAt: cutoff });
+      await db.client.outboxEvent.create({
+        data: {
+          id: "first",
+          workflowRunId: live.id,
+          sequence: 1,
+          eventType: "test",
+          payload: {},
+          causationId: "test",
+          occurredAt: old,
+          publishedAt: old,
+        },
+      });
+      await db.client.idempotencyKey.create({
+        data: { key: "first", commandType: "run.write", result: {} },
+      });
+      await db.client.$executeRawUnsafe("ANALYZE");
+      const numbers =
+        "(WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 100000) SELECT n FROM numbers)";
+      const bulk = (sql: string) =>
+        writeRetentionSql(db.client, "sqlite", sql, [live.id, old]);
+      try {
+        await bulk(
+          `INSERT INTO "ai_calls" ("id","topic","callType","modelKey","modelId","prompt","response","inputTokens","outputTokens","cost","createdAt","textExpiresAt")
+          SELECT 'bulk-' || n, 'test', 'text', 'm', 'm', '', '', 1, 1, 0, $2, $2 FROM ${numbers}`,
+        );
+        await bulk(
+          `INSERT INTO "outbox_events" ("id","workflowRunId","sequence","eventType","payload","causationId","occurredAt","publishedAt")
+          SELECT 'bulk-' || n, $1, n + 1, 'test', '{}', 'test', $2, $2 FROM ${numbers}`,
+        );
+        await bulk(
+          `INSERT INTO "idempotency_keys" ("id","key","commandType","workflowRunId","createdAt","result")
+          SELECT 'bulk-' || n, 'bulk-' || n, 'run.write', $1, $2, '{"__workflowEngineState":"in_progress"}' FROM ${numbers}`,
+        );
+        const scans: Record<string, string> = {};
+        for (const clause of [
+          "aiCalls",
+          "aiCallText",
+          "outbox",
+          "idempotencyKeys",
+          "runWriters",
+        ] as const) {
+          const sent: { sql: string; args: unknown[] }[] = [];
+          await pruneRows(
+            {
+              $databaseType: "sqlite",
+              $executeRawUnsafe: async (sql: string, ...args: unknown[]) => {
+                sent.push({ sql, args });
+                return 0;
+              },
+            } as any,
+            "sqlite",
+            clause,
+            cutoff,
+            1,
+            new RetentionIndexes(db.client, "sqlite"),
+          );
+          // The bound values are written in, as the plan does not depend on them.
+          const statement = sent[0]!.sql.replace(/\$(\d+)/g, (_, n) =>
+            JSON.stringify(Number(sent[0]!.args[Number(n) - 1])),
+          );
+          const plan = (
+            await rawFor(db.client, { detail: "text" }).$queryRawUnsafe(
+              `EXPLAIN QUERY PLAN ${statement}`,
+            )
+          )
+            .map((row: any) => String(row.detail))
+            .join("\n");
+          if (/\bSCAN\b/.test(plan)) scans[clause] = plan;
+        }
+        expect(scans).toEqual({});
+      } finally {
+        await db.client.$executeRawUnsafe("DELETE FROM sqlite_stat1");
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(!sqlite)(
+    "prunes AI calls on a table without the age indexes with plain statements",
+    async () => {
+      const known = await new RetentionIndexes(db.client, "sqlite").of(
+        "ai_calls",
+      );
+      const dropped = [...known.led].filter(([column]) =>
+        ["createdAt", "textExpiresAt"].includes(column),
+      );
+      expect(dropped).toHaveLength(2);
+      for (const [, name] of dropped)
+        await db.client.$executeRawUnsafe(`DROP INDEX "${name}"`);
+      try {
+        await seedCall("old", { createdAt: old });
+        await seedCall("text", {
+          textExpiresAt: cutoff,
+          metadata: { instructions: "instruction" },
+        });
+        const worker = db.makeKernel({
+          services: { aiLogger: createPrismaAICallLogger(db.client, options) },
+        });
+        expect(
+          await worker.dispatch({
+            type: "engine.prune",
+            aiCalls: { olderThan: cutoff },
+            aiCallText: { now: cutoff },
+          }),
+        ).toMatchObject({ aiCalls: 1, aiCallText: 1 });
+      } finally {
+        for (const [column, name] of dropped)
+          await db.client.$executeRawUnsafe(
+            `CREATE INDEX "${name}" ON "ai_calls" ("${column}")`,
+          );
+      }
+    },
+  );
+
+  it.skipIf(!sqlite)(
+    "reads the primary-key and age indexes from the table, not from their names",
+    async () => {
+      const scratch = [
+        `CREATE TABLE "scratch_text" ("a" TEXT UNIQUE, "id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME)`,
+        `CREATE INDEX "scratch_text_by_age" ON "scratch_text" ("createdAt")`,
+        `CREATE TABLE "scratch_rowid" ("id" INTEGER PRIMARY KEY, "createdAt" DATETIME)`,
+        `CREATE TABLE "scratch_keys" ("id" TEXT NOT NULL PRIMARY KEY, "commandType" TEXT, "createdAt" DATETIME)`,
+        `CREATE INDEX "scratch_other" ON "scratch_keys" ("createdAt") WHERE "commandType" = 'job.execute'`,
+        `CREATE INDEX "scratch_writers" ON "scratch_keys" ("createdAt") WHERE "commandType" = 'run.write'`,
+      ];
+      try {
+        for (const statement of scratch)
+          await db.client.$executeRawUnsafe(statement);
+        const indexes = new RetentionIndexes(db.client, "sqlite");
+        // A UNIQUE column before the key numbers the key's index 2.
+        expect(await indexes.of("scratch_text")).toMatchObject({
+          primaryKey: "sqlite_autoindex_scratch_text_2",
+          led: new Map([
+            ["a", "sqlite_autoindex_scratch_text_1"],
+            ["createdAt", "scratch_text_by_age"],
+          ]),
+        });
+        // A rowid alias has no index to name.
+        expect((await indexes.of("scratch_rowid")).primaryKey).toBeUndefined();
+        expect(await indexes.of("scratch_keys")).toMatchObject({
+          primaryKey: "sqlite_autoindex_scratch_keys_1",
+          writers: "scratch_writers",
+        });
+        expect((await indexes.of("no_such_table")).primaryKey).toBeUndefined();
+      } finally {
+        for (const table of ["scratch_text", "scratch_rowid", "scratch_keys"])
+          await db.client.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}"`);
+      }
+    },
+  );
+
+  it("prunes keys without the run writer index as before, and the writers once it exists", async () => {
+    const live = await db.seed();
+    await db.client.idempotencyKey.createMany({
+      data: [
+        {
+          key: "completed",
+          commandType: "job.execute",
+          createdAt: old,
+          result: {},
+        },
+        {
+          key: "abandoned",
+          commandType: "run.write",
+          workflowRunId: live.id,
+          createdAt: new Date(Date.now() - 11 * RUN_WRITE_LEASE_MS),
+          result: { __workflowEngineState: "in_progress" },
+        },
+      ],
+    });
+    await db.client.$executeRawUnsafe(
+      `DROP INDEX "idempotency_keys_writer_prune_idx"`,
+    );
+    try {
+      const bare = createPrismaWorkflowPersistence(db.client, options);
+      expect(await bare.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+      expect(await bare.pruneIdempotencyKeys(cutoff, 10)).toBe(0);
+      expect(await db.client.idempotencyKey.count()).toBe(1);
+    } finally {
+      await db.client.$executeRawUnsafe(writerIndexDdl);
+    }
+    const installed = createPrismaWorkflowPersistence(db.client, options);
+    expect(await installed.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+    expect(await db.client.idempotencyKey.count()).toBe(0);
+  });
+
+  it("leaves a registration that only a host with a fast clock sees as lapsed", async () => {
+    const { id } = await db.seed();
+    let now = Date.now();
+    const host = (at: () => number) =>
+      createPrismaWorkflowPersistence(db.client, {
+        ...options,
+        now: () => new Date(at()),
+      });
+    const writerHost = host(() => now);
+    const fastHost = host(() => now + 40_001);
+    expect(await writerHost.beginRunWrite!(id, "live")).toBe(true);
+    expect(
+      await host(() => Date.now() - 11 * RUN_WRITE_LEASE_MS).beginRunWrite!(
+        id,
+        "abandoned",
+      ),
+    ).toBe(true);
+    // One heartbeat later the writer's own lease holds, and the fast host
+    // sees the registration 60,001 ms old.
+    now += 20_000;
+    expect(await writerHost.hasRunWriters!(id)).toBe(true);
+    expect(await fastHost.pruneIdempotencyKeys(cutoff, 10)).toBe(1);
+    expect(await writerHost.refreshRunWrite!("live")).toBe(true);
+    expect(await db.client.idempotencyKey.count()).toBe(1);
+  });
+
+  describe("a signal sender", () => {
+    const payload = { text: "x".repeat(70_000) };
+    const signal = (id: string) =>
+      ({
+        type: "step.signal",
+        workflowRunId: id,
+        stageId: "first",
+        stepId: "answer",
+        payload,
+      }) as const;
+    const erase = (id: string) =>
+      ({ type: "run.purge", workflowRunIds: [id] }) as const;
+    const leftovers = async () => ({
+      blobs: await db.client.workflowBlob.count(),
+      steps: await db.client.workflowStep.count(),
+      keys: await db.client.idempotencyKey.count(),
+      events: await db.client.outboxEvent.count(),
+    });
+
+    it("holds erasure off until its spilled payload is stored", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      const gate = hold();
+      const sender = db.makeKernel({
+        blobStore: override(db.blobStore, {
+          async put(key, data) {
+            await gate.pause();
+            return db.blobStore.put(key, data);
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      let result: unknown;
+      try {
+        await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+        expect(await kernel().dispatch(erase(id))).toMatchObject({
+          removed: { runs: 0 },
+          incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+        });
+      } finally {
+        gate.release();
+        result = await sending.catch((error) => error);
+      }
+      expect(result).toMatchObject({ signalled: true });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual({
+        blobs: 0,
+        steps: 0,
+        keys: 0,
+        events: 0,
+      });
+    });
+
+    const empty = { blobs: 0, steps: 0, keys: 0, events: 0 };
+    const answers = [
+      { signalled: true, ok: true, alreadyCompleted: false },
+      { signalled: true, ok: true, alreadyCompleted: true },
+    ];
+
+    it.each([
+      "completed",
+      "failed",
+      "cancelled",
+    ] as const)("answers the same signal sent twice to a %s run as to a live one, and erases with it", async (ending) => {
+      // What a live run answers is what a run that has ended always answered.
+      const control = await db.seed("RUNNING", "SUSPENDED");
+      const worker = kernel();
+      expect([
+        await worker.dispatch(signal(control.id)),
+        await worker.dispatch(signal(control.id)),
+      ]).toEqual(answers);
+      await worker.dispatch({ type: "run.cancel", workflowRunId: control.id });
+      expect(await worker.dispatch(erase(control.id))).toMatchObject({
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      if (ending === "cancelled") {
+        await worker.dispatch({ type: "run.cancel", workflowRunId: id });
+      } else {
+        await db.client.workflowRun.update({
+          where: { id },
+          data: { status: ending === "failed" ? "FAILED" : "COMPLETED" },
+        });
+      }
+      expect(await worker.dispatch(signal(id))).toEqual(answers[0]);
+      // The signal's own writes: its step, the spilled payload and the wake.
+      const written = await leftovers();
+      expect(written).toMatchObject({ blobs: 1, steps: 1 });
+      expect(await worker.dispatch(signal(id))).toEqual(answers[1]);
+      expect(await leftovers()).toEqual(written);
+      // Registered while it wrote and released, it leaves erasure nothing.
+      expect(await worker.dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+    });
+
+    it("holds erasure off a late signal to an ended run until its spilled payload is stored", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      const gate = hold();
+      const sender = db.makeKernel({
+        blobStore: override(db.blobStore, {
+          async put(key, data) {
+            await gate.pause();
+            return db.blobStore.put(key, data);
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      try {
+        expect(await kernel().dispatch(erase(id))).toMatchObject({
+          removed: { runs: 0 },
+          incomplete: [{ workflowRunId: id, failed: ["writers"] }],
+        });
+      } finally {
+        gate.release();
+      }
+      expect(await sending).toEqual(answers[0]);
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1, blobs: 1, steps: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+    });
+
+    it("writes nothing for a late signal that arrives while its run is being erased", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      const listing = hold();
+      // Past its look for writers, in its external phase.
+      const erasing = db.makeKernel({
+        services: { aiLogger: db.aiLogger },
+        blobStore: override(db.blobStore, {
+          async list(prefix) {
+            const keys = await db.blobStore.list(prefix);
+            await listing.pause();
+            return keys;
+          },
+        }),
+      });
+      const erased = erasing.dispatch(erase(id));
+      await listing.reached;
+      let answer: unknown;
+      try {
+        answer = await kernel().dispatch(signal(id));
+        expect((await leftovers()).blobs).toBe(0);
+        expect((await leftovers()).steps).toBe(0);
+      } finally {
+        listing.release();
+      }
+      expect(answer).toEqual(answers[0]);
+      expect(await erased).toMatchObject({
+        removed: { runs: 1 },
+        incomplete: [],
+      });
+      expect(await leftovers()).toEqual(empty);
+    });
+
+    it("answers a late signal to an ended run whose wait is past its deadline as a live one does", async () => {
+      const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
+      await db.stepLedger.claim({
+        stageRecordId: stage.id,
+        stepId: "answer",
+        seq: 1,
+        kind: "signal",
+        status: "pending",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: new Date(Date.now() - 60_000),
+        waitState: { onTimeout: "return" },
+      });
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      const timedOut = {
+        ok: true,
+        signalled: false,
+        alreadyCompleted: true,
+        timedOut: true,
+      };
+      expect(await kernel().dispatch(signal(id))).toEqual(timedOut);
+      expect(await kernel().dispatch(signal(id))).toEqual(timedOut);
+    });
+
+    it("writes nothing once the run it read has been erased", async () => {
+      const { id } = await db.seed("RUNNING", "SUSPENDED");
+      const gate = hold();
+      // Stalled after reading the stage, before it registers. It keeps
+      // seeing that stage, so its cleanup of a stage that went does not run,
+      // as for a sender that stops before it.
+      let stale: Awaited<ReturnType<typeof db.persistence.getStage>>;
+      const sender = db.makeKernel({
+        persistence: override(db.persistence, {
+          async getStage(runId, stageId) {
+            if (stale) return stale;
+            stale = await db.persistence.getStage(runId, stageId);
+            await gate.pause();
+            return stale;
+          },
+        }),
+      });
+      const sending = sender.dispatch(signal(id));
+      await gate.reached;
+      await kernel().dispatch({ type: "run.cancel", workflowRunId: id });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 1 },
+        incomplete: [],
+      });
+      gate.release();
+      await expect(sending).rejects.toThrow();
+      expect(await leftovers()).toEqual({
+        blobs: 0,
+        steps: 0,
+        keys: 0,
+        events: 0,
+      });
+      expect(await kernel().dispatch(erase(id))).toMatchObject({
+        removed: { runs: 0, blobs: 0 },
+        incomplete: [],
+      });
+    });
   });
 });

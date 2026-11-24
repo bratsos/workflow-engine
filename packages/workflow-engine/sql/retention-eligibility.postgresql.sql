@@ -71,3 +71,9 @@ CREATE INDEX IF NOT EXISTS "outbox_events_prune_idx"
 CREATE INDEX IF NOT EXISTS "idempotency_keys_prune_idx"
   ON "idempotency_keys" (("createdAt" + interval '0 seconds'))
   WHERE ("result"->>'__workflowEngineState') IS DISTINCT FROM 'in_progress';
+-- statement-breakpoint
+-- Run writer registrations are in progress, so the index above never holds
+-- them; this one lets pruning find those whose lease lapsed.
+CREATE INDEX IF NOT EXISTS "idempotency_keys_writer_prune_idx"
+  ON "idempotency_keys" (("createdAt" + interval '0 seconds'))
+  WHERE "commandType" = 'run.write';

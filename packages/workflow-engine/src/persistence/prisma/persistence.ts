@@ -48,6 +48,7 @@ import type {
 import {
   ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
+  RUN_ERASURE_COMMAND,
   RUN_WRITE_LEASE_MS,
   StaleVersionError,
 } from "../interface";
@@ -68,7 +69,13 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
-import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
+import {
+  prefixRange,
+  pruneRows,
+  RetentionIndexes,
+  RUN_WRITER,
+  writeRetentionSql,
+} from "./retention-sql.js";
 import {
   isSerializationFailure,
   isSqliteBusy,
@@ -224,7 +231,8 @@ function truthy(value: unknown): boolean {
   return false;
 }
 
-const RUN_WRITER = "run.write";
+/** Pruning removes a run writer registration this many leases after its last refresh. */
+const ABANDONED_WRITER_LEASES = 10;
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
@@ -354,6 +362,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private readonly rawOutboxQueries: boolean;
   private statusEnumName: string;
   private now: () => Date;
+  private readonly retentionIndexes: RetentionIndexes;
   /**
    * Shared with every transactional clone (see `withTransaction`), so the
    * database probe runs once per client rather than once per transaction.
@@ -394,6 +403,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
+    this.retentionIndexes = new RetentionIndexes(
+      this.prisma,
+      this.databaseType,
+    );
     this.versioning = {
       enabled:
         options.definitionVersioning ?? detectDefinitionVersioning(prisma),
@@ -662,7 +675,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async beginRunWrite(
     workflowRunId: string,
     token: string,
-    options?: { unchecked?: boolean },
+    options?: { unchecked?: boolean; endedOk?: boolean },
   ): Promise<boolean> {
     const row = {
       id: token,
@@ -680,14 +693,17 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     // One statement: SQLite takes its writer lock before the check, and
     // PostgreSQL's share lock makes a concurrent status change wait for this
     // insert to commit, or re-checks the status that change committed.
-    return (
+    const registered =
       (await writeRetentionSql(
         this.prisma,
         this.databaseType,
         `INSERT INTO "idempotency_keys" ("id", "key", "commandType", "workflowRunId", "createdAt", "result")
           SELECT $1, $1, $2, $3, ${pg ? utcTimestampParam(4) : "$4"}, $5${pg ? "::jsonb" : ""}
-          WHERE EXISTS (SELECT 1 FROM "workflow_runs" WHERE "id" = $3
-            AND ${pg ? '"status"::text' : '"status"'} NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')${pg ? " FOR SHARE" : ""})`,
+          WHERE EXISTS (SELECT 1 FROM "workflow_runs" WHERE "id" = $3${
+            options?.endedOk
+              ? ""
+              : ` AND ${pg ? '"status"::text' : '"status"'} NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')`
+          }${pg ? " FOR SHARE" : ""})`,
         [
           token,
           RUN_WRITER,
@@ -695,14 +711,29 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           pg ? row.createdAt.toISOString() : row.createdAt,
           JSON.stringify(IDEMPOTENCY_IN_PROGRESS_MARKER),
         ],
-      )) !== 0
-    );
+      )) !== 0;
+    if (!registered || !options?.endedOk) return registered;
+    // The registration has committed, so an erasure that marks the run after
+    // this look finds it, and one that marked it before is seen here.
+    const marked = await this.prisma.idempotencyKey.findFirst({
+      where: { workflowRunId, commandType: RUN_ERASURE_COMMAND },
+      select: { id: true },
+    });
+    if (!marked) return true;
+    await this.releaseIdempotencyKey(token, RUN_WRITER);
+    return false;
   }
 
   async refreshRunWrite(token: string): Promise<boolean> {
+    const now = this.now();
+    // A lapsed lease stays lapsed: erasure may already have seen no writers.
     const { count } = await this.prisma.idempotencyKey.updateMany({
-      where: { key: token, commandType: RUN_WRITER },
-      data: { createdAt: this.now() },
+      where: {
+        key: token,
+        commandType: RUN_WRITER,
+        createdAt: { gt: new Date(now.getTime() - RUN_WRITE_LEASE_MS) },
+      },
+      data: { createdAt: now },
     });
     return count > 0;
   }
@@ -777,9 +808,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     const execute = (sql: string, ...args: unknown[]) =>
       writeRetentionSql(this.prisma, this.databaseType, sql, args);
     const pg = this.databaseType === "postgresql";
-    // Stamped keys include writer registrations, which have all ended.
+    // Stamped keys include writer registrations, which have all ended. The
+    // erasure mark stays until the run is gone, and is not a key of the run's.
     let { count: idempotencyKeys } =
-      await this.prisma.idempotencyKey.deleteMany({ where });
+      await this.prisma.idempotencyKey.deleteMany({
+        where: { ...where, commandType: { not: RUN_ERASURE_COMMAND } },
+      });
     const legacyRunId = pg
       ? `"result"->>'workflowRunId'`
       : `json_extract("result", '$.workflowRunId')`;
@@ -831,6 +865,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       });
       if (runs !== 1) throw new Error("Run changed during erasure");
     }
+    await this.prisma.idempotencyKey.deleteMany({
+      where: { ...where, commandType: RUN_ERASURE_COMMAND },
+    });
     return {
       stages,
       steps,
@@ -849,16 +886,37 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       "outbox",
       publishedOlderThan,
       limit,
+      this.retentionIndexes,
     );
   }
 
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<number> {
-    return pruneRows(
+    const completed = await pruneRows(
       this.prisma,
       this.databaseType,
       "idempotencyKeys",
       olderThan,
       limit,
+      this.retentionIndexes,
+    );
+    if (completed >= limit) return completed;
+    // Registrations of writers that stopped refreshing them, such as a host
+    // that crashed. A live one is in progress and is never pruned, and one
+    // that only looks lapsed to a host whose clock runs ahead is left too:
+    // this only needs to clear what has been abandoned for good.
+    const abandoned = new Date(
+      this.now().getTime() - ABANDONED_WRITER_LEASES * RUN_WRITE_LEASE_MS,
+    );
+    return (
+      completed +
+      (await pruneRows(
+        this.prisma,
+        this.databaseType,
+        "runWriters",
+        abandoned,
+        limit - completed,
+        this.retentionIndexes,
+      ))
     );
   }
 

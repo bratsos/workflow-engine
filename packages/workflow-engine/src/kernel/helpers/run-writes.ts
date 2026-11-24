@@ -25,11 +25,15 @@ export interface RunWriter {
   close(): Promise<void>;
 }
 
-/** Register (or adopt `token`, registered in a transaction) and keep it alive. */
+/**
+ * Register (or adopt `token`, registered in a transaction) and keep it alive.
+ * `endedOk` also registers a run that has ended, unless it is being erased.
+ */
 export async function openRunWriter(
   persistence: Persistence,
   workflowRunId: string,
   token?: string,
+  options?: { endedOk?: boolean },
 ): Promise<RunWriter> {
   if (
     !persistence.beginRunWrite ||
@@ -40,7 +44,8 @@ export async function openRunWriter(
   }
   const id = token ?? crypto.randomUUID();
   const registered =
-    token !== undefined || (await persistence.beginRunWrite(workflowRunId, id));
+    token !== undefined ||
+    (await persistence.beginRunWrite(workflowRunId, id, options));
   let held = registered;
   let confirmedAt = Date.now();
   // A registration erased with its run, or one this process could not

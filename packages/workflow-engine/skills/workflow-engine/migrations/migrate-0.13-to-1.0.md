@@ -538,20 +538,33 @@ For table retention, also add this column to the same migration:
 Run the matching `sql/retention-eligibility.postgresql.sql` or
 `sql/retention-eligibility.sqlite.sql` after adding the column. The script
 installs the outbox triggers, backfills existing events and creates the
-eligible-only pruning indexes. Include these statements alongside Prisma's
-generated migration. The triggers track event publication, dead letters,
-and run transitions and deletion. The indexes exclude live or orphaned events,
-dead letters, unpublished events and in-progress idempotency keys. A run
-status change between live and terminal updates that run's published events,
-so its cost grows with the run's published history.
+eligible-only pruning indexes, and a partial index on `idempotency_keys` for
+run writer registrations (`idempotency_keys_writer_prune_idx`). Include these
+statements alongside Prisma's generated migration. The triggers track event
+publication, dead letters, and run transitions and deletion. The indexes
+exclude live or orphaned events, dead letters, unpublished events and
+in-progress idempotency keys. A run status change between live and terminal
+updates that run's published events, so its cost grows with the run's
+published history. On SQLite, pruning reads each table's indexes from the table itself and
+names the primary-key index and the `ai_calls` age indexes (`createdAt`,
+`textExpiresAt`) it finds, so that statistics taken on a small table cannot
+turn a prune into a table scan; a table without one is pruned with a plain
+statement.
 
 Runs created and redriven before this release need nothing more: erasure finds
 the stage records a redrive archived through its `run.supersededAttempt`
-annotations. Stage executions and cancellation sweeps register as writers of
-their run in `idempotency_keys` (command type `run.write`); erasure reports
-`writers` while one is registered and refreshed. A registration whose process
-stopped refreshing it stops counting after one minute (`RUN_WRITE_LEASE_MS`).
-A custom asynchronous `AICallLogger` that buffers calls must return, from
+annotations. Stage executions, suspended-stage polls, signal senders and
+cancellation sweeps register as writers of their run in `idempotency_keys`
+(command type `run.write`); erasure reports `writers` while one is registered
+and refreshed. A `step.signal` for a run that has ended registers as
+well and behaves as it did; only one that finds the run marked for erasure
+(`run.purge` writes an idempotency key of command type `run.erase` before it
+looks for writers) writes nothing. A registration whose process stopped refreshing it stops counting
+after one minute (`RUN_WRITE_LEASE_MS`), and a writer that finds its lease
+lapsed does not revive it. `engine.prune` with `idempotencyKeys` removes
+registrations nobody has refreshed for ten leases, so those a crashed host
+left do not accumulate; it needs `idempotency_keys_writer_prune_idx` and
+skips them without it. A custom asynchronous `AICallLogger` that buffers calls must return, from
 `logCall`, a promise that settles once the call is stored: erasure waits for
 that promise, not for the buffer.
 

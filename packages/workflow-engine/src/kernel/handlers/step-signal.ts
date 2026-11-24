@@ -5,6 +5,7 @@ import {
 import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
+import { fenceRunWrites, openRunWriter } from "../helpers/run-writes.js";
 import { waitTimeoutPatch } from "../helpers/step-api.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord, WorkflowStageRecord } from "../ports.js";
@@ -45,8 +46,33 @@ export async function handleStepSignal(
     );
   }
 
+  // The ledger write can spill the payload to the blob store, outside any
+  // transaction. Registered as a writer of the run (as `job.execute` is), the
+  // sender holds off erasure until it has written. A late signal to a run
+  // that has ended (a webhook's retry, say) registers as well and behaves as
+  // on a live run. Only a run being erased refuses it, and then the sender
+  // writes nothing and answers as it would have; a run that is gone is left
+  // to the fenced writes, which refuse.
+  let writer = await openRunWriter(deps.persistence, command.workflowRunId);
+  if (!writer.held) {
+    writer = await openRunWriter(
+      deps.persistence,
+      command.workflowRunId,
+      undefined,
+      { endedOk: true },
+    );
+  }
   try {
-    return await deliverSignal(command, { ...deps, stepLedger: ledger }, stage);
+    const erasing =
+      !writer.held &&
+      Boolean(await deps.persistence.getRun(command.workflowRunId));
+    const fenced = fenceRunWrites(deps, command.workflowRunId, writer);
+    return await deliverSignal(
+      command,
+      { ...fenced, stepLedger: fenced.stepLedger ?? ledger },
+      stage,
+      erasing,
+    );
   } catch (error) {
     // The record went (purge, restart) after the read above: whatever this
     // delivery wrote under it has no row left to name it, and whoever
@@ -64,6 +90,8 @@ export async function handleStepSignal(
         .catch(() => {});
     }
     throw error;
+  } finally {
+    await writer.close();
   }
 }
 
@@ -71,6 +99,7 @@ async function deliverSignal(
   command: StepSignalCommand,
   deps: KernelDeps & { stepLedger: StepLedger },
   stage: WorkflowStageRecord,
+  erasing: boolean,
 ): Promise<HandlerResult<StepSignalResult>> {
   // The ledger is external to the stage transaction. A completed ledger row
   // must still retry its wake; this key commits with the wake and outbox event.
@@ -128,6 +157,29 @@ async function deliverSignal(
     };
   };
 
+  // The answer of a run being erased, without the writes the same call makes
+  // otherwise. A stage that went while this read has nothing for them to land
+  // on, and they would have failed.
+  const answered = async (
+    alreadyCompleted: boolean,
+  ): Promise<HandlerResult<StepSignalResult>> => {
+    const current = await deps.persistence.getStage(
+      command.workflowRunId,
+      command.stageId,
+    );
+    if (current?.id !== stage.id) {
+      throw new Error(
+        `Workflow stage ${command.workflowRunId}/${command.stageId} not found`,
+      );
+    }
+    return {
+      signalled: true,
+      ok: true,
+      alreadyCompleted,
+      _events: [],
+    };
+  };
+
   const timedOut = (): HandlerResult<StepSignalResult> => ({
     ok: true,
     signalled: false,
@@ -140,7 +192,9 @@ async function deliverSignal(
     alreadyCompleted: boolean,
   ): Promise<HandlerResult<StepSignalResult>> => {
     if (record.waitState?.timedOut) return timedOut();
-    return wake(record, alreadyCompleted);
+    return erasing
+      ? answered(alreadyCompleted)
+      : wake(record, alreadyCompleted);
   };
   // Only a deadline fails a wait row. With an explicit `onTimeout` the
   // sender gets the same refusal as before the poller recorded it.
@@ -177,6 +231,12 @@ async function deliverSignal(
       record.deadlineAt !== null &&
       record.deadlineAt <= deps.clock.now();
     if (expired && record.waitState?.onTimeout !== "return") return timedOut();
+    if (erasing) {
+      // Without the write that settles it, the answer is the one it leads to.
+      if (expired) return timedOut();
+      payload();
+      return answered(false);
+    }
     const completed = await deps.stepLedger.compareAndSet(
       stage.id,
       command.stepId,
@@ -206,6 +266,7 @@ async function deliverSignal(
   if (existing) return completeExisting(existing, readPayload);
 
   const payload = readPayload();
+  if (erasing) return answered(false);
   const claimed = await deps.stepLedger.claim({
     stageRecordId: stage.id,
     stepId: command.stepId,

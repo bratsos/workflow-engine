@@ -178,7 +178,7 @@ await kernel.dispatch({
 });
 ```
 
-Each optional clause has its own count and batch limit. AI call text expiry clears prompt, response and metadata instructions while keeping the call's accounting data. Outbox retention applies to published events whose runs still exist and are terminal. Idempotency retention applies to completed keys. Both hosts accept `prune: { aiCalls?: { olderThanMs }, aiCallText?: boolean, outbox?: { publishedOlderThanMs }, idempotencyKeys?: { olderThanMs }, limit? }` and run it before age-based run purge.
+Each optional clause has its own count and batch limit. AI call text expiry clears prompt, response and metadata instructions while keeping the call's accounting data. Outbox retention applies to published events whose runs still exist and are terminal. Idempotency retention applies to completed keys and to run writer registrations nobody has refreshed for ten leases (`10 * RUN_WRITE_LEASE_MS`), such as those a crashed host left. Both hosts accept `prune: { aiCalls?: { olderThanMs }, aiCallText?: boolean, outbox?: { publishedOlderThanMs }, idempotencyKeys?: { olderThanMs }, limit? }` and run it before age-based run purge.
 
 ---
 
