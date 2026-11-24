@@ -1,5 +1,43 @@
 # @bratsos/workflow-engine-console
 
+## 1.0.0-alpha.9
+
+### Patch Changes
+
+- f5f9796: Filter the console runs list by exact tenant ID using the Tenant ID control, `GET /api/runs?tenantId=tenant-a`, or `ConsoleReadPort.listRuns({ filters: { tenantId: "tenant-a" } })`. The runs list shows the tenant ID when present. Omit the filter to see all runs available to the reader, including runs with no tenant ID. The filter only changes the view. Anyone who can open the console can clear it and see every tenant available to the reader.
+
+  The runs list and run detail now read the `workflow_runs.tenantId` column, so the database needs the engine schema that adds it (the same release's migration) before the console is upgraded. Rolling-safe once that migration is applied: the reader uses the existing tenant column and index and writes nothing.
+
+- Updated dependencies [42bb251]
+- Updated dependencies [9d538de]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [3f7093b]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [28fe917]
+- Updated dependencies [9a66053]
+- Updated dependencies [49d11c4]
+- Updated dependencies [bb3414a]
+- Updated dependencies [28fe917]
+- Updated dependencies [42bb251]
+- Updated dependencies [246259b]
+- Updated dependencies [bb3414a]
+- Updated dependencies [004e51e]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+  - @bratsos/workflow-engine@1.0.0-alpha.22
+
+Tested on: Node 22, 24; Bun 1.4.2; Prisma 6 6.19.3, 7 7.10.1, 8 8.0.0-rc.29 (@prisma/orm-postgres 8.0.0-rc.21).
+
 ## 1.0.0-alpha.8
 
 ### Minor Changes
