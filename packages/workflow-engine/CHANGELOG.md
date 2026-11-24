@@ -1,5 +1,115 @@
 # @bratsos/workflow-engine
 
+## 1.0.0-alpha.22
+
+### Minor Changes
+
+- 9a66053: Attach tenant IDs and labels to accounting rows through `AIHelperOptions.attribution`. Stage helpers inherit them from the run and also record its ID. A row written through `ctx.aiLogger` carries the run's ID, gets the run's tenant when it has none, and the run's labels under its own. Child helpers merge labels by key. Custom loggers receive the attribution fields, and `PrismaAICallLogger.costByTenant` reads a tenant's USD cost for a period with optional label grouping.
+
+  **Rolling-safe** after the additive attribution schema migration. Custom stage helper factories must forward the supplied options.
+
+- 9a66053: Choose whether to store request and response text through `AIHelperOptions.text`. Full text remains the default and can have a TTL. Disabled capture also omits stream instructions and tool inputs and outputs. Text in trace output requires both `WORKFLOW_ENGINE_TRACE` and `WORKFLOW_ENGINE_TRACE_TEXT=1`.
+
+  **Rolling-safe** after the additive expiry schema migration. Rows without captured text keep empty strings in the existing required columns. Apply the privacy guarantee after every writer supports it and historical capture has been addressed.
+
+- 28fe917: Use `engine.prune` to remove old AI calls, published events of terminal runs, and completed idempotency keys. Clear expired AI call text and metadata instructions independently. Each configured clause returns a count and applies its own batch limit. Both hosts accept an optional `prune` configuration so maintenance ticks can run these policies.
+
+  The additive indexes are **rolling-safe**. Apply them before enabling retention. Existing hosts can continue processing jobs while the indexes are added.
+
+- 9a66053: Asynchronous call loggers can reject a failed write. Helpers report every failed write through `onLogError`, and a caller that awaits a write through `ctx.aiLogger` gets a rejection with a safe message instead of `undefined`; an ignored write is handled. `ai.flush({ timeoutMs })` returns counts of failed writes and of pending work, including its children's, and `ctx.aiLogger.flush()` returns the configured logger's own `flush` result, as in earlier releases, once the run's write fence has handed on the direct writes it holds (waiting within the same bound), plus the direct writes the fence still holds or refused; with a logger that has no `flush`, it returns counts for the direct writes made through `ctx.aiLogger`. Pending work is everything that can still write a row: calls in progress, stream requests until their row is written or the AI SDK ends them without one, stream reads, batch result collection and writes in progress. An error part or a consumer that stops reading does not end a stream request. `kernel.flush()` waits for the configured logger within its own bound; Node shutdown and the end of each serverless invocation call it. Stage outcomes, retries and run totals do not wait for accounting writes, as before, and `getResults` still records a batch before returning it.
+
+  **Rolling-safe** because the change adds no schema requirements. Existing synchronous loggers still work.
+
+- 49d11c4: Set `AIHelperOptions.routing.provider` to configure an upstream allowlist, provider order, fallback behaviour and data collection for a helper and its children. OpenRouter realtime calls combine the policy with per-call restrictions. The helper intersects allowlists and preserves the stricter privacy and fallback settings. A no-fallback request restricted to one endpoint retains that limit when combined with an order. OpenRouter text batch submissions send supported allowlists and fallback settings at the top level, including submissions that fall back from a native transport. The helper refuses calls that cannot honour the policy. Custom model factories and resolvers receive the policy as their second argument.
+
+  Regional endpoints remain in the merged ranking when a matching variant is allowed. OpenRouter batches can pin a single eligible regional endpoint with fallbacks disabled.
+
+  Each batch call fixes its transport when it starts and enforces the policy on that transport, so a concurrent poll of a saved batch cannot move an in-flight submission. As before, stored refs and an automatic OpenRouter fallback switch the batch client's later calls to their transport, and new handles identify the transport that submitted them.
+
+  Without a provider policy, batch calls send the same requests as before. With a policy, a client that has switched away from its configured provider submits only when its `baseURL` is unset or that provider's canonical base URL. Reads with another URL use that provider's default URL and environment credential.
+
+  Multi-step call rows store the distinct serving providers in `servedBy` and the ordered provider for each step in `metadata.servedBySteps`, including steps the SDK reported before a call failed. Calls keep their billable usage and cost if reading structured output fails or a stream callback throws.
+
+  Rolling-safe. The policy is opt-in and provider attribution uses the existing call-log fields.
+
+- bb3414a: Completed idempotency keys record the owning run when it is known, including keys from `run.create`, `job.execute`, signal wake and SQL enqueue. The persistence port takes the run ID as the fourth argument to `completeIdempotencyKey`. The nullable `workflowRunId` and existing `createdAt` columns have indexes for run attribution and key age.
+
+  **Rolling-safe.** Add the nullable column and indexes using the bounded table upgrade before deploying new clients. Old hosts keep completing keys without a run ID, and their cached results still replay.
+
+- 42bb251: The job queue has nullable columns for workflow identity, retry backoff, and the duration and deadline of each lease and absolute cap. Apply the schema upgrade before deploying the new engine. It requires no row backfill. Existing jobs retain their workflow identity in the payload and keep the previous retry and timeout defaults.
+
+  **Rolling-safe with the new options disabled.** Old hosts can read and write the migrated queue. Stop old hosts first before enabling the controls, because old workers use their own retry delay and timeout rules and can claim jobs above a workflow's limit.
+
+- bb3414a: PostgreSQL `run.create` and `workflow_engine_enqueue` send the new run ID to `workflow_engine_runs` when the transaction commits. Replays and rollbacks send no notification. Kernel notifications use the transaction client’s raw query or raw execute method. Delegate-only transaction views still rely on polling.
+
+  **Rolling-safe.** Apply the table upgrade before replacing the application-owned SQL function in a separate transaction. Old hosts continue polling for pending runs. Restore any custom `EXECUTE` grants and `PUBLIC` revocations on the new function signature before committing. Follow the Prisma 6 connection notes in the schema migration guide.
+
+- 004e51e: Route engine diagnostics through one application sink with `setLogger({ debug, info, warn, error })` from `@bratsos/workflow-engine/kernel`. The kernel, hosts, standalone helpers, and Prisma adapters pass contextual IDs as structured fields. The default console keeps its trace-level gate. Prompt and response previews require `WORKFLOW_ENGINE_TRACE_TEXT`: with `WORKFLOW_ENGINE_TRACE=1` alone the console no longer prints them, so set both to see them as before. Error diagnostics retain their original details. If the application sink throws, the engine falls back to the console for that entry.
+
+  Rollout is rolling-safe because the change only affects process diagnostics and requires no schema or worker coordination.
+
+- 9a66053: Record calls made outside the helper with their supplied USD cost and accounting fields through `recordCall`, including sessions recorded as `realtime`. Providing the cost bypasses catalogue lookup.
+
+  **Rolling-safe** because the existing accounting columns support supplied costs and call types.
+
+- 28fe917: Erase terminal workflow runs with `run.purge` by passing `workflowRunIds` or `tenantId` and an optional tenant batch limit. The command reports rows and blobs removed, live runs skipped, and incomplete cleanup that can be retried. Configure an AI call logger with `deleteForRuns`, and cancel live runs before erasure. Prisma also removes legacy workflow topics and idempotency keys.
+
+  For targeted erasure, **stop old hosts first**: hosts without writer registration can write for a run while it is erased. Add the retention indexes in the attribution migration before enabling the command; erasure on SQLite requires them.
+
+- bb3414a: `run.create` accepts optional `tenantId` and `labels` and stores them on the run. The run schema indexes newest-first lookups within a tenant. The AI-call schema adds nullable `workflowRunId`, `tenantId`, `labels` and `textExpiresAt` with indexes for attribution and expiry. `prompt` and `response` stay required.
+
+  Both create paths validate a flat map of string labels and reject the `__proto__` key consistently across Postgres and SQLite. SQL enqueue adds a nine-argument `workflow_engine_enqueue(..., p_tenant_id text, p_labels jsonb)` with no defaults. After the table upgrade, apply the new `sql/enqueue.sql`. It drops nothing: it creates the new overload, then replaces the released seven-argument function in place, keeping its signature, owner, ACL and dependent views or wrappers; its existing callers need no new `EXECUTE` grant. The new overload gets the database's default function ACL: grant `EXECUTE` on it to the roles that pass a tenant or labels. A role that writes engine tables through column-level grants also needs `INSERT ("tenantId", labels)` on `workflow_runs` and `UPDATE ("workflowRunId")` on `idempotency_keys` before the new function or engine is deployed; table-wide grants need nothing.
+
+  **Rolling-safe with compatible prepared statements.** The PostgreSQL table upgrade uses separate 500 ms lock attempts and concurrent index builds. Old traffic may briefly wait on the table being altered. Apply the column and index steps before the optional enqueue function. Existing seven-argument calls, wrappers and grants keep working. On PostgreSQL Prisma 6, stop old hosts first and keep their cached connections closed across the schema change, or roll them onto `statement_cache_size=0` beforehand. A warmed `RETURNING *` plan otherwise fails after the result shape changes.
+
+- 42bb251: Set `absoluteTimeoutMs` on a workflow or stage to cap the wall time of one claimed job attempt. The stage value takes precedence. Each claim starts a new deadline that heartbeats leave unchanged. The runaway sweep uses the host cap for claims without a recorded deadline.
+- 42bb251: Node hosts accept `concurrency` to run more than one claimed job per process. The default is one slot. Set `maxConcurrent` on a workflow to limit its RUNNING jobs across workers using the Prisma queue on PostgreSQL or SQLite. Use an enumerable workflow registry and the same cap on all hosts that claim the workflow. The claim skips capped workflows before applying queue order and fairness.
+- 42bb251: Set `leaseTimeoutMs` on a workflow or stage to change how long a claimed job can go without heartbeating. The stage value takes precedence, with the host's stale lease threshold used when neither sets a duration. For an override, workers heartbeat at the lesser of the host interval and one third of its lease. Other jobs keep the host's heartbeat cadence and lock-based expiry, including during a rolling upgrade. The queue stamps and refreshes the lease deadline using the same clock as the claim. Rows claimed before the upgrade still use the legacy lock timestamp.
+- 42bb251: Set `jobRetry: { maxAttempts, backoff: { initialDelayMs, factor?, maxDelayMs? } }` on a workflow or stage to control retries of failed jobs and suspended polls. A stage policy overrides its workflow policy. `maxAttempts` includes the first attempt. The initial delay applies after the first failure, the multiplier defaults to 2, and `factor: 1` gives a fixed delay. Existing jobs keep their stored attempt budget and default backoff.
+
+  A suspended poll retries by the next opted-in durable wait deadline if it comes sooner. Once a pending opted-in deadline has passed, the poll uses the default retry delay so it can settle the timeout.
+
+### Patch Changes
+
+- 42bb251: Keep capped workflow claims fast behind a large saturated backlog. PostgreSQL and SQLite seek to each eligible workflow's next job and keep the queue's priority and creation-time ordering. The index upgrade is rolling-safe with the controls disabled. The packaged expression index is required for bounded `maxConcurrent` claims on a Prisma-provisioned database. Without it, the queue still enforces the cap using a slower scan and logs a warning once per adapter with the SQL file to apply. Restart workers after installing the index. The job runtime controls SQL upgrade includes it.
+- 9d538de: The bundled Prisma setup reference now states a known limitation of `fromPrisma8` on SQLite under Bun: changing `journal_mode` at runtime, or leaving WAL, after the engine has committed a transaction can fail with `database is locked`, because Bun's `node:sqlite` `close()` keeps a connection open until its statements are collected and the Prisma 8 driver gives each transaction a connection of its own. Staying in one journal mode is unaffected; set it before the engine starts. Documentation only. Rolling-safe.
+- 3f7093b: Let stages branch on a durable deadline. Set `onTimeout: "return"` on `ctx.step.waitForSignal` or `ctx.step.waitFor` to receive `{ timedOut: false, value }` or `{ timedOut: true }`. The first completion wins and survives replay.
+
+  A wait with an explicit `onTimeout` (`"throw"` or `"return"`) keeps its deadline exactly. The stage wakes at its next poll or deadline, including after a replay that did not reach it. From the deadline on, a signal or a ready poll settles only as a timeout, and a late `step.signal` reports `signalled: false, timedOut: true` without emitting a signal event. A worker that dies mid-replay delays such a deadline by at most the 60-second claim lease. Waits without `onTimeout` behave as before.
+
+  `StepLedger` gains an optional `listPendingWaits`, which the Prisma and in-memory ledgers implement, so suspending reads no completed step results. A custom ledger without it falls back to `list`.
+
+  Rolling-safe for waits without `onTimeout`. Upgrade every worker and signal dispatcher before setting `onTimeout`, because older versions do not read it. No database schema change is required.
+
+- bb3414a: `workflow_engine_enqueue` uses the status column's PostgreSQL enum type, so it works with a renamed native enum. The `fromPrisma8` validation message also recognizes custom names. Pass a custom name as `statusEnumName` to `createPrismaWorkflowPersistence` for the kernel's raw run claim.
+
+  **Rolling-safe.** The replacement SQL function works with the enum already in use. Replace it in a separate transaction after the schema upgrade. Restore the intended `EXECUTE` ACL and recreate tracked dependents before committing.
+
+- 42bb251: Enforce explicit workflow and stage job deadlines when the host fallback `jobAbsoluteTimeoutMs` is zero. Jobs without an explicit deadline have no absolute cap in this configuration.
+- 28fe917: Targeted run erasure no longer lets a write land after it reports a run erased. Stage executions, suspended-stage polls and the provider batch sweep of `run.cancel` register as writers of their run while the run is live, and erasure reports `writers` until they end. A registration whose process stopped refreshing it stops counting after `RUN_WRITE_LEASE_MS` (one minute), and a writer that stalled past half of it checks its registration before writing again. Age-based `run.purge` skips runs with writers, and a targeted retry for a run that is already gone removes the AI calls, jobs, keys and outbox events left under its ID. Erasure finds the stage records a redrive archived through its `run.supersededAttempt` annotations, so runs redriven by earlier releases are erasable after an ordinary upgrade, and it skips records that another run names. A command that completes or fails after its key was erased with its run no longer touches a key another command acquired since: `completeIdempotencyKey` and `releaseIdempotencyKey` take the acquisition time. The spilling job transport now answers a failed payload spill only after the other spills of the batch settle.
+
+  For targeted erasure, **stop old hosts first**: earlier hosts do not register their writes, so a write of theirs can land after erasure reported the run gone. A custom asynchronous `AICallLogger` must return from `logCall` a promise that settles once the call is stored.
+
+- 28fe917: Outbox and idempotency retention now select from indexes that contain eligible rows. Outbox eligibility updates with the parent run status, including reopening and removal; that update touches the run's published events, so its cost grows with the run's published history. On PostgreSQL every `engine.prune` clause now deletes or updates its selected rows by primary key, even when statistics were taken before a backlog became eligible.
+
+  The additive schema change is **rolling-safe**. Install the dialect-specific eligibility migration before enabling the updated retention command. Its triggers maintain eligibility for existing writers.
+
+- 246259b: A run writer whose lease lapsed can no longer revive it. `refreshRunWrite` renews a registration only while it was refreshed within `RUN_WRITE_LEASE_MS`; a writer that stalled for longer than that, after targeted erasure saw no writer, falls back to a registration of its own, which is refused once the run has ended or is gone, so it cannot write behind the erasure. `engine.prune` with `idempotencyKeys` now also removes run writer registrations that nobody has refreshed for ten leases, such as those a crashed host left, within the clause's limit; the ten leases keep a host whose clock runs ahead from removing a live registration.
+
+  `step.signal` registers its sender as a writer of the run, as `job.execute` does. A payload it spills to the blob store can no longer land after `run.purge` reported the run erased: erasure reports `writers` while the sender holds its registration, and a late signal to a run that has ended (a webhook retry, say) registers as well and behaves as before, so a second delivery still reports `alreadyCompleted: true`. `run.purge` marks a run it is about to erase with an idempotency key of command type `run.erase` (not counted in `removed.idempotencyKeys`, and removed with the run) before it looks for writers; a sender that finds the mark writes nothing and answers as it would have.
+
+  On SQLite, every `engine.prune` clause now reads and mutates its rows through the primary-key index and the `ai_calls` age indexes, so statistics taken while a table was small no longer turn a prune into a scan of the whole table. The indexes are read from the table itself and named only when the table has them; one without them is pruned with the plain statement, as before. The Getting Started models in the README now declare every index of the shipped schema.
+
+  The change is **rolling-safe**: it adds no column and changes no command. Old and new hosts can run side by side, because the refresh condition only narrows what a host may renew and a host without it keeps registering as before. Pruning the registrations uses the additive partial index `idempotency_keys_writer_prune_idx` from the updated `sql/retention-eligibility.postgresql.sql` or `sql/retention-eligibility.sqlite.sql` (`CREATE INDEX IF NOT EXISTS`, so running the script again is safe); without it `engine.prune` skips the registrations and prunes keys as before. For erasure of signalled runs, **stop old hosts first**: earlier hosts do not register their signal senders.
+
+- 9a66053: Text capture now covers error text on AI call rows. Under `store: "none"` or a TTL, a row's `metadata.error` is stored as `AI call failed`, on every row a helper with that policy builds: its calls, batch results and `recordCall`, including a helper given `ctx.aiLogger`. A TTL row never stores the message, because text expiry clears prompt, response and instructions only. The engine's own console lines print provider error text only when both `WORKFLOW_ENGINE_TRACE=1` and `WORKFLOW_ENGINE_TRACE_TEXT=1` are set; otherwise a failed call prints its error name and HTTP status. Provider warnings reach the SDK, step callbacks and `rawResult` unchanged, as before, and the SDK prints them as process warnings unless `globalThis.AI_SDK_LOG_WARNINGS = false`. A provider error message can contain text the provider echoed from the request. Values thrown to callers and the SDK, stage and step error columns, events, outbox payloads, workflow logs and console reads keep it, as before. Text capture and attribution are applied once, by the helper that builds a row; the stage logger sets the run ID on every row and fills only the run's tenant and labels the row lacks, under the row's own. Direct `ctx.aiLogger` writes are stored as given with those fields, as in earlier releases. Frozen loggers and providers keep working.
+
+  **Rolling-safe** for schema compatibility. Enforce the privacy policy after all writers support it and address previously captured data separately.
+
+- 42bb251: `run.reapStuck` keeps a run active while a pending job or a job with a live lease can still advance it. This includes jobs returned to the queue by the stale-lease sweep in the same maintenance tick. Recovery still re-enqueues a pending stage whose job is missing.
+
+Tested on: Node 22, 24; Bun 1.4.2; Prisma 6 6.19.3, 7 7.10.1, 8 8.0.0-rc.29 (@prisma/orm-postgres 8.0.0-rc.21).
+
 ## 1.0.0-alpha.21
 
 ### Minor Changes

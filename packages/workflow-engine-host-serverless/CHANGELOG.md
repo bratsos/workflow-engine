@@ -1,5 +1,57 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.4.0-alpha.9
+
+### Minor Changes
+
+- 28fe917: Use `engine.prune` to remove old AI calls, published events of terminal runs, and completed idempotency keys. Clear expired AI call text and metadata instructions independently. Each configured clause returns a count and applies its own batch limit. Both hosts accept an optional `prune` configuration so maintenance ticks can run these policies.
+
+  The additive indexes are **rolling-safe**. Apply them before enabling retention. Existing hosts can continue processing jobs while the indexes are added.
+
+- 9a66053: Asynchronous call loggers can reject a failed write. Helpers report every failed write through `onLogError`, and a caller that awaits a write through `ctx.aiLogger` gets a rejection with a safe message instead of `undefined`; an ignored write is handled. `ai.flush({ timeoutMs })` returns counts of failed writes and of pending work, including its children's, and `ctx.aiLogger.flush()` returns the configured logger's own `flush` result, as in earlier releases, once the run's write fence has handed on the direct writes it holds (waiting within the same bound), plus the direct writes the fence still holds or refused; with a logger that has no `flush`, it returns counts for the direct writes made through `ctx.aiLogger`. Pending work is everything that can still write a row: calls in progress, stream requests until their row is written or the AI SDK ends them without one, stream reads, batch result collection and writes in progress. An error part or a consumer that stops reading does not end a stream request. `kernel.flush()` waits for the configured logger within its own bound; Node shutdown and the end of each serverless invocation call it. Stage outcomes, retries and run totals do not wait for accounting writes, as before, and `getResults` still records a batch before returning it.
+
+  **Rolling-safe** because the change adds no schema requirements. Existing synchronous loggers still work.
+
+- 42bb251: Node hosts accept `concurrency` to run more than one claimed job per process. The default is one slot. Set `maxConcurrent` on a workflow to limit its RUNNING jobs across workers using the Prisma queue on PostgreSQL or SQLite. Use an enumerable workflow registry and the same cap on all hosts that claim the workflow. The claim skips capped workflows before applying queue order and fairness.
+- 42bb251: Set `leaseTimeoutMs` on a workflow or stage to change how long a claimed job can go without heartbeating. The stage value takes precedence, with the host's stale lease threshold used when neither sets a duration. For an override, workers heartbeat at the lesser of the host interval and one third of its lease. Other jobs keep the host's heartbeat cadence and lock-based expiry, including during a rolling upgrade. The queue stamps and refreshes the lease deadline using the same clock as the claim. Rows claimed before the upgrade still use the legacy lock timestamp.
+
+### Patch Changes
+
+- 42bb251: Enforce explicit workflow and stage job deadlines when the host fallback `jobAbsoluteTimeoutMs` is zero. Jobs without an explicit deadline have no absolute cap in this configuration.
+- 004e51e: Route engine diagnostics through one application sink with `setLogger({ debug, info, warn, error })` from `@bratsos/workflow-engine/kernel`. The kernel, hosts, standalone helpers, and Prisma adapters pass contextual IDs as structured fields. The default console keeps its trace-level gate. Prompt and response previews require `WORKFLOW_ENGINE_TRACE_TEXT`: with `WORKFLOW_ENGINE_TRACE=1` alone the console no longer prints them, so set both to see them as before. Error diagnostics retain their original details. If the application sink throws, the engine falls back to the console for that entry.
+
+  Rollout is rolling-safe because the change only affects process diagnostics and requires no schema or worker coordination.
+
+- Updated dependencies [42bb251]
+- Updated dependencies [9d538de]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [3f7093b]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [28fe917]
+- Updated dependencies [9a66053]
+- Updated dependencies [49d11c4]
+- Updated dependencies [bb3414a]
+- Updated dependencies [28fe917]
+- Updated dependencies [42bb251]
+- Updated dependencies [246259b]
+- Updated dependencies [bb3414a]
+- Updated dependencies [004e51e]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+  - @bratsos/workflow-engine@1.0.0-alpha.22
+
+Tested on: Node 22, 24; Bun 1.4.2; Prisma 6 6.19.3, 7 7.10.1, 8 8.0.0-rc.29 (@prisma/orm-postgres 8.0.0-rc.21).
+
 ## 0.4.0-alpha.8
 
 ### Minor Changes

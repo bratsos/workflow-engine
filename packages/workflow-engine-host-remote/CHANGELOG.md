@@ -1,5 +1,43 @@
 # @bratsos/workflow-engine-host-remote
 
+## 0.2.3-alpha.9
+
+### Patch Changes
+
+- 004e51e: Route engine diagnostics through one application sink with `setLogger({ debug, info, warn, error })` from `@bratsos/workflow-engine/kernel`. The kernel, hosts, standalone helpers, and Prisma adapters pass contextual IDs as structured fields. The default console keeps its trace-level gate. Prompt and response previews require `WORKFLOW_ENGINE_TRACE_TEXT`: with `WORKFLOW_ENGINE_TRACE=1` alone the console no longer prints them, so set both to see them as before. Error diagnostics retain their original details. If the application sink throws, the engine falls back to the console for that entry.
+
+  Rollout is rolling-safe because the change only affects process diagnostics and requires no schema or worker coordination.
+
+- Updated dependencies [42bb251]
+- Updated dependencies [9d538de]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [3f7093b]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [28fe917]
+- Updated dependencies [9a66053]
+- Updated dependencies [49d11c4]
+- Updated dependencies [bb3414a]
+- Updated dependencies [28fe917]
+- Updated dependencies [42bb251]
+- Updated dependencies [246259b]
+- Updated dependencies [bb3414a]
+- Updated dependencies [004e51e]
+- Updated dependencies [9a66053]
+- Updated dependencies [9a66053]
+- Updated dependencies [28fe917]
+- Updated dependencies [bb3414a]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+- Updated dependencies [42bb251]
+  - @bratsos/workflow-engine@1.0.0-alpha.22
+
+Tested on: Node 22, 24; Bun 1.4.2; Prisma 6 6.19.3, 7 7.10.1, 8 8.0.0-rc.29 (@prisma/orm-postgres 8.0.0-rc.21).
+
 ## 0.2.3-alpha.8
 
 ### Patch Changes
